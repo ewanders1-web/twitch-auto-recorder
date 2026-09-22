@@ -186,7 +186,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.26</span>
+    <span class="badge">v6.27</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -243,11 +243,12 @@
         <select id="fmtSel"></select>
       </div>
       <div>
-        <label>Helper quality (streamlink)</label>
+        <label>Helper format (streamlink → OGG)</label>
         <select id="helperQualitySel">
-          <option value="best">Best (video + audio)</option>
-          <option value="audio_only">Audio only</option>
+          <option value="audio_only">OGG audio (default)</option>
+          <option value="best">Best audio → OGG</option>
         </select>
+        <div class="hint" style="margin-top:.25rem">Helper recordings land as <code>.ogg</code> in ~/TwitchRecordings (no mp4).</div>
         <div class="toggle-row" style="margin-top:.55rem">
           <label title="When on, mid-stream segments are joined into one continuous file after the session stops. Native segment files stay on disk.">
             <input type="checkbox" id="seamlessToggle" checked onchange="saveSeamlessToggle()"> Seamless recordings
@@ -423,8 +424,8 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.26'; // keep in sync with badge + HELPER_VERSION
-let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'best', seamlessRecordings:true, autoMusicOnly:true, homeStreamer:'', returnHomeAfterSet:true };
+const UI_VERSION = '6.27'; // keep in sync with badge + HELPER_VERSION
+let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, homeStreamer:'', returnHomeAfterSet:true };
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
 let musicJobsNotified = new Set(); // jobIds already fireNotify'd for done/error (health spam safe)
@@ -571,7 +572,8 @@ function restoreSettings(){
     }
     if(data.fmtMime) restoredFmtMime=data.fmtMime;
     if(data.notifyOptIn) cfg.notifyOptIn=!!data.notifyOptIn;
-    if(data.helperQuality==='audio_only') cfg.helperQuality='audio_only';
+    if(data.helperQuality==='best') cfg.helperQuality='best';
+    else cfg.helperQuality='audio_only'; // v6.27 default OGG audio
     // v6.20: default true when missing so Eric gets seamless without re-toggling
     if(typeof data.seamlessRecordings==='boolean') cfg.seamlessRecordings=data.seamlessRecordings;
     else cfg.seamlessRecordings=true;
@@ -1488,7 +1490,7 @@ function isSeamlessExportName(name){
 function findSeamlessSibling(firstName){
   if(!firstName) return null;
   const stem=String(firstName).replace(/\.[^.]+$/,'');
-  const ext=(String(firstName).match(/(\.[^.]+)$/)||[])[1]||'.mp4';
+  const ext=(String(firstName).match(/(\.[^.]+)$/)||[])[1]||'.ogg';
   const candidates=[stem+'-seamless'+ext];
   for(let n=2;n<20;n++) candidates.push(stem+'-seamless-'+n+ext);
   for(const n of candidates){
@@ -1505,7 +1507,7 @@ function musicNativeStem(name){
 function findSiblingExport(nativeName, kind){
   if(!nativeName || (kind!=='music' && kind!=='vocals')) return null;
   const stem=musicNativeStem(nativeName);
-  const exts=['.mp3','.m4a','.wav'];
+  const exts=['.ogg','.mp3','.m4a','.wav']; // v6.27 prefer ogg; keep legacy
   for(const ext of exts){
     const n=stem+'-'+kind+ext;
     if(diskFileIndex[n]) return n;
@@ -1676,7 +1678,7 @@ async function startHelperRec(s, isAuto){
   if(isHelperRecording(s)) return;
   s.helperStarting=true;
   try{
-    const d=await helperFetch('/api/record', {username:s.username, quality:cfg.helperQuality||'best'}, 8000);
+    const d=await helperFetch('/api/record', {username:s.username, quality:cfg.helperQuality||'audio_only'}, 8000);
     if(!d || !d.ok) throw new Error((d && d.error) || 'helper record failed');
     if(!d.already){
       if(d.retrying){
@@ -2919,7 +2921,7 @@ function recCardHTML(s, helperJob){
     const sess=Date.parse(helperJob.sessionStartedAt||helperJob.startedAt);
     const secs=isFinite(sess)?Math.max(0, Math.floor((Date.now()-sess)/1000)):0;
     const size=((helperJob.size||0)/1048576).toFixed(1)+' MB';
-    const ext=((helperJob.file||'').split('.').pop()||'mp4').toUpperCase();
+    const ext=((helperJob.file||'').split('.').pop()||'ogg').toUpperCase();
     const color=s.color||'#9146ff';
     const retrying=!!helperJob.retrying;
     const resumes=Math.max(0, parseInt(helperJob.resumes,10)||0);

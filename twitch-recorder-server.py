@@ -17,7 +17,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8765
-HELPER_VERSION = "6.26"
+HELPER_VERSION = "6.27"
 REC_DIR = Path.home() / "TwitchRecordings"
 HTML_NAME = "twitch-auto-recorder.html"
 HERE = Path(__file__).resolve().parent
@@ -604,23 +604,32 @@ def stop_all_locked():
 
 
 def build_cmd(username, quality):
+    """Always write OGG audio for helper recordings (no mp4). Uses streamlink audio_only.
+
+    With ffmpeg: --ffmpeg-fout ogg → unique_recording_path(..., "ogg").
+    Without ffmpeg: ogg remux is impossible, so fall back to .ts only.
+    UI may pass quality best|audio_only; both map to audio_only for reliable OGG.
+    """
     sl = which_streamlink()
     ff = which_ffmpeg()
+    # Supported OGG path is audio_only (video→ogg is unreliable / not wanted).
+    sl_quality = "audio_only"
     if ff:
-        out = unique_recording_path(username, "mp4")
+        out = unique_recording_path(username, "ogg")
         cmd = [
             sl,
             "--force",
             "--output",
             str(out),
             "--ffmpeg-fout",
-            "mp4",
+            "ogg",
             f"twitch.tv/{username}",
-            quality,
+            sl_quality,
         ]
     else:
+        # streamlink cannot remux to ogg without ffmpeg — keep .ts fallback
         out = unique_recording_path(username, "ts")
-        cmd = [sl, "--force", "--output", str(out), f"twitch.tv/{username}", quality]
+        cmd = [sl, "--force", "--output", str(out), f"twitch.tv/{username}", sl_quality]
     return cmd, out
 
 
@@ -1134,7 +1143,7 @@ def start_record(username, quality):
         err = "streamlink not found — install with: pip install streamlink"
         set_last_error(username, err)
         return {"ok": False, "error": err}
-    quality = quality if quality in ("audio_only", "best") else "best"
+    quality = quality if quality in ("audio_only", "best") else "audio_only"
     disk_err = disk_block_error()
     if disk_err:
         set_last_error(username, disk_err)
@@ -1526,11 +1535,11 @@ def is_music_export_name(name):
 
 
 def find_existing_sibling(src_name, kind):
-    """Return Path of existing <stem>-{kind}.{mp3,m4a,wav} (prefer mp3), or None."""
+    """Return Path of existing <stem>-{kind}.{ogg,mp3,m4a,wav} (prefer ogg), or None."""
     if kind not in ("music", "vocals"):
         return None
     stem = music_base_stem(src_name)
-    for ext in (".mp3", ".m4a", ".wav"):
+    for ext in (".ogg", ".mp3", ".m4a", ".wav"):
         p = REC_DIR / f"{stem}-{kind}{ext}"
         try:
             if p.is_file():
@@ -1545,7 +1554,7 @@ def delete_music_siblings(src_name):
     stem = music_base_stem(src_name)
     removed = []
     for kind in ("music", "vocals"):
-        for ext in (".mp3", ".m4a", ".wav"):
+        for ext in (".ogg", ".mp3", ".m4a", ".wav"):
             p = REC_DIR / f"{stem}-{kind}{ext}"
             try:
                 if not p.is_file():
@@ -1613,7 +1622,7 @@ def _find_vocals(work_dir):
 
 
 def _remux_instrumental(wav_path, dest_path):
-    """Prefer mp3/m4a via ffmpeg; else copy wav. Returns final Path."""
+    """Prefer OGG (libvorbis, then libopus) via ffmpeg; else copy wav. Returns final Path."""
     ff = which_ffmpeg()
     wav_path = Path(wav_path)
     dest_path = Path(dest_path)
@@ -1621,10 +1630,10 @@ def _remux_instrumental(wav_path, dest_path):
         final = dest_path.with_suffix(".wav")
         shutil.copy2(str(wav_path), str(final))
         return final
-    # Try mp3 first (smaller), then m4a, else wav copy
+    # Prefer ogg; fall back wav only if ogg encode fails (legacy mp3/m4a no longer preferred)
     for ext, args in (
-        (".mp3", ["-codec:a", "libmp3lame", "-q:a", "2"]),
-        (".m4a", ["-codec:a", "aac", "-b:a", "192k"]),
+        (".ogg", ["-codec:a", "libvorbis", "-q:a", "5"]),
+        (".ogg", ["-codec:a", "libopus", "-b:a", "128k"]),
     ):
         out = dest_path.with_suffix(ext)
         cmd = [
@@ -1645,7 +1654,12 @@ def _remux_instrumental(wav_path, dest_path):
             )
             if r.returncode == 0 and out.is_file() and out.stat().st_size > 0:
                 return out
-            log(f"ffmpeg remux to {ext} failed: {(r.stderr or '')[-400:]}")
+            log(f"ffmpeg remux to {ext} ({args[1]}) failed: {(r.stderr or '')[-400:]}")
+            try:
+                if out.is_file() and out.stat().st_size == 0:
+                    out.unlink()
+            except OSError:
+                pass
         except (OSError, subprocess.TimeoutExpired) as e:
             log(f"ffmpeg remux {ext} error: {e}")
     final = dest_path.with_suffix(".wav")
@@ -1851,25 +1865,25 @@ def _run_demucs(src_path, work_dir, progress_cb):
 
 
 def _unique_sibling_dest(src_name, kind):
-    """Pick REC_DIR / <stem>-{kind}.mp3 (or -{kind}-N) that does not already exist as mp3/m4a/wav."""
+    """Pick REC_DIR / <stem>-{kind}.ogg (or -{kind}-N) that does not already exist as ogg/mp3/m4a/wav."""
     if kind not in ("music", "vocals"):
         raise ValueError("kind must be music or vocals")
     stem = music_base_stem(src_name)
 
     def taken(base_stem):
-        for ext in (".mp3", ".m4a", ".wav"):
+        for ext in (".ogg", ".mp3", ".m4a", ".wav"):
             if (REC_DIR / f"{base_stem}{ext}").exists():
                 return True
         return False
 
     if not taken(f"{stem}-{kind}"):
-        return REC_DIR / f"{stem}-{kind}.mp3"
+        return REC_DIR / f"{stem}-{kind}.ogg"
     n = 2
     while n < 1000:
         if not taken(f"{stem}-{kind}-{n}"):
-            return REC_DIR / f"{stem}-{kind}-{n}.mp3"
+            return REC_DIR / f"{stem}-{kind}-{n}.ogg"
         n += 1
-    return REC_DIR / f"{stem}-{kind}-{int(time.time())}.mp3"
+    return REC_DIR / f"{stem}-{kind}-{int(time.time())}.ogg"
 
 
 def _unique_music_dest(src_name):
@@ -2140,7 +2154,7 @@ def _set_seamless_job(job_id, **kwargs):
 def _unique_seamless_dest(first_name):
     """<firstSegmentStem>-seamless.<ext> next to recordings; never overwrite natives."""
     stem = Path(first_name).stem
-    ext = Path(first_name).suffix.lower() or ".mp4"
+    ext = Path(first_name).suffix.lower() or ".ogg"
     if is_seamless_export_name(first_name):
         # Avoid -seamless-seamless
         import re as _re
@@ -2318,7 +2332,7 @@ def seamless_worker(job_id, names):
 def start_seamless(body):
     """Join finished segment files into <firstStem>-seamless.<ext>.
 
-    Body: { "names": ["a.mp4", "b.mp4", ...] }
+    Body: { "names": ["a.ogg", "b.ogg", ...] }
        or { "username": "foo" } using RECENT_SESSIONS / ACTIVE finished segments.
     Never overwrites native segment files. Requires ffmpeg.
     """
@@ -2404,7 +2418,7 @@ def start_seamless(body):
     # If seamless sibling already exists for this set's first stem, return already
     first = clean[0]
     stem = Path(first).stem
-    ext = Path(first).suffix.lower() or ".mp4"
+    ext = Path(first).suffix.lower() or ".ogg"
     existing = REC_DIR / f"{stem}-seamless{ext}"
     if existing.is_file():
         return {
@@ -2781,7 +2795,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not username:
                 self.send_json({"ok": False, "error": "invalid username"}, status=400)
                 return
-            quality = body.get("quality") or "best"
+            quality = body.get("quality") or "audio_only"
             result = start_record(username, quality)
             self.send_json(result, status=200 if result.get("ok") else 400)
             return
