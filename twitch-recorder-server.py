@@ -11,15 +11,31 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8765
-HELPER_VERSION = "6.24"
+HELPER_VERSION = "6.25"
 REC_DIR = Path.home() / "TwitchRecordings"
 HTML_NAME = "twitch-auto-recorder.html"
 HERE = Path(__file__).resolve().parent
+
+# GitHub auto-update (public repo). Install dir = directory of this running script
+# (Application Support when installed via LaunchAgent / Desktop launcher).
+UPDATE_REPO = "ewanders1-web/twitch-auto-recorder"
+UPDATE_BRANCH = "main"
+UPDATE_RAW_BASE = (
+    f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}/"
+)
+UPDATE_FILES = (
+    "twitch-auto-recorder.html",
+    "twitch-recorder-server.py",
+    "README-recorder.txt",
+    "VERSION",
+)
+INSTALL_DIR = HERE
 
 # Quick-fail window and backoff between early streamlink retries (went-live race).
 QUICK_FAIL_SECS = 20
@@ -1222,6 +1238,193 @@ def music_jobs_for_health():
     return out
 
 
+def local_helper_version():
+    """Prefer HELPER_VERSION; fall back to VERSION file next to the script."""
+    ver = str(HELPER_VERSION or "").strip()
+    if ver:
+        return ver
+    try:
+        p = INSTALL_DIR / "VERSION"
+        if p.is_file():
+            return p.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _parse_version_tuple(s):
+    """Best-effort numeric tuple for compare (6.25 -> (6, 25))."""
+    import re as _re
+    parts = _re.findall(r"\d+", str(s or ""))
+    if not parts:
+        return (0,)
+    try:
+        return tuple(int(x) for x in parts)
+    except ValueError:
+        return (0,)
+
+
+def fetch_url_text(url, timeout=12):
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"TwitchAutoRecorder/{HELPER_VERSION}"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    return raw.decode("utf-8", errors="replace")
+
+
+def fetch_url_bytes(url, timeout=30):
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"TwitchAutoRecorder/{HELPER_VERSION}"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def fetch_remote_version():
+    """Fetch remote VERSION; optionally parse HELPER_VERSION from server script."""
+    ver = ""
+    try:
+        ver = fetch_url_text(UPDATE_RAW_BASE + "VERSION", timeout=12).strip().splitlines()[0].strip()
+    except Exception as e:
+        log(f"update check VERSION fetch failed: {e}")
+    if not ver:
+        try:
+            py = fetch_url_text(UPDATE_RAW_BASE + "twitch-recorder-server.py", timeout=20)
+            import re as _re
+            m = _re.search(r'HELPER_VERSION\s*=\s*["\']([^"\']+)["\']', py)
+            if m:
+                ver = m.group(1).strip()
+        except Exception as e:
+            log(f"update check HELPER_VERSION parse failed: {e}")
+            raise
+    if not ver:
+        raise RuntimeError("could not determine remote version")
+    return ver
+
+
+def check_update():
+    local = local_helper_version()
+    try:
+        remote = fetch_remote_version()
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "localVersion": local,
+            "remoteVersion": None,
+            "updateAvailable": False,
+            "repo": UPDATE_REPO,
+            "rawBase": UPDATE_RAW_BASE,
+        }
+    available = _parse_version_tuple(remote) > _parse_version_tuple(local)
+    out = {
+        "ok": True,
+        "localVersion": local,
+        "remoteVersion": remote,
+        "updateAvailable": available,
+        "repo": UPDATE_REPO,
+        "rawBase": UPDATE_RAW_BASE,
+    }
+    if available:
+        out["files"] = list(UPDATE_FILES)
+    return out
+
+
+def atomic_write_bytes(dest: Path, data: bytes):
+    """Write via temp file in same dir then os.replace (atomic on same volume)."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=dest.name + ".",
+        suffix=".tmp",
+        dir=str(dest.parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(str(tmp_path), str(dest))
+    except Exception:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def apply_update():
+    """Download UPDATE_FILES into INSTALL_DIR. Never self-kill; always needsRestart."""
+    local = local_helper_version()
+    try:
+        remote = fetch_remote_version()
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"version check failed: {e}",
+            "localVersion": local,
+            "restarted": False,
+            "needsRestart": False,
+        }
+
+    written = []
+    try:
+        for name in UPDATE_FILES:
+            url = UPDATE_RAW_BASE + name
+            data = fetch_url_bytes(url, timeout=45)
+            if not data:
+                raise RuntimeError(f"empty download: {name}")
+            dest = INSTALL_DIR / name
+            atomic_write_bytes(dest, data)
+            written.append(name)
+            log(f"update wrote {dest} ({len(data)} bytes)")
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "localVersion": local,
+            "remoteVersion": remote,
+            "written": written,
+            "restarted": False,
+            "needsRestart": False,
+        }
+
+    with LOCK:
+        reap_locked()
+        active = list(ACTIVE.keys())
+
+    note = (
+        "Update files written. Restart the helper (LaunchAgent / Desktop launcher / "
+        "stop+start twitch-recorder-server.py), then hard-refresh the recorder page."
+    )
+    if active:
+        note = (
+            f"Update written while recording {', '.join(active)} — process left running. "
+            "Restart the helper after recordings finish, then hard-refresh the page."
+        )
+
+    return {
+        "ok": True,
+        "version": remote,
+        "localVersion": local,
+        "remoteVersion": remote,
+        "written": written,
+        "installDir": str(INSTALL_DIR),
+        "active": active,
+        "restarted": False,
+        "needsRestart": True,
+        "note": note,
+    }
+
+
+
 def health_payload():
     with LOCK:
         reap_locked()
@@ -1253,6 +1456,7 @@ def health_payload():
         "diskBlock": disk["diskBlock"],
         "musicJobs": music_jobs_for_health(),
         "seamlessJobs": seamless_jobs_for_health(),
+        "updateRepo": f"https://github.com/{UPDATE_REPO}",
     }
 
 
@@ -2514,6 +2718,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/health":
             self.send_json(health_payload())
             return
+        if path == "/api/update/check":
+            self.send_json(check_update())
+            return
         if path == "/api/status":
             self.send_json(status_payload())
             return
@@ -2564,6 +2771,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path == "/api/update":
+            result = apply_update()
+            self.send_json(result, status=200 if result.get("ok") else 400)
+            return
         if path == "/api/record":
             body = self.read_json()
             username = safe_username(body.get("username"))

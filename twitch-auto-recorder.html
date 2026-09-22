@@ -36,6 +36,13 @@
   .s-live{color:#ff6b6b;font-weight:700;}
   .s-rec{color:#ff6b6b;font-weight:800;}
   .s-armed{color:#6ee7b7;font-weight:700;font-size:.72rem;margin-left:.35rem;}
+  .s-home{color:#fcd34d;font-weight:700;font-size:.72rem;margin-left:.35rem;}
+  .btn-home{background:#3a3420;color:#fcd34d;border:1px solid #6b5a1e;}
+  .btn-home.is-home{background:#fcd34d;color:#1a1408;border-color:#fcd34d;font-weight:800;}
+  .home-bar{display:flex;align-items:center;gap:.65rem;flex-wrap:wrap;margin-bottom:.75rem;font-size:.8rem;color:#c4b5fd;}
+  .update-box{background:#22222a;border:1px solid #31313a;border-radius:.85rem;padding:.85rem 1rem;margin-top:1rem;}
+  .update-box .verline{font-size:.8rem;color:#a1a1aa;margin:.35rem 0 .55rem;}
+
   .s-retry{color:#fcd34d;font-weight:700;font-size:.72rem;margin-left:.35rem;}
   .s-herr{color:#fca5a5;font-weight:600;font-size:.7rem;margin-top:.15rem;max-width:28rem;line-height:1.35;}
   .s-herr.muted{color:#9ca3af;font-weight:500;}
@@ -179,7 +186,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>Local helper + crash-safe IndexedDB • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.24</span>
+    <span class="badge">v6.25</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -200,6 +207,15 @@
     <div class="api-bar" id="helperBar">
       <div id="helperDot" class="dot"></div>
       <span id="helperTxt">Not running — using tab capture</span>
+      <button class="btn btn-gray btn-sm" style="margin-left:auto" id="checkUpdateBtn" onclick="checkForUpdates()" title="Compare local helper version to GitHub">Check for updates</button>
+    </div>
+    <div id="updatePanel" class="update-box hidden">
+      <strong style="font-size:.88rem">⬆ Helper update</strong>
+      <div class="verline" id="updateVerLine">—</div>
+      <div style="display:flex;gap:.45rem;flex-wrap:wrap;align-items:center;">
+        <button class="btn btn-purple btn-sm hidden" id="installUpdateBtn" onclick="installUpdate()">Install update</button>
+        <button class="btn btn-gray btn-sm" onclick="hideUpdatePanel()">Dismiss</button>
+      </div>
     </div>
     <!-- v6.24: sticky one-shot when Auto Music only is on but demucs is missing -->
     <div id="demucsMissingBanner" class="alert alert-err hidden" role="status"></div>
@@ -275,6 +291,13 @@
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.9rem;flex-wrap:wrap;gap:.5rem;">
       <h2 style="font-size:1.05rem">Watched Streamers</h2>
       <span style="font-size:.76rem;color:#9ca3af">Toggle Auto-Record and Arm capture per streamer</span>
+    </div>
+    <div class="home-bar">
+      <span>🏠 Home streamer: <strong id="homeStreamerLabel">(none)</strong></span>
+      <label title="When a non-home guest/DJ set ends (live→offline), Auto-Rec starts the home streamer if they are live and not already recording.">
+        <input type="checkbox" id="returnHomeToggle" checked onchange="saveReturnHomeToggle()"> Return home after set
+      </label>
+      <button class="btn btn-gray btn-sm" id="clearHomeBtn" onclick="clearHomeStreamer()" title="Clear home streamer">Clear home</button>
     </div>
     <div id="streamerList"></div>
     <div class="add-row">
@@ -365,6 +388,14 @@
       <p class="hint">then open <code>http://127.0.0.1:8765/</code></p>
       <p class="hint">You can still use this HTML as a <code>file://</code> tab-capture app without the helper. The helper binds localhost only.</p>
     </div>
+    <div class="step-block">
+      <p><span class="step-num">5</span><strong>Helper auto-update (GitHub)</strong></p>
+      <p class="hint">Public repo <code>ewanders1-web/twitch-auto-recorder</code>. Check compares local helper <code>VERSION</code> / HELPER_VERSION to remote, then can download HTML + server + README into the install dir (Application Support when installed).</p>
+      <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin-top:.4rem;">
+        <button class="btn btn-gray btn-sm" onclick="checkForUpdates()">Check for updates</button>
+        <span id="setupUpdateHint" style="font-size:.76rem;color:#9ca3af"></span>
+      </div>
+    </div>
     <div style="display:flex;gap:.7rem;margin-top:1rem;flex-wrap:wrap;">
       <button class="btn btn-purple" onclick="connectAPI()">🔌 Connect & Test</button>
       <button class="btn btn-gray"   onclick="disconnectAPI()">Disconnect</button>
@@ -380,13 +411,15 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.24'; // keep in sync with badge + HELPER_VERSION
-let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'best', seamlessRecordings:true, autoMusicOnly:true };
-let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', demucsHint:'', recordingsDir:'', installHint:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false };
+const UI_VERSION = '6.25'; // keep in sync with badge + HELPER_VERSION
+let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'best', seamlessRecordings:true, autoMusicOnly:true, homeStreamer:'', returnHomeAfterSet:true };
+let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
 let musicJobsNotified = new Set(); // jobIds already fireNotify'd for done/error (health spam safe)
 let autoMusicQueued = new Set(); // basenames already auto-queued this session (dedupe mid-stream + stop)
 let helperDemucsMissingNotified = false; // v6.24: one-shot demucs-missing flash/notify per episode
+let updateCheck = { localVersion:'', remoteVersion:'', updateAvailable:false, checking:false, installing:false }; // v6.25
+
 let seamlessJobs = {}; // key(name|joinKey) -> {jobId, status, progress, error, outputName, names}
 let seamlessJobsNotified = new Set();
 let seamlessAutoStarted = new Set(); // joinKey already auto-queued this session (avoid spam)
@@ -498,7 +531,9 @@ function persist(){
       notifyOptIn: !!cfg.notifyOptIn,
       helperQuality: cfg.helperQuality==='audio_only'?'audio_only':'best',
       seamlessRecordings: cfg.seamlessRecordings!==false,
-      autoMusicOnly: cfg.autoMusicOnly!==false
+      autoMusicOnly: cfg.autoMusicOnly!==false,
+      homeStreamer: String(cfg.homeStreamer||'').toLowerCase(),
+      returnHomeAfterSet: cfg.returnHomeAfterSet!==false
     }));
   }catch(e){ console.warn('persist failed', e); }
 }
@@ -531,6 +566,10 @@ function restoreSettings(){
     // v6.23: Auto Music only default on when missing
     if(typeof data.autoMusicOnly==='boolean') cfg.autoMusicOnly=data.autoMusicOnly;
     else cfg.autoMusicOnly=true;
+    // v6.25: home streamer + return after guest/DJ set
+    cfg.homeStreamer=data.homeStreamer?String(data.homeStreamer).toLowerCase():'';
+    if(typeof data.returnHomeAfterSet==='boolean') cfg.returnHomeAfterSet=data.returnHomeAfterSet;
+    else cfg.returnHomeAfterSet=true;
     if(Array.isArray(data.streamers)){
       restoredStreamerList=true; // even an empty list is user data — don't overwrite
       streamers=data.streamers.filter(s=>s&&s.username).map((s,i)=>makeStreamer(
@@ -622,7 +661,7 @@ function markHelperDown(wasOk){
   if(wasOk && !helperDropNotified){
     helperActiveOnDrop=(helper.active||[]).map(function(a){ return a && a.username; }).filter(Boolean);
   }
-  helper.ok=false; helper.streamlink=false; helper.ffmpeg=false; helper.seamless=false; helper.demucs=false; helper.version=''; helper.demucsHint=''; helper.installHint=''; helper.active=[]; helper.lastErrors={};
+  helper.ok=false; helper.streamlink=false; helper.ffmpeg=false; helper.seamless=false; helper.demucs=false; helper.version=''; helper.demucsHint=''; helper.installHint=''; helper.updateRepo=''; helper.active=[]; helper.lastErrors={};
   helper.diskFree=null; helper.diskTotal=null; helper.diskWarn=false; helper.diskBlock=false;
   // v6.24: hide demucs sticky while helper is down (not the same as demucs missing)
   helperDemucsMissingNotified=false;
@@ -1170,6 +1209,7 @@ function pingHelperAndStatus(){
       helper.demucsHint=d.demucsHint||(!d.demucs?'pip install demucs (first run downloads models)':'');
       helper.recordingsDir=d.recordingsDir||'';
       helper.installHint=d.installHint||(!d.streamlink?'pip install streamlink':'');
+      helper.updateRepo=d.updateRepo?String(d.updateRepo):'';
       if(d.lastErrors && typeof d.lastErrors==='object') helper.lastErrors=d.lastErrors;
       helper.diskFree=(typeof d.diskFree==='number')?d.diskFree:null;
       helper.diskTotal=(typeof d.diskTotal==='number')?d.diskTotal:null;
@@ -1857,6 +1897,160 @@ async function recoverIdbRecordings(){
 }
 
 
+// ─── HOME STREAMER (v6.25) ───────────────────────────
+function updateHomeStreamerUI(){
+  const lab=document.getElementById('homeStreamerLabel');
+  if(lab) lab.textContent=cfg.homeStreamer||'(none)';
+  const tog=document.getElementById('returnHomeToggle');
+  if(tog) tog.checked=cfg.returnHomeAfterSet!==false;
+  const clr=document.getElementById('clearHomeBtn');
+  if(clr) clr.disabled=!cfg.homeStreamer;
+}
+function toggleHomeStreamer(username){
+  const n=String(username||'').toLowerCase();
+  if(!n) return;
+  if(String(cfg.homeStreamer||'')===n){
+    cfg.homeStreamer='';
+    flashOk('Home streamer cleared.');
+  }else{
+    cfg.homeStreamer=n;
+    flashOk('Home streamer set to '+n+' — will return after a non-home set ends (if Return home is on).');
+  }
+  persist();
+  updateHomeStreamerUI();
+  renderStreamers();
+}
+function clearHomeStreamer(){
+  if(!cfg.homeStreamer){ flashOk('No home streamer set.'); return; }
+  cfg.homeStreamer='';
+  persist();
+  updateHomeStreamerUI();
+  renderStreamers();
+  flashOk('Home streamer cleared.');
+}
+function saveReturnHomeToggle(){
+  const el=document.getElementById('returnHomeToggle');
+  cfg.returnHomeAfterSet=el?!!el.checked:true;
+  persist();
+  flashOk(cfg.returnHomeAfterSet
+    ? 'Return home after set ON — when a guest/DJ goes offline, Auto-Rec starts home if live.'
+    : 'Return home after set OFF.');
+}
+/** After a non-home streamer goes offline (set ended), kick home Auto-Rec if eligible. */
+function maybeReturnHome(endedUsername){
+  if(cfg.returnHomeAfterSet===false) return null;
+  const home=String(cfg.homeStreamer||'').toLowerCase();
+  if(!home) return null;
+  const ended=String(endedUsername||'').toLowerCase();
+  if(ended && ended===home) return null; // home itself ended
+  const hs=findStreamer(home);
+  if(!hs) return null;
+  if(!hs.isLive) return null;
+  if(!hs.autoRec) return null;
+  if(isRecording(hs)) return null; // already on home — do not steal focus / double-start
+  flashOk('Returning to home streamer '+home);
+  fireNotify('tar-home', 'Returning to home streamer '+home, 'Set ended — starting Auto-Rec for '+home);
+  hs.lastStartFailFlash=0;
+  hs.needArmNotified=false;
+  return Promise.resolve().then(function(){ return startRec(home, true); });
+}
+
+// ─── GITHUB AUTO-UPDATE (v6.25) ───────────────────────
+function hideUpdatePanel(){
+  const p=document.getElementById('updatePanel');
+  if(p) p.classList.add('hidden');
+  const btn=document.getElementById('installUpdateBtn');
+  if(btn) btn.classList.add('hidden');
+}
+function showUpdatePanel(msg, showInstall){
+  const p=document.getElementById('updatePanel');
+  const line=document.getElementById('updateVerLine');
+  const btn=document.getElementById('installUpdateBtn');
+  if(line) line.textContent=msg;
+  if(p) p.classList.remove('hidden');
+  if(btn){
+    if(showInstall) btn.classList.remove('hidden');
+    else btn.classList.add('hidden');
+  }
+  const hint=document.getElementById('setupUpdateHint');
+  if(hint) hint.textContent=msg;
+}
+async function checkForUpdates(){
+  if(updateCheck.checking) return;
+  if(!helper.ok){
+    flashErr('Helper not running — start the local helper to check for updates.');
+    showUpdatePanel('Helper offline — cannot check GitHub from this page alone.', false);
+    return;
+  }
+  updateCheck.checking=true;
+  try{
+    const d=await helperFetch('/api/update/check', undefined, 15000);
+    if(!d || !d.ok){
+      flashErr('Update check failed: '+(d&&d.error?d.error:'unknown'));
+      showUpdatePanel('Check failed: '+(d&&d.error?d.error:'unknown'), false);
+      return;
+    }
+    updateCheck.localVersion=d.localVersion||helper.version||UI_VERSION;
+    updateCheck.remoteVersion=d.remoteVersion||'';
+    updateCheck.updateAvailable=!!d.updateAvailable;
+    const msg='Local v'+(updateCheck.localVersion||'?')+' · Remote v'+(updateCheck.remoteVersion||'?')
+      +(d.repo?(' · '+d.repo):'');
+    if(d.updateAvailable){
+      flashOk('Update available: v'+updateCheck.remoteVersion+' (you have v'+updateCheck.localVersion+'). Click Install update to confirm.');
+      showUpdatePanel(msg+' — update available. Click Install update to download into the helper install dir.', true);
+    }else{
+      flashOk('Up to date — local v'+updateCheck.localVersion+' matches remote.');
+      showUpdatePanel(msg+' — up to date.', false);
+    }
+  }catch(e){
+    flashErr('Update check failed: '+(e.message||e));
+    showUpdatePanel('Check failed: '+(e.message||e), false);
+  }finally{
+    updateCheck.checking=false;
+  }
+}
+async function installUpdate(){
+  if(updateCheck.installing) return;
+  if(!updateCheck.updateAvailable){
+    flashErr('No update queued — run Check for updates first.');
+    return;
+  }
+  if(!helper.ok){
+    flashErr('Helper not running — cannot install update.');
+    return;
+  }
+  // Confirm via flash + button click (this is the confirm); not browser confirm().
+  flashOk('Installing update v'+(updateCheck.remoteVersion||'')+'…');
+  updateCheck.installing=true;
+  const btn=document.getElementById('installUpdateBtn');
+  if(btn){ btn.disabled=true; btn.textContent='Installing…'; }
+  try{
+    const d=await helperFetch('/api/update', {}, 60000);
+    if(!d || !d.ok){
+      flashErr('Install failed: '+(d&&d.error?d.error:'unknown'));
+      showUpdatePanel('Install failed: '+(d&&d.error?d.error:'unknown'), true);
+      return;
+    }
+    updateCheck.updateAvailable=false;
+    const ver=d.version||updateCheck.remoteVersion||'';
+    let msg='Installed v'+ver+'. Restart the helper';
+    if(d.needsRestart!==false) msg+=' (needsRestart)';
+    if(Array.isArray(d.active)&&d.active.length) msg+=' — active recording(s): '+d.active.join(', ')+' (process left running)';
+    msg+='. Then hard-refresh this page (Cmd/Ctrl+Shift+R).';
+    if(d.note) msg+=' '+d.note;
+    msg+=' If you use the Desktop launcher / LaunchAgent, quit & relaunch (or restart the agent).';
+    flashOk(msg);
+    showUpdatePanel(msg, false);
+    fireNotify('tar-update', 'Helper update installed', 'v'+ver+' — restart helper + hard-refresh');
+  }catch(e){
+    flashErr('Install failed: '+(e.message||e));
+    showUpdatePanel('Install failed: '+(e.message||e), true);
+  }finally{
+    updateCheck.installing=false;
+    if(btn){ btn.disabled=false; btn.textContent='Install update'; }
+  }
+}
+
 // ─── STREAMER MANAGEMENT ─────────────────────────────
 async function addStreamer(){
   const raw=document.getElementById('addInput').value;
@@ -1891,7 +2085,11 @@ function removeStreamer(username){
   if(helper.active.some(a=>a.username===username)) helperStop(username);
   teardownCapture(s);
   streamers.splice(idx,1);
+  if(String(cfg.homeStreamer||'')===String(username||'').toLowerCase()){
+    cfg.homeStreamer='';
+  }
   persist();
+  updateHomeStreamerUI();
   renderStreamers(); loadSchedule(); renderLiveBanners(); updateNeedArmBanner(); updateNextSched(); updateStatusUI(); updateHealthPanel();
 }
 
@@ -1916,12 +2114,17 @@ function toggleAutoRec(username){
 function renderStreamers(){
   const el=document.getElementById('streamerList');
   if(!el) return;
+  updateHomeStreamerUI();
   if(!streamers.length){el.innerHTML='<div style="text-align:center;padding:1.5rem;color:#555;font-size:.88rem">No streamers yet — add one below.</div>';return;}
-  el.innerHTML=streamers.map(s=>`
+  const home=String(cfg.homeStreamer||'').toLowerCase();
+  el.innerHTML=streamers.map(s=>{
+    const isHome=home && s.username===home;
+    return `
     <div class="streamer-row">
       <div class="s-dot" style="background:${s.color}"></div>
       <div>
         <div class="s-name">${s.username}
+          ${isHome?'<span class="s-home"> ★ HOME</span>':''}
           ${s.isLive?'<span class="s-live"> ● LIVE</span>':'<span class="s-status"> offline</span>'}
           ${isRecording(s)?'<span class="s-rec"> ● REC</span>':''}
           ${helperIsRetrying(s.username)?'<span class="s-retry">● RETRYING</span>':''}
@@ -1931,6 +2134,7 @@ function renderStreamers(){
         ${helperErrorHTML(s.username, 'Helper: ')}
       </div>
       <div class="streamer-controls">
+        <button class="btn btn-sm btn-home ${isHome?'is-home':''}" onclick="toggleHomeStreamer('${s.username}')" title="${isHome?'Clear home streamer':'Set as home streamer (return after guest/DJ set)'}">${isHome?'★ Home':'☆ Home'}</button>
         <div class="s-arm">
           Auto-Rec
           <label class="switch">
@@ -1946,7 +2150,8 @@ function renderStreamers(){
           : `<button class="btn btn-purple btn-sm" onclick="armCapture('${s.username}')">🎧 Arm</button>`)}
         <button class="btn btn-red btn-sm" onclick="removeStreamer('${s.username}')">✕</button>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 // ─── TWITCH API ───────────────────────────────────────
@@ -2149,6 +2354,12 @@ function applyLiveStatus(s, data){
     if(helper.active.some(a=>a.username===s.username)){
       flashOk(`📴 ${s.username} went offline — stopping helper recording.`);
       stopRec(s.username, 'helper');
+    }
+    // v6.25: guest/DJ set ended → return to home streamer if eligible
+    const homeP=maybeReturnHome(s.username);
+    if(homeP && !startP) startP=homeP;
+    else if(homeP && startP){
+      startP=Promise.allSettled([startP, homeP]).then(function(){});
     }
   }
   return startP;
@@ -3701,6 +3912,7 @@ initFormats();
 initHelperQuality();
 initSeamlessToggle();
 initAutoMusicOnlyToggle();
+updateHomeStreamerUI();
 renderStreamers();
 renderHist();
 updateNotifyBtn();

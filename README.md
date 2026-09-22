@@ -2,7 +2,7 @@
 
 Local multi-streamer Twitch recorder (HTML UI + Python streamlink helper) with seamless segment joins, Music only (Demucs), Auto Music only, and Convert upload.
 
-**Current version:** see badge in `twitch-auto-recorder.html` / `HELPER_VERSION` in `twitch-recorder-server.py` (also `VERSION`).
+**Current version:** 6.25 — see badge in `twitch-auto-recorder.html` / `HELPER_VERSION` in `twitch-recorder-server.py` (also `VERSION`).
 
 ## Quick start (Mac)
 
