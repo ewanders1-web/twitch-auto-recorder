@@ -1,0 +1,3734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Twitch Auto-Recorder</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:radial-gradient(circle at top,#2c1648 0%,#18181b 42%,#101014 100%);min-height:100vh;padding:1rem;color:#efeff1;}
+  .container{max-width:1120px;margin:0 auto;}
+  .card{background:#17171c;border-radius:1.25rem;overflow:hidden;border:1px solid #2d2d35;box-shadow:0 24px 70px rgba(0,0,0,.45);}
+  .header{background:linear-gradient(135deg,#7c3aed 0%,#5b21b6 50%,#312e81 100%);padding:1.4rem 1.8rem;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.75rem;}
+  .header h1{font-size:1.4rem;} .header p{font-size:.8rem;opacity:.85;margin-top:.2rem;}
+  .badge{background:rgba(0,0,0,.3);padding:.3rem .8rem;border-radius:999px;font-size:.72rem;font-weight:700;}
+  .tabs{display:flex;background:#18181b;overflow-x:auto;}
+  .tab{flex:1;min-width:72px;padding:.85rem .4rem;background:none;border:none;color:#888;cursor:pointer;font-size:.82rem;font-weight:600;border-bottom:3px solid transparent;transition:.2s;white-space:nowrap;}
+  .tab:hover{color:#fff;} .tab.active{color:#bf94ff;border-bottom-color:#9146ff;background:#1f1f23;}
+  .tab-content{display:none;padding:1.35rem 1.6rem 1.6rem;} .tab-content.active{display:block;}
+  lbl{display:block;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#9ca3af;margin:.85rem 0 .35rem;}
+  label{display:block;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#9ca3af;margin:.85rem 0 .35rem;}
+  input[type=text],input[type=password],select,input[type=number]{width:100%;padding:.68rem .9rem;border-radius:.5rem;border:1px solid #3a3a44;background:#26262c;color:#fff;font-size:.93rem;}
+  input:focus,select:focus{outline:none;border-color:#9146ff;}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:1rem;}
+  @media(max-width:540px){.row{grid-template-columns:1fr;}}
+  .api-bar{display:flex;align-items:center;gap:.6rem;background:#22222a;padding:.8rem 1rem;border-radius:.8rem;margin-bottom:1rem;font-size:.83rem;flex-wrap:wrap;border:1px solid #31313a;}
+  .dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;background:#555;}
+  .dot.ok{background:#51cf66;box-shadow:0 0 8px #51cf66;} .dot.err{background:#ff6b6b;box-shadow:0 0 8px #ff6b6b;}
+  .dot.spin{background:#fcd34d;animation:pulse 1s infinite;}
+  @keyframes pulse{50%{opacity:.35;}}
+
+  /* streamer list */
+  .streamer-row{display:grid;grid-template-columns:auto 1fr auto;gap:.85rem;background:#22222a;padding:.95rem 1rem;border-radius:.85rem;margin-bottom:.55rem;border:1px solid #30303a;align-items:start;}
+  .s-dot{width:12px;height:12px;border-radius:50%;flex-shrink:0;margin-top:.35rem;box-shadow:0 0 0 4px rgba(255,255,255,.03);} 
+  .s-name{flex:1;font-size:.98rem;font-weight:700;}
+  .s-status{font-size:.74rem;color:#9ca3af;}
+  .s-live{color:#ff6b6b;font-weight:700;}
+  .s-rec{color:#ff6b6b;font-weight:800;}
+  .s-armed{color:#6ee7b7;font-weight:700;font-size:.72rem;margin-left:.35rem;}
+  .s-retry{color:#fcd34d;font-weight:700;font-size:.72rem;margin-left:.35rem;}
+  .s-herr{color:#fca5a5;font-weight:600;font-size:.7rem;margin-top:.15rem;max-width:28rem;line-height:1.35;}
+  .s-herr.muted{color:#9ca3af;font-weight:500;}
+  .s-herr .btn{margin-left:.35rem;vertical-align:middle;}
+  .hist-actions{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;}
+  .music-redo{display:inline-flex;align-items:center;gap:.25rem;font-size:.72rem;color:#a78bfa;cursor:pointer;user-select:none;white-space:nowrap;}
+  .music-redo input{accent-color:#a78bfa;cursor:pointer;}
+  .toggle-row{display:flex;align-items:center;gap:.55rem;flex-wrap:wrap;margin:.35rem 0 .15rem;}
+  .toggle-row label{margin:0;font-size:.82rem;color:#d4d4d8;cursor:pointer;user-select:none;display:inline-flex;align-items:center;gap:.45rem;}
+  .toggle-row input[type=checkbox]{accent-color:#9146ff;width:1rem;height:1rem;cursor:pointer;}
+  .upload-music-box{background:#22222a;border:1px solid #31313a;border-radius:.85rem;padding:.85rem 1rem;margin-bottom:.85rem;}
+  .upload-music-box .hint{font-size:.72rem;color:#9ca3af;margin-top:.35rem;}
+  .music-progress{display:flex;align-items:center;gap:.4rem;margin-top:.4rem;max-width:22rem;flex-wrap:wrap;}
+  .music-progress-track{flex:1;min-width:6rem;height:.42rem;background:#2a2a33;border-radius:999px;overflow:hidden;border:1px solid #3a3a48;}
+  .music-progress-fill{height:100%;width:0%;background:linear-gradient(90deg,#c4b5fd,#a78bfa,#9146ff);border-radius:999px;transition:width .3s ease;box-shadow:0 0 8px rgba(145,70,255,.45);}
+  .music-progress-fill.indeterminate{width:28%;opacity:.65;animation:musicPulse 1.1s ease-in-out infinite;}
+  @keyframes musicPulse{0%,100%{opacity:.4}50%{opacity:.9}}
+  .music-progress-pct{font-size:.7rem;color:#c4b5fd;font-weight:700;min-width:2.5rem;text-align:right;font-variant-numeric:tabular-nums;}
+  .music-progress-msg{font-size:.7rem;color:#a78bfa;max-width:14rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .hist-item .music-progress{margin-top:.3rem;max-width:100%;}
+  .hist-actions{display:flex;flex-wrap:wrap;gap:.35rem;align-items:center;justify-content:flex-end;}
+
+  a.btn{text-decoration:none;display:inline-flex;align-items:center;}
+  .add-row{display:flex;gap:.6rem;margin-top:.75rem;}
+  .add-row input{flex:1;}
+  .streamer-controls{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;justify-content:flex-end;}
+  @media(max-width:640px){
+    .streamer-row{grid-template-columns:auto 1fr;}
+    .streamer-controls{grid-column:1/-1;justify-content:flex-start;}
+  }
+
+  /* arm per-streamer */
+  .s-arm{display:flex;align-items:center;gap:.4rem;font-size:.72rem;color:#9ca3af;}
+  .switch{position:relative;width:38px;height:20px;cursor:pointer;flex-shrink:0;}
+  .switch input{display:none;}
+  .slider{position:absolute;inset:0;background:#3a3a44;border-radius:999px;transition:.2s;}
+  .slider:before{content:'';position:absolute;width:14px;height:14px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;}
+  .switch input:checked+.slider{background:#9146ff;}
+  .switch input:checked+.slider:before{transform:translateX(18px);}
+
+  /* status / stats */
+  .status-big{text-align:center;margin:1rem 0;padding:1.25rem;border-radius:1rem;background:#22222a;border:1px solid #31313a;}
+  .status-big .main{font-size:1.15rem;font-weight:800;} .status-big .sub{font-size:.76rem;color:#9ca3af;margin-top:.3rem;}
+  .status-big.rec{background:rgba(239,68,68,.12);border:1px solid #ef4444;} .status-big.rec .main{color:#ff6b6b;}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:.75rem;margin:.85rem 0 1rem;}
+  .stat{background:#22222a;padding:.85rem;border-radius:.85rem;text-align:center;border:1px solid #31313a;}
+  .stat .v{font-size:1.1rem;font-weight:800;color:#bf94ff;} .stat .l{font-size:.63rem;color:#9ca3af;text-transform:uppercase;margin-top:.2rem;}
+  .controls{display:flex;gap:.55rem;justify-content:center;flex-wrap:wrap;margin-top:.7rem;}
+  .btn{padding:.68rem 1.3rem;border:none;border-radius:.5rem;font-size:.9rem;font-weight:700;cursor:pointer;transition:.15s;display:inline-flex;align-items:center;gap:.4rem;}
+  .btn:hover:not(:disabled){transform:translateY(-1px);filter:brightness(1.12);} .btn:disabled{opacity:.4;cursor:not-allowed;}
+  .btn-rec{background:#ef4444;color:#fff;} .btn-stop{background:#f59e0b;color:#000;}
+  .btn-purple{background:#9146ff;color:#fff;} .btn-gray{background:#3a3a44;color:#fff;}
+  .btn-red{background:#dc2626;color:#fff;} .btn-sm{padding:.4rem .8rem;font-size:.78rem;}
+  .alert{padding:.82rem 1rem;border-radius:.6rem;margin-top:.75rem;font-size:.85rem;line-height:1.6;}
+  .alert-err{background:rgba(239,68,68,.12);border:1px solid #ef4444;color:#fca5a5;}
+  .alert-ok{background:rgba(16,185,129,.12);border:1px solid #10b981;color:#6ee7b7;}
+  .alert-info{background:rgba(145,70,255,.1);border:1px solid #9146ff;color:#d3b4ff;}
+  .hidden{display:none!important;}
+
+  /* rec cards + arm chips (v5 multi-record) */
+  .rec-cards{display:grid;gap:.65rem;margin:.85rem 0 .4rem;}
+  .rec-card{background:rgba(239,68,68,.12);border:1px solid #ef4444;border-left:4px solid #ef4444;border-radius:.85rem;padding:.9rem 1rem;display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap;}
+  .rec-card .who{font-weight:800;font-size:.98rem;}
+  .rec-card .meta{font-size:.78rem;color:#9ca3af;margin-top:.2rem;}
+  .arm-chip-list{display:flex;flex-wrap:wrap;gap:.4rem;width:100%;margin:-.35rem 0 .75rem;}
+  .arm-chip{font-size:.72rem;font-weight:700;padding:.22rem .6rem;border-radius:999px;border:1px solid #3a3a44;background:#1b1b22;color:#9ca3af;}
+  .arm-chip.on{border-color:#51cf66;color:#6ee7b7;background:rgba(16,185,129,.08);}
+  .arm-chip.rec{border-color:#ef4444;color:#fca5a5;background:rgba(239,68,68,.12);}
+  .arm-pick{display:flex;gap:.6rem;margin:-.15rem 0 .85rem;align-items:center;flex-wrap:wrap;}
+  .arm-pick select{flex:1;min-width:160px;}
+  /* v6.7+ multi-bar VU meters on every active rec card */
+  .rec-vu{display:flex;align-items:flex-end;gap:.55rem;margin-top:.45rem;min-height:52px;}
+  .rec-vu-bars{display:flex;align-items:flex-end;gap:2px;height:52px;padding:2px 4px;background:#1a1a22;border:1px solid #3a3a44;border-radius:.45rem;}
+  .rec-vu-bar{display:block;width:5px;height:6%;min-height:3px;border-radius:2px 2px 0 0;background:#6ee7b7;transition:height .14s ease,background .14s ease;box-shadow:0 0 6px rgba(110,231,183,.15);}
+  .rec-vu.silent .rec-vu-bar,.rec-vu.stalled .rec-vu-bar{background:#f59e0b;box-shadow:0 0 6px rgba(245,158,11,.2);}
+  .rec-vu.silent .rec-vu-txt,.rec-vu.stalled .rec-vu-txt{color:#fcd34d;}
+  .rec-vu.hot .rec-vu-txt{color:#fca5a5;}
+  .rec-vu-txt{font-size:.68rem;font-weight:800;color:#9ca3af;text-transform:uppercase;letter-spacing:.04em;align-self:center;min-width:3.4rem;}
+  .capture-keep{position:fixed;left:0;top:0;width:16px;height:16px;overflow:hidden;opacity:0;pointer-events:none;z-index:-1;}
+
+  /* schedule */
+  .sched-filters{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:.85rem;}
+  .filter-btn{padding:.3rem .75rem;border:1px solid #3a3a44;border-radius:999px;background:none;color:#9ca3af;cursor:pointer;font-size:.75rem;font-weight:600;transition:.15s;}
+  .filter-btn:hover{border-color:#9146ff;color:#bf94ff;}
+  .filter-btn.active{background:#9146ff;border-color:#9146ff;color:#fff;}
+  .sched-day-header{font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:#9ca3af;margin:1rem 0 .4rem;padding-bottom:.3rem;border-bottom:1px solid #2d2d35;}
+  .sched-item{background:#26262c;border-radius:.65rem;padding:.8rem 1rem;margin-bottom:.4rem;display:grid;grid-template-columns:70px 1fr auto;gap:.35rem .85rem;align-items:start;border-left:3px solid transparent;}
+  .sched-item.now{background:rgba(239,68,68,.08);border-left-color:#ef4444;}
+  .sched-date{font-size:.7rem;color:#9ca3af;line-height:1.5;}
+  .sched-date .t{font-size:.85rem;font-weight:800;color:#efeff1;}
+  .sched-title{font-size:.88rem;font-weight:700;}
+  .sched-meta{font-size:.73rem;color:#9ca3af;margin-top:.18rem;}
+  .sched-streamer-chip{display:inline-flex;align-items:center;gap:.3rem;font-size:.7rem;font-weight:700;padding:.15rem .55rem;border-radius:999px;margin-bottom:.2rem;color:#fff;}
+  .sched-tags{display:flex;flex-direction:column;align-items:flex-end;gap:.3rem;}
+  .tag{font-size:.66rem;font-weight:700;padding:.14rem .5rem;border-radius:999px;white-space:nowrap;}
+  .tag-live{background:#ef4444;color:#fff;} .tag-today{background:#9146ff;color:#fff;}
+  .tag-soon{background:#f59e0b;color:#000;} .tag-sched{background:#2d2d35;color:#9ca3af;}
+  .tag-cancel{background:#374151;color:#6b7280;text-decoration:line-through;}
+  .sched-empty{text-align:center;padding:2.5rem 1rem;color:#555;font-size:.88rem;}
+
+  /* history */
+  .hist-item{background:#22222a;padding:.9rem 1rem;border-radius:.85rem;margin-bottom:.55rem;display:flex;justify-content:space-between;align-items:center;gap:.9rem;flex-wrap:wrap;border:1px solid #31313a;}
+  .hist-item strong{font-size:.86rem;display:block;} .hist-item small{color:#9ca3af;font-size:.72rem;}
+
+  /* setup */
+  .step-block{background:#26262c;border-radius:.6rem;padding:.95rem 1.1rem;margin:.55rem 0;}
+  .step-num{display:inline-block;background:#9146ff;color:#fff;width:22px;height:22px;border-radius:50%;text-align:center;line-height:22px;font-size:.75rem;font-weight:800;margin-right:.5rem;}
+  code{background:#111;padding:.1rem .4rem;border-radius:.3rem;font-size:.82em;color:#f0abfc;}
+  .hint{font-size:.79rem;color:#9ca3af;margin-top:.4rem;line-height:1.5;}
+
+  .dashboard-grid{display:grid;grid-template-columns:1.45fr .95fr;gap:1rem;align-items:start;}
+  @media(max-width:860px){.dashboard-grid{grid-template-columns:1fr;}}
+  .panel{background:#1d1d24;border:1px solid #31313a;border-radius:1rem;padding:1rem;}
+  .panel h3{font-size:.86rem;text-transform:uppercase;letter-spacing:.08em;color:#a1a1aa;margin-bottom:.75rem;}
+  .rec-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:.75rem;}
+  @media(max-width:640px){.rec-grid{grid-template-columns:1fr;}}
+  .mini-stat{background:#22222a;border:1px solid #31313a;border-radius:.9rem;padding:.9rem;}
+  .mini-stat .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:#9ca3af;}
+  .mini-stat .v{font-size:1rem;font-weight:800;color:#f5f3ff;margin-top:.35rem;}
+  .health-list{display:grid;gap:.6rem;}
+  .health-item{display:flex;justify-content:space-between;gap:.75rem;padding:.7rem .8rem;background:#22222a;border:1px solid #31313a;border-radius:.75rem;font-size:.82rem;}
+  .health-item span:last-child{color:#d4d4d8;text-align:right;}
+  .streamer-meta{display:flex;flex-wrap:wrap;gap:.35rem .55rem;margin-top:.35rem;}
+  .meta-pill{font-size:.68rem;color:#d4d4d8;background:#2b2b35;border:1px solid #3b3b49;border-radius:999px;padding:.16rem .5rem;}
+  .streamer-actions{display:flex;flex-direction:column;align-items:flex-end;gap:.55rem;}
+  .streamer-top{display:flex;align-items:center;gap:.55rem;justify-content:space-between;flex-wrap:wrap;}
+  .state-chip{font-size:.68rem;font-weight:800;padding:.18rem .56rem;border-radius:999px;letter-spacing:.03em;}
+  .state-live{background:rgba(239,68,68,.18);color:#fca5a5;border:1px solid rgba(239,68,68,.35);} 
+  .state-offline{background:#2b2b35;color:#a1a1aa;border:1px solid #3a3a44;}
+  .section-head{display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap;margin-bottom:.75rem;}
+  .section-head p{font-size:.78rem;color:#9ca3af;max-width:none;}
+  .history-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:.7rem;margin-bottom:.9rem;}
+  @media(max-width:640px){.history-summary{grid-template-columns:1fr;}}
+  .summary-card{background:#22222a;border:1px solid #31313a;border-radius:.9rem;padding:.85rem 1rem;}
+  .summary-card .label{font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:#9ca3af;}
+  .summary-card .value{font-size:1.08rem;font-weight:800;margin-top:.35rem;color:#f5f3ff;}
+</style>
+</head>
+<body>
+<div id="captureKeepalives" class="capture-keep" aria-hidden="true"></div>
+<div class="container"><div class="card">
+  <div class="header">
+    <div><h1>🎙️ Twitch Auto-Recorder</h1><p>Local helper + crash-safe IndexedDB • Multi-streamer • Level meters • Tab-capture fallback</p></div>
+    <span class="badge">v6.24</span>
+  </div>
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
+    <button class="tab" onclick="switchTab(this,'streamers')">👥 Streamers</button>
+    <button class="tab" onclick="switchTab(this,'sched')">📅 Schedule</button>
+    <button class="tab" onclick="switchTab(this,'hist')">📜 History</button>
+    <button class="tab" onclick="switchTab(this,'convert')">🎵 Convert</button>
+    <button class="tab" onclick="switchTab(this,'setup')">🔑 API Setup</button>
+  </div>
+
+  <!-- ── RECORDER ── -->
+  <div id="main" class="tab-content active">
+    <div class="api-bar">
+      <div id="apiDot" class="dot"></div>
+      <span id="apiTxt">Not connected — enter credentials in API Setup</span>
+      <button class="btn btn-gray btn-sm" style="margin-left:auto" onclick="switchTab(document.querySelectorAll('.tab')[5],'setup')">Configure →</button>
+    </div>
+    <div class="api-bar" id="helperBar">
+      <div id="helperDot" class="dot"></div>
+      <span id="helperTxt">Not running — using tab capture</span>
+    </div>
+    <!-- v6.24: sticky one-shot when Auto Music only is on but demucs is missing -->
+    <div id="demucsMissingBanner" class="alert alert-err hidden" role="status"></div>
+
+    <!-- live now banners -->
+    <div id="liveNowBox"></div>
+
+    <!-- next scheduled mini -->
+    <div id="nextSchedBanner" class="hidden" style="background:#26262c;border-radius:.6rem;padding:.65rem 1rem;margin-bottom:.5rem;font-size:.81rem;display:flex;align-items:center;gap:.65rem;flex-wrap:wrap;">
+      <span style="color:#9146ff">📅</span>
+      <span><strong>Next scheduled:</strong> <span id="nextSchedTxt">—</span></span>
+      <button class="btn btn-gray btn-sm" onclick="switchTab(document.querySelectorAll('.tab')[2],'sched')" style="margin-left:auto">Schedule →</button>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>Audio Format (tab capture)</label>
+        <select id="fmtSel"></select>
+      </div>
+      <div>
+        <label>Helper quality (streamlink)</label>
+        <select id="helperQualitySel">
+          <option value="best">Best (video + audio)</option>
+          <option value="audio_only">Audio only</option>
+        </select>
+        <div class="toggle-row" style="margin-top:.55rem">
+          <label title="When on, mid-stream segments are joined into one continuous file after the session stops. Native segment files stay on disk.">
+            <input type="checkbox" id="seamlessToggle" checked onchange="saveSeamlessToggle()"> Seamless recordings
+          </label>
+          <label title="When on, each finished helper segment auto-queues Demucs Music only (-music / -vocals siblings) while the next segment may still record. Native files never overwritten." style="margin-left:1rem">
+            <input type="checkbox" id="autoMusicOnlyToggle" checked onchange="saveAutoMusicOnlyToggle()"> Auto Music only
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <div class="api-bar" id="armBar">
+      <div id="armDot" class="dot"></div>
+      <span id="armTxt">Arm capture per streamer on the Streamers tab — each needs their own Twitch tab share.</span>
+    </div>
+    <div id="armList" class="arm-chip-list"></div>
+    <div class="arm-pick">
+      <select id="armPickSel"></select>
+      <button class="btn btn-purple btn-sm" onclick="armCaptureFromPicker()">🎧 Arm for selected</button>
+    </div>
+
+    <div id="needArmBanner" class="alert alert-err hidden" role="status"></div>
+
+    <div id="statusBig" class="status-big">
+      <div class="main" id="statusMain">⚪ Idle</div>
+      <div class="sub"  id="statusSub">Add streamers and connect the API to begin</div>
+    </div>
+    <div id="recCards" class="rec-cards"></div>
+    <div class="stats" id="idleStats">
+      <div class="stat"><div class="v" id="sDur">00:00:00</div><div class="l">Duration</div></div>
+      <div class="stat"><div class="v" id="sSize">0 MB</div><div class="l">Size</div></div>
+      <div class="stat"><div class="v" id="sFmt">OGG</div><div class="l">Format</div></div>
+    </div>
+    <div class="controls">
+      <button id="startBtn" class="btn btn-rec" onclick="startRec(null)">⏺ Start Now</button>
+      <button id="stopAllBtn" class="btn btn-stop hidden" onclick="stopAll()">⏹ Stop All</button>
+      <button id="notifyBtn" class="btn btn-gray" onclick="enableNotifications()">🔔 Enable notifications</button>
+    </div>
+    <div id="errBox" class="alert alert-err hidden"></div>
+    <div id="okBox"  class="alert alert-ok  hidden"></div>
+    <div class="alert alert-info" style="margin-top:.75rem">
+      💡 Auto-Rec is <strong>ON by default</strong>. If the <strong>local helper</strong> is running with streamlink, live Auto-Rec streamers record automatically — that path actually connects to the stream (no tab share). Otherwise arm a Twitch tab per streamer (click <strong>Arm</strong>, pick that <strong>TAB</strong> not a window/screen, check <strong>Share tab audio</strong>). Chrome must keep the shared tab's video surface; we hide a tiny muted copy so capture stays alive. Twitch often autoplay-mutes — unmute the player in the shared tab. Don't share this recorder page. Helper/streamlink is preferred. Tab-capture chunks are crash-safe in IndexedDB. Re-arm after reload. Arm must still be a real click.
+    </div>
+  </div>
+
+  <!-- ── STREAMERS ── -->
+  <div id="streamers" class="tab-content">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.9rem;flex-wrap:wrap;gap:.5rem;">
+      <h2 style="font-size:1.05rem">Watched Streamers</h2>
+      <span style="font-size:.76rem;color:#9ca3af">Toggle Auto-Record and Arm capture per streamer</span>
+    </div>
+    <div id="streamerList"></div>
+    <div class="add-row">
+      <input type="text" id="addInput" placeholder="username or https://www.twitch.tv/..." onkeydown="if(event.key==='Enter')addStreamer()">
+      <button class="btn btn-purple" onclick="addStreamer()">+ Add</button>
+    </div>
+    <div id="streamerMsg" class="hidden"></div>
+    <div class="alert alert-info" style="margin-top:.85rem">
+      With the helper running, Auto-Rec starts streamlink with no tab needed (preferred — it pulls the actual stream). Without it, arm capture per streamer: open their Twitch tab, unmute the player, click <strong>Arm</strong>, share that <strong>TAB</strong> with tab audio. Chrome keeps the tab's video surface; we hide it. Don't share this recorder page or a whole monitor. Auto-Rec still toggles whether going live starts their recorder.
+    </div>
+  </div>
+
+  <!-- ── SCHEDULE ── -->
+  <div id="sched" class="tab-content">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.6rem;flex-wrap:wrap;gap:.5rem;">
+      <h2 style="font-size:1.05rem">📅 Upcoming Schedule</h2>
+      <button class="btn btn-gray btn-sm" onclick="loadSchedule()">↻ Refresh</button>
+    </div>
+    <div id="schedFilters" class="sched-filters"></div>
+    <div id="schedList"><div class="sched-empty">Connect to the API and add streamers first.</div></div>
+  </div>
+
+  <!-- ── HISTORY ── -->
+  <div id="hist" class="tab-content">
+    <div class="history-summary">
+      <div class="summary-card"><div class="label">Saved recordings</div><div class="value" id="histCount">0 files</div></div>
+      <div class="summary-card"><div class="label">Last capture</div><div class="value" id="histLast">None yet</div></div>
+      <div class="summary-card"><div class="label">Latest format</div><div class="value" id="histFmt">—</div></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.8rem;">
+      <h2 style="font-size:1.05rem">Session Recordings</h2>
+      <button class="btn btn-gray btn-sm" onclick="clearHist()">🗑 Clear</button>
+    </div>
+    <div style="font-size:.75rem;color:#9ca3af;margin-bottom:.7rem">Tab-capture is crash-safe via IndexedDB (Recovered entries auto-download once). Helper files write to ~/TwitchRecordings. Seamless joins write a sibling <code>-seamless</code> file (segments kept). For Demucs Music only on any file, use the <strong>Convert</strong> tab.</div>
+    <div id="histList"></div>
+  </div>
+
+  <!-- ── CONVERT (Music only) ── -->
+  <div id="convert" class="tab-content">
+    <div class="section-head">
+      <div>
+        <h2 style="font-size:1.05rem">🎵 Music only conversion</h2>
+        <p>Upload a finished recording, or convert from History. Progress shows here while Demucs runs.</p>
+      </div>
+      <button class="btn btn-gray btn-sm" onclick="switchTab(document.querySelectorAll('.tab')[3],'hist')">📜 History →</button>
+    </div>
+    <div class="upload-music-box">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap;">
+        <strong style="font-size:.88rem">🎵 Upload for Music only</strong>
+        <div style="display:flex;gap:.45rem;align-items:center;flex-wrap:wrap;">
+          <input type="file" id="musicUploadInput" accept="audio/*,video/*,.mp4,.mkv,.ts,.mp3,.m4a,.wav,.webm,.ogg,.flac,.mov,.m4v" style="font-size:.75rem;max-width:16rem">
+          <button class="btn btn-purple btn-sm" id="musicUploadBtn" onclick="uploadMusicOnly()">Upload &amp; Music only</button>
+        </div>
+      </div>
+      <div class="hint">Saves under <code>~/TwitchRecordings</code> as <code>&lt;name&gt;</code>, then <code>&lt;stem&gt;-music</code> / <code>-vocals</code>. Unique name on collision. Native file is never deleted. Requires helper + demucs.</div>
+      <div id="demucsConvertHint" class="hint" style="display:none;color:#fca5a5;margin-top:.35rem">demucs not installed — <code>pip install demucs</code> (first run downloads models), then restart the helper.</div>
+      <div id="musicUploadMeter" class="hidden" style="margin-top:.55rem"></div>
+    </div>
+    <div class="alert alert-info" style="margin-top:.35rem"><strong>Auto Music only</strong> (Recorder Settings toggle) builds <code>-music</code> / <code>-vocals</code> siblings during/after capture on finished segments. This tab&#39;s upload remains for arbitrary files. History rows still have <strong>Music only</strong> / <strong>Redo</strong> for disk files.</div>
+  </div>
+
+  <!-- ── API SETUP ── -->
+  <div id="setup" class="tab-content">
+    <div class="alert alert-info">Calls Twitch Helix API from your browser. Use as a local HTML file (tab capture) or run the helper and open <code>http://127.0.0.1:8765/</code>.</div>
+    <div class="step-block">
+      <p><span class="step-num">1</span><strong>Create a Twitch app</strong></p>
+      <p class="hint">Go to <code>dev.twitch.tv/console</code> → Register Your Application.<br>OAuth Redirect URL: <code>https://localhost</code> · Category: <strong>Other</strong>. Copy Client ID and generate a Client Secret.</p>
+    </div>
+    <div class="step-block">
+      <p><span class="step-num">2</span><strong>Enter credentials</strong></p>
+      <label>Client ID</label>
+      <input type="text"     id="cfgClientId"     placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" oninput="saveCreds()">
+      <label>Client Secret</label>
+      <input type="password" id="cfgClientSecret" placeholder="••••••••••••••••••••••••••••••"  oninput="saveCreds()">
+      <p class="hint" style="color:#fcd34d">⚠️ Saved in this browser's localStorage — never transmitted except to Twitch's OAuth endpoint.</p>
+    </div>
+    <div class="step-block">
+      <p><span class="step-num">3</span><strong>Poll interval</strong></p>
+      <label>Check every N seconds (min 15)</label>
+      <input type="number" id="cfgInterval" value="30" min="15" max="300" oninput="saveInterval()">
+      <p class="hint">Twitch recommends ≥ 30 s to avoid rate limits.</p>
+    </div>
+    <div class="step-block">
+      <p><span class="step-num">4</span><strong>Optional local helper</strong></p>
+      <p class="hint">Skip tab capture — a tiny Python server records with streamlink to <code>~/TwitchRecordings</code>. Helper/streamlink is preferred because it pulls the actual stream with no tab share.</p>
+      <p class="hint"><code>pip install streamlink</code></p>
+      <p class="hint"><code>python twitch-recorder-server.py</code></p>
+      <p class="hint">then open <code>http://127.0.0.1:8765/</code></p>
+      <p class="hint">You can still use this HTML as a <code>file://</code> tab-capture app without the helper. The helper binds localhost only.</p>
+    </div>
+    <div style="display:flex;gap:.7rem;margin-top:1rem;flex-wrap:wrap;">
+      <button class="btn btn-purple" onclick="connectAPI()">🔌 Connect & Test</button>
+      <button class="btn btn-gray"   onclick="disconnectAPI()">Disconnect</button>
+    </div>
+    <div id="setupMsg" class="hidden"></div>
+  </div>
+</div></div>
+
+<script>
+
+// ─── CONFIG ───────────────────────────────────────────
+const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Auto-Rec toggles restore
+const IDB_NAME = 'twitch-auto-recorder-v6';
+const IDB_STORE = 'chunks';
+const HELPER_URL = 'http://127.0.0.1:8765';
+const UI_VERSION = '6.24'; // keep in sync with badge + HELPER_VERSION
+let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'best', seamlessRecordings:true, autoMusicOnly:true };
+let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', demucsHint:'', recordingsDir:'', installHint:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false };
+let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
+let musicJobsNotified = new Set(); // jobIds already fireNotify'd for done/error (health spam safe)
+let autoMusicQueued = new Set(); // basenames already auto-queued this session (dedupe mid-stream + stop)
+let helperDemucsMissingNotified = false; // v6.24: one-shot demucs-missing flash/notify per episode
+let seamlessJobs = {}; // key(name|joinKey) -> {jobId, status, progress, error, outputName, names}
+let seamlessJobsNotified = new Set();
+let seamlessAutoStarted = new Set(); // joinKey already auto-queued this session (avoid spam)
+let diskFileIndex = {}; // name -> file entry from last GET /api/files (pair -music/-vocals)
+let helperDiskNotified = false; // one-shot low-disk notify per warn episode
+let helperDropNotified = false; // one-shot notify when helper was up and then vanishes
+let helperActiveOnDrop = []; // usernames that were ACTIVE when helper last dropped
+// Per-username mid-stream resume UX: avoid spamming notify/flash every poll
+// { lastMidErr, wasRetrying, notifiedAt }
+let helperMidRemember = {};
+// username -> lastError text that user dismissed (or auto-hidden while another records)
+let dismissedHelperErrors = {};
+let idbPromise = null;
+let token = null, tokenExpiry = 0, connected = false;
+let pollTimer = null, pollWorker = null, pollWorkerUrl = null, pollInFlight = false, pollQueued = false;
+// v6.16: helper /api/status must not rely on page setInterval — Chrome throttles it hard in
+// background tabs. A dedicated Worker keeps mid-resume give-up + reconnect kicks timely.
+let helperPingWorker = null, helperPingWorkerUrl = null, helperPingTimer = null;
+let helperPingChain = Promise.resolve();
+let chosenFmt = null, recordings = [], restoredFmtMime = null;
+let needsRearmNotice = false; // MediaStreams cannot be persisted across reloads
+let lastPollErrAt = 0;
+
+// Streamer list:
+// { username, broadcasterId, color, autoRec, isLive, liveData,
+//   captureStream (original display MediaStream), captureTrack (audio), captureArmed,
+//   captureVideoEl (hidden <video> keepalive), captureAudioCtx / analyser (silence watchdog),
+//   rec: { mediaRecorder, chunks, secs, bytes, timer, recStarting, fmt } | null,
+//   lastStartFailFlash }
+// Persist still only: creds, interval, fmtMime, streamers[{username, armed, color}]
+// (`armed` persist key = Auto-Rec toggle, NOT capture-armed)
+let streamers = [];
+let restoredStreamerList = false;
+const COLORS = ['#9146ff','#00c8ff','#ff6b6b','#51cf66','#fcd34d','#f97316','#e879f9','#34d399'];
+
+function makeStreamer(username, color, autoRec){
+  return {
+    username:String(username).toLowerCase(),
+    broadcasterId:null,
+    color:color||COLORS[0],
+    autoRec:autoRec!==false, // in-memory name; persist key remains `armed`
+    isLive:false,
+    liveData:null,
+    captureStream:null,
+    captureTrack:null,
+    captureArmed:false,
+    captureVideoEl:null,
+    captureAudioCtx:null,
+    captureAnalyser:null,
+    captureAnalyserSrc:null,
+    captureLevelTimer:null,
+    captureLevel:0,
+    silenceMs:0,
+    silenceWarned:false,
+    rec:null,
+    lastStartFailFlash:0,
+    needArmNotified:false,
+    helperStarting:false
+  };
+}
+function findStreamer(name){
+  const n=String(name||'').toLowerCase();
+  return streamers.find(s=>s.username===n)||null;
+}
+function isRecording(s){
+  return isTabRecording(s) || isHelperRecording(s);
+}
+
+// ─── FORMATS ─────────────────────────────────────────
+const FMTS = [
+  {mime:'audio/ogg;codecs=opus',ext:'ogg', label:'OGG Opus (Firefox native)'},
+  {mime:'audio/ogg',            ext:'ogg', label:'OGG (native)'},
+  {mime:'audio/webm;codecs=opus',ext:'ogg',label:'OGG Opus (Chromium)'},
+  {mime:'audio/webm',           ext:'webm',label:'WebM Audio (fallback)'}
+];
+function initFormats(){
+  const sel=document.getElementById('fmtSel');
+  if(!sel) return;
+  let sup; try{sup=FMTS.filter(f=>MediaRecorder.isTypeSupported(f.mime));}catch(e){sup=[];}
+  if(!sup.length)sup=[{mime:'audio/ogg',ext:'ogg',label:'OGG (default)'}];
+  sel.innerHTML='';
+  sup.forEach((f,i)=>{const o=document.createElement('option');o.value=i;o.textContent=f.label;sel.appendChild(o);});
+  let idx=0;
+  if(restoredFmtMime){
+    const found=sup.findIndex(f=>f.mime===restoredFmtMime);
+    if(found>=0) idx=found;
+  }
+  sel.value=String(idx);
+  sel.onchange=()=>{
+    chosenFmt=sup[+sel.value];
+    const sFmt=document.getElementById('sFmt');
+    if(sFmt) sFmt.textContent=chosenFmt.ext.toUpperCase();
+    persist();
+  };
+  chosenFmt=sup[idx];
+  const sFmt=document.getElementById('sFmt');
+  if(sFmt) sFmt.textContent=chosenFmt.ext.toUpperCase();
+}
+
+// ─── PERSISTENCE ─────────────────────────────────────
+function persist(){
+  try{
+    localStorage.setItem(LS_KEY, JSON.stringify({
+      clientId: cfg.clientId||'',
+      clientSecret: cfg.clientSecret||'',
+      interval: cfg.interval||30,
+      fmtMime: chosenFmt ? chosenFmt.mime : (restoredFmtMime||null),
+      streamers: streamers.map(s=>({username:s.username, armed:!!s.autoRec, color:s.color})),
+      notifyOptIn: !!cfg.notifyOptIn,
+      helperQuality: cfg.helperQuality==='audio_only'?'audio_only':'best',
+      seamlessRecordings: cfg.seamlessRecordings!==false,
+      autoMusicOnly: cfg.autoMusicOnly!==false
+    }));
+  }catch(e){ console.warn('persist failed', e); }
+}
+function restoreSettings(){
+  try{
+    const raw=localStorage.getItem(LS_KEY);
+    if(!raw) return;
+    const data=JSON.parse(raw);
+    if(data.clientId){
+      cfg.clientId=String(data.clientId);
+      const el=document.getElementById('cfgClientId');
+      if(el) el.value=cfg.clientId;
+    }
+    if(data.clientSecret){
+      cfg.clientSecret=String(data.clientSecret);
+      const el=document.getElementById('cfgClientSecret');
+      if(el) el.value=cfg.clientSecret;
+    }
+    if(data.interval){
+      cfg.interval=Math.max(15,+data.interval||30);
+      const el=document.getElementById('cfgInterval');
+      if(el) el.value=cfg.interval;
+    }
+    if(data.fmtMime) restoredFmtMime=data.fmtMime;
+    if(data.notifyOptIn) cfg.notifyOptIn=!!data.notifyOptIn;
+    if(data.helperQuality==='audio_only') cfg.helperQuality='audio_only';
+    // v6.20: default true when missing so Eric gets seamless without re-toggling
+    if(typeof data.seamlessRecordings==='boolean') cfg.seamlessRecordings=data.seamlessRecordings;
+    else cfg.seamlessRecordings=true;
+    // v6.23: Auto Music only default on when missing
+    if(typeof data.autoMusicOnly==='boolean') cfg.autoMusicOnly=data.autoMusicOnly;
+    else cfg.autoMusicOnly=true;
+    if(Array.isArray(data.streamers)){
+      restoredStreamerList=true; // even an empty list is user data — don't overwrite
+      streamers=data.streamers.filter(s=>s&&s.username).map((s,i)=>makeStreamer(
+        String(s.username).toLowerCase(),
+        s.color||COLORS[i%COLORS.length],
+        s.armed!==false // missing/true → Auto-Rec on (persist key `armed`)
+      ));
+    }
+    needsRearmNotice=true; // capture stream cannot survive reload
+  }catch(e){ console.warn('restore failed', e); }
+}
+function seedDefaultStreamers(){
+  if(restoredStreamerList) return;
+  streamers=[makeStreamer('whistleface', COLORS[0], true)];
+  persist();
+}
+
+// ─── CREDS ───────────────────────────────────────────
+function saveCreds(){
+  cfg.clientId=document.getElementById('cfgClientId').value.trim();
+  cfg.clientSecret=document.getElementById('cfgClientSecret').value.trim();
+  persist();
+}
+function saveInterval(){
+  cfg.interval=Math.max(15,+document.getElementById('cfgInterval').value||30);
+  persist();
+  if(connected) startPolling();
+}
+function parseUsername(v){v=v.trim();try{const u=new URL(v);return u.pathname.replace(/^\/+/,'').split('/')[0].toLowerCase();}catch(e){return v.toLowerCase();}}
+
+// ─── NOTIFICATIONS ───────────────────────────────────
+function notificationsAllowed(){
+  return !!(cfg.notifyOptIn && typeof Notification!=='undefined' && Notification.permission==='granted');
+}
+function fireNotify(tag, title, body){
+  if(!cfg.notifyOptIn) return;
+  if(typeof Notification==='undefined') return;
+  if(Notification.permission!=='granted') return;
+  try{ new Notification(title, {body:body||'', tag:tag||'tar', renotify:true}); }catch(e){}
+}
+async function enableNotifications(){
+  if(typeof Notification==='undefined'){ flashErr('This browser does not support notifications.'); return; }
+  try{
+    const p=await Notification.requestPermission();
+    cfg.notifyOptIn=(p==='granted');
+    persist();
+    updateNotifyBtn();
+    if(cfg.notifyOptIn){
+      flashOk('Notifications enabled.');
+      fireNotify('tar-test', 'Twitch Auto-Recorder', 'Notifications are on.');
+    }else{
+      flashErr('Notifications permission was not granted.');
+    }
+  }catch(e){}
+}
+function updateNotifyBtn(){
+  const btn=document.getElementById('notifyBtn');
+  if(!btn) return;
+  if(typeof Notification==='undefined'){ btn.textContent='Notifications N/A'; btn.disabled=true; return; }
+  btn.disabled=false;
+  btn.textContent=notificationsAllowed()?'Notifications on':'Enable notifications';
+}
+
+// ─── LOCAL HELPER CLIENT ─────────────────────────────
+function helperReady(){ return !!(helper.ok && helper.streamlink); }
+function isTabRecording(s){
+  return !!(s && s.rec && s.rec.mediaRecorder && s.rec.mediaRecorder.state==='recording');
+}
+function isHelperRecording(s){
+  return !!(s && helper.active && helper.active.some(a=>a.username===s.username));
+}
+async function helperFetch(path, body, timeoutMs){
+  const ctrl=new AbortController();
+  const t=setTimeout(()=>ctrl.abort(), timeoutMs||1000);
+  try{
+    const opts={ method: body===undefined ? 'GET' : 'POST', signal:ctrl.signal };
+    if(body!==undefined){
+      opts.headers={'Content-Type':'application/json'};
+      opts.body=JSON.stringify(body);
+    }
+    const r=await fetch(HELPER_URL+path, opts);
+    let d=null;
+    try{ d=await r.json(); }catch(e){ d={ok:false, error:'bad json'}; }
+    return d;
+  }finally{ clearTimeout(t); }
+}
+function markHelperDown(wasOk){
+  // Capture who was recording before we clear ACTIVE — used in the drop notify.
+  if(wasOk && !helperDropNotified){
+    helperActiveOnDrop=(helper.active||[]).map(function(a){ return a && a.username; }).filter(Boolean);
+  }
+  helper.ok=false; helper.streamlink=false; helper.ffmpeg=false; helper.seamless=false; helper.demucs=false; helper.version=''; helper.demucsHint=''; helper.installHint=''; helper.active=[]; helper.lastErrors={};
+  helper.diskFree=null; helper.diskTotal=null; helper.diskWarn=false; helper.diskBlock=false;
+  // v6.24: hide demucs sticky while helper is down (not the same as demucs missing)
+  helperDemucsMissingNotified=false;
+  const demucsBan=document.getElementById('demucsMissingBanner');
+  if(demucsBan){ demucsBan.classList.add('hidden'); demucsBan.innerHTML=''; }
+  noticeHelperDropped(wasOk);
+  updateHelperBar();
+  updateDemucsUi();
+  updateStatusUI();
+  renderStreamers();
+  updateNeedArmBanner();
+}
+function noticeHelperDropped(wasOk){
+  // Only when we previously had a healthy helper — not the cold first-load miss.
+  if(!wasOk) return;
+  if(helperDropNotified) return;
+  helperDropNotified=true;
+  const names=helperActiveOnDrop||[];
+  const who=names.length?(' (was recording '+names.join(', ')+')'):'';
+  flashErr('Local helper disconnected'+who+' — Auto-Rec cannot start streamlink until it returns. Arm tab capture as fallback, or restart the helper.');
+  fireNotify('tar-helper', 'Twitch helper disconnected', names.length?('Was recording '+names.join(', ')):'Auto-Rec streamlink path is down');
+}
+async function kickLiveAutoRecAfterHelperReconnect(){
+  // Don't wait for the next Twitch poll tick (up to cfg.interval) after helper returns.
+  if(!helperReady()) return;
+  const targets=streamers.filter(function(s){
+    return s.autoRec && s.isLive && !isHelperRecording(s) && !isTabRecording(s);
+  });
+  if(!targets.length) return;
+  flashOk('Helper back — resuming Auto-Rec for '+targets.map(function(s){return s.username;}).join(', '));
+  fireNotify('tar-helper', 'Helper reconnected', 'Resuming Auto-Rec for '+targets.map(function(s){return s.username;}).join(', '));
+  for(const s of targets){
+    s.lastStartFailFlash=0;
+    s.needArmNotified=false;
+    try{ await startRec(s.username, true); }catch(e){ console.warn('reconnect kick failed', s.username, e); }
+  }
+}
+// v6.21: compact purple progress meter (Music only + seamless + upload).
+function formatMusicPct(pct){
+  if(pct==null || pct===undefined || pct==='' || isNaN(Number(pct))) return null;
+  const n=Math.max(0, Math.min(100, Number(pct)));
+  return n;
+}
+function musicProgressHtml(job, opts){
+  opts=opts||{};
+  if(!job) return '';
+  const st=job.status||'';
+  if(!opts.force && st!=='queued' && st!=='running' && st!=='uploading') return '';
+  const pct=formatMusicPct(job.progressPct);
+  const pctLabel=pct==null?'…':(Math.round(pct)+'%');
+  const width=pct==null?'28%':(pct+'%');
+  const ind=pct==null?' indeterminate':'';
+  const msg=String(job.progress||opts.fallback||'Working…').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+  return '<div class="music-progress" title="'+msg+'">'
+    +'<div class="music-progress-track"><div class="music-progress-fill'+ind+'" style="width:'+width+'"></div></div>'
+    +'<span class="music-progress-pct">'+pctLabel+'</span>'
+    +'<span class="music-progress-msg">'+msg+'</span></div>';
+}
+function setMusicUploadMeter(jobOrNull, name){
+  const el=document.getElementById('musicUploadMeter');
+  if(!el) return;
+  if(!jobOrNull){
+    el.classList.add('hidden');
+    el.removeAttribute('data-job-name');
+    el.innerHTML='';
+    return;
+  }
+  if(name) el.setAttribute('data-job-name', name);
+  el.classList.remove('hidden');
+  el.innerHTML=musicProgressHtml(jobOrNull, {force:true, fallback:'Music…'});
+}
+function refreshMusicUploadMeterFromJobs(){
+  const el=document.getElementById('musicUploadMeter');
+  if(!el) return;
+  const name=el.getAttribute('data-job-name');
+  if(!name) return;
+  const job=musicJobs[name];
+  if(!job) return;
+  if(job.status==='queued'||job.status==='running'||job.status==='uploading'){
+    setMusicUploadMeter(job, name);
+  }else if(job.status==='done'||job.status==='error'){
+    setMusicUploadMeter(Object.assign({}, job, {
+      progressPct: job.status==='done' ? 100 : job.progressPct,
+      progress: job.status==='done' ? (job.progress||'Done') : (job.progress||'Error')
+    }), name);
+  }
+}
+
+// v6.19: merge helper.musicJobs from /api/health (Worker ticks survive background throttle + refresh).
+function applyMusicJobsFromHealth(jobs){
+  if(!Array.isArray(jobs)) return;
+  let needRender=false;
+  const finishNotify=[];
+  for(let i=0;i<jobs.length;i++){
+    const j=jobs[i];
+    if(!j || !j.name || !j.jobId) continue;
+    const name=j.name;
+    const status=j.status||'';
+    const prev=musicJobs[name];
+    const pctRaw=j.progressPct;
+    const pct=(pctRaw==null||pctRaw===undefined||pctRaw==='')?null:Number(pctRaw);
+    const entry={
+      jobId:j.jobId,
+      status:status,
+      progress:j.progress||'',
+      progressPct:(pct!=null && !isNaN(pct))?pct:null,
+      error:j.error||null,
+      outputName:j.outputName||null,
+      vocalsName:j.vocalsName||null,
+      redo:!!j.redo,
+      startedAt:j.startedAt||null
+    };
+    const changed=!prev
+      || prev.jobId!==entry.jobId
+      || prev.status!==entry.status
+      || prev.progress!==entry.progress
+      || String(prev.progressPct)!==String(entry.progressPct)
+      || prev.outputName!==entry.outputName
+      || prev.vocalsName!==entry.vocalsName;
+    if(changed){
+      musicJobs[name]=entry;
+      needRender=true;
+    }else if(!musicJobs[name]){
+      musicJobs[name]=entry;
+      needRender=true;
+    }
+    if((status==='done'||status==='error') && !musicJobsNotified.has(j.jobId)){
+      musicJobsNotified.add(j.jobId);
+      finishNotify.push(entry);
+    }
+  }
+  if(needRender){ renderHist(); refreshMusicUploadMeterFromJobs(); }
+  else refreshMusicUploadMeterFromJobs();
+  if(!finishNotify.length) return;
+  (async function(){
+    try{ await fetchHelperFiles(); }catch(e){}
+    renderHist();
+    refreshMusicUploadMeterFromJobs();
+    for(let k=0;k<finishNotify.length;k++){
+      const j=finishNotify[k];
+      if(j.status==='done'){
+        flashOk('Music ready: '+(j.outputName||'done')+(j.vocalsName?' · vocals: '+j.vocalsName:''));
+        fireNotify('tar-music-'+j.jobId, 'Music ready', j.outputName||j.name||'Music only done');
+        if(j.outputName) triggerNamedDownload(j.outputName);
+      }else{
+        flashErr('Music only failed: '+(j.error||'unknown'));
+        fireNotify('tar-music-'+j.jobId, 'Music only failed', j.error||j.name||'error');
+      }
+    }
+  })().catch(function(e){ console.warn('musicJobs notify', e); });
+}
+// v6.20: seamless join jobs via /api/health (same Worker path as music).
+function applySeamlessJobsFromHealth(jobs){
+  if(!Array.isArray(jobs)) return;
+  let needRender=false;
+  const finishNotify=[];
+  for(let i=0;i<jobs.length;i++){
+    const j=jobs[i];
+    if(!j || !j.jobId) continue;
+    const key=j.name || ((j.names&&j.names[0])||j.jobId);
+    const status=j.status||'';
+    const prev=seamlessJobs[key];
+    const pctRaw=j.progressPct;
+    const pct=(pctRaw==null||pctRaw===undefined||pctRaw==='')?null:Number(pctRaw);
+    const entry={
+      jobId:j.jobId,
+      status:status,
+      progress:j.progress||'',
+      progressPct:(pct!=null && !isNaN(pct))?pct:null,
+      error:j.error||null,
+      outputName:j.outputName||null,
+      names:Array.isArray(j.names)?j.names.slice():[],
+      startedAt:j.startedAt||null
+    };
+    const changed=!prev
+      || prev.jobId!==entry.jobId
+      || prev.status!==entry.status
+      || prev.progress!==entry.progress
+      || String(prev.progressPct)!==String(entry.progressPct)
+      || prev.outputName!==entry.outputName;
+    if(changed || !seamlessJobs[key]){
+      seamlessJobs[key]=entry;
+      needRender=true;
+    }
+    if((status==='done'||status==='error') && !seamlessJobsNotified.has(j.jobId)){
+      seamlessJobsNotified.add(j.jobId);
+      finishNotify.push(entry);
+    }
+  }
+  if(needRender) renderHist();
+  if(!finishNotify.length) return;
+  (async function(){
+    try{ await fetchHelperFiles(); }catch(e){}
+    renderHist();
+    for(let k=0;k<finishNotify.length;k++){
+      const j=finishNotify[k];
+      if(j.status==='done'){
+        flashOk('Seamless ready: '+(j.outputName||'done'));
+        fireNotify('tar-seamless-'+j.jobId, 'Seamless recording ready', j.outputName||'Joined segments');
+        if(j.outputName) triggerNamedDownload(j.outputName);
+      }else{
+        flashErr('Seamless join failed: '+(j.error||'unknown'));
+        fireNotify('tar-seamless-'+j.jobId, 'Seamless join failed', j.error||'error');
+      }
+    }
+  })().catch(function(e){ console.warn('seamlessJobs notify', e); });
+}
+function seamlessJoinKey(names){
+  return (names||[]).join('|');
+}
+function parseHelperRecName(name){
+  // username-Weekday-YYYY-MM-DDTHH-MM-SS[.N].ext
+  const m=String(name||'').match(/^([a-z0-9_]+)-((?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})(?:-(\d+))?(\.[^.]+)$/i);
+  if(!m) return null;
+  return {username:m[1].toLowerCase(), stamp:m[2], n:m[3]?parseInt(m[3],10):1, ext:m[4].toLowerCase(), name:name};
+}
+function stampToApproxMs(stamp){
+  // Tue-2026-09-15T10-08-45 → Date
+  const m=String(stamp||'').match(/^(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})$/i);
+  if(!m) return NaN;
+  return new Date(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]).getTime();
+}
+function findRelatedSegmentGroup(anchorName){
+  // Cluster finished helper segments for the same streamer within ~3h by filename stamp.
+  const anchor=parseHelperRecName(anchorName);
+  if(!anchor) return null;
+  if(isMusicExportName(anchorName) || isSeamlessExportName(anchorName)) return null;
+  const items=[];
+  for(const r of recordings){
+    if(!r || !r.name) continue;
+    if(r.recording || r.dur==='recording…') continue;
+    if(isMusicExportName(r.name) || isSeamlessExportName(r.name)) continue;
+    const meta=parseHelperRecName(r.name);
+    if(!meta || meta.username!==anchor.username || meta.ext!==anchor.ext) continue;
+    const t=stampToApproxMs(meta.stamp);
+    const mtime=(typeof r.mtime==='number' && r.mtime)?(r.mtime*1000):t;
+    items.push({name:r.name, t:isFinite(t)?t:mtime, mtime:mtime, meta:meta});
+  }
+  // Also consider disk index only
+  for(const name of Object.keys(diskFileIndex||{})){
+    if(items.some(function(x){return x.name===name;})) continue;
+    if(isMusicExportName(name) || isSeamlessExportName(name)) continue;
+    const f=diskFileIndex[name];
+    if(f && f.recording) continue;
+    const meta=parseHelperRecName(name);
+    if(!meta || meta.username!==anchor.username || meta.ext!==anchor.ext) continue;
+    const t=stampToApproxMs(meta.stamp);
+    const mtime=(f && typeof f.mtime==='number')?(f.mtime*1000):t;
+    items.push({name:name, t:isFinite(t)?t:mtime, mtime:mtime, meta:meta});
+  }
+  if(items.length<2) return null;
+  items.sort(function(a,b){ return (a.t-b.t) || a.name.localeCompare(b.name); });
+  // Build clusters with gap < 3 hours
+  const GAP=3*60*60*1000;
+  const clusters=[];
+  let cur=[items[0]];
+  for(let i=1;i<items.length;i++){
+    if(items[i].t - cur[cur.length-1].t <= GAP) cur.push(items[i]);
+    else { clusters.push(cur); cur=[items[i]]; }
+  }
+  clusters.push(cur);
+  const hit=clusters.find(function(c){ return c.some(function(x){ return x.name===anchorName; }) && c.length>=2; });
+  if(!hit) return null;
+  return hit.map(function(x){ return x.name; });
+}
+async function queueSeamlessJoin(names, opts){
+  opts=opts||{};
+  const clean=(names||[]).filter(function(n){
+    return n && !isMusicExportName(n) && !isSeamlessExportName(n);
+  });
+  if(clean.length<2){
+    if(!opts.silent) flashErr('Need at least 2 finished segments to join.');
+    return null;
+  }
+  if(!helper.ok){
+    if(!opts.silent) flashErr('Local helper not running — start twitch-recorder-server.py for seamless join.');
+    return null;
+  }
+  if(!helper.ffmpeg && !helper.seamless){
+    if(!opts.silent) flashErr('ffmpeg not installed — needed for seamless join (helper /api/health.ffmpeg).');
+    return null;
+  }
+  const key=seamlessJoinKey(clean);
+  if(opts.auto){
+    if(seamlessAutoStarted.has(key)) return null;
+    seamlessAutoStarted.add(key);
+  }
+  // Already have seamless for first?
+  const existing=findSeamlessSibling(clean[0]);
+  if(existing && !opts.force){
+    if(!opts.silent){
+      flashOk('Already have seamless: '+existing);
+      triggerNamedDownload(existing);
+    }
+    return {already:true, outputName:existing};
+  }
+  const runningKey=clean[0];
+  const existingJob=seamlessJobs[runningKey];
+  if(existingJob && (existingJob.status==='queued'||existingJob.status==='running')){
+    if(!opts.silent) flashOk('Seamless join already running…');
+    pollSeamlessJob(runningKey, existingJob.jobId);
+    return existingJob;
+  }
+  try{
+    const d=await helperFetch('/api/seamless', {names:clean}, 8000);
+    if(!d || !d.ok){
+      if(!opts.silent) flashErr((d && d.error) || 'Seamless join failed to start');
+      if(opts.auto) seamlessAutoStarted.delete(key);
+      return null;
+    }
+    if(d.already){
+      if(!opts.silent){
+        flashOk('Already have seamless: '+(d.outputName||'ready'));
+        if(d.outputName) triggerNamedDownload(d.outputName);
+      }
+      try{ await fetchHelperFiles(); }catch(e){}
+      renderHist();
+      return d;
+    }
+    if(d.alreadyRunning && d.jobId){
+      seamlessJobs[runningKey]={jobId:d.jobId, status:'queued', progress:'Already running…', progressPct:0, names:clean};
+      renderHist();
+      pollSeamlessJob(runningKey, d.jobId);
+      return d;
+    }
+    if(!d.jobId){
+      if(!opts.silent) flashErr('Seamless join failed to start');
+      return null;
+    }
+    seamlessJobs[runningKey]={jobId:d.jobId, status:'queued', progress:'Queued…', progressPct:0, names:clean};
+    renderHist();
+    if(!opts.silent) flashOk('Joining '+clean.length+' segments into a seamless file… (natives kept)');
+    pollSeamlessJob(runningKey, d.jobId);
+    return d;
+  }catch(e){
+    if(opts.auto) seamlessAutoStarted.delete(key);
+    if(!opts.silent) flashErr('Seamless join failed: '+(e.message||e));
+    return null;
+  }
+}
+async function queueSeamlessForUsername(username, opts){
+  opts=opts||{};
+  if(!helper.ok) return null;
+  try{
+    const d=await helperFetch('/api/seamless', {username:username}, 8000);
+    if(!d || !d.ok){
+      // Fall back: cluster from History for this user
+      const sample=(recordings||[]).find(function(r){
+        const m=parseHelperRecName(r && r.name);
+        return m && m.username===String(username).toLowerCase() && !isSeamlessExportName(r.name) && !isMusicExportName(r.name);
+      });
+      if(sample){
+        const group=findRelatedSegmentGroup(sample.name);
+        if(group && group.length>=2) return queueSeamlessJoin(group, opts);
+      }
+      if(!opts.silent && d && d.error && !/need at least 2/i.test(d.error)) flashErr(d.error);
+      return null;
+    }
+    if(d.already){
+      if(!opts.silent){ flashOk('Already have seamless: '+(d.outputName||'ready')); if(d.outputName) triggerNamedDownload(d.outputName); }
+      try{ await fetchHelperFiles(); }catch(e){}
+      renderHist();
+      return d;
+    }
+    const names=d.names||[];
+    const runningKey=(names[0])||username;
+    if(d.alreadyRunning && d.jobId){
+      seamlessJobs[runningKey]={jobId:d.jobId, status:'queued', progress:'Already running…', progressPct:0, names:names};
+      renderHist();
+      pollSeamlessJob(runningKey, d.jobId);
+      return d;
+    }
+    if(d.jobId){
+      seamlessJobs[runningKey]={jobId:d.jobId, status:'queued', progress:'Queued…', progressPct:0, names:names};
+      renderHist();
+      if(!opts.silent) flashOk('Joining seamless for '+username+'…');
+      pollSeamlessJob(runningKey, d.jobId);
+    }
+    return d;
+  }catch(e){
+    if(!opts.silent) flashErr('Seamless join failed: '+(e.message||e));
+    return null;
+  }
+}
+async function pollSeamlessJob(key, jobId){
+  const maxTries=1800;
+  for(let n=0;n<maxTries;n++){
+    await new Promise(function(res){ setTimeout(res, 2000); });
+    const cur=seamlessJobs[key];
+    if(cur && cur.jobId===jobId && (cur.status==='done'||cur.status==='error') && seamlessJobsNotified.has(jobId)){
+      return;
+    }
+    let d=null;
+    try{
+      d=await helperFetch('/api/seamless/'+encodeURIComponent(jobId), undefined, 5000);
+    }catch(e){ continue; }
+    if(!d || !d.ok){
+      if(d && d.error){
+        seamlessJobs[key]={jobId:jobId, status:'error', progress:'Error', error:d.error, names:(cur&&cur.names)||[]};
+        renderHist();
+        if(!seamlessJobsNotified.has(jobId)){
+          seamlessJobsNotified.add(jobId);
+          flashErr('Seamless: '+d.error);
+          fireNotify('tar-seamless-'+jobId, 'Seamless join failed', d.error);
+        }
+        return;
+      }
+      continue;
+    }
+    const pctRaw=d.progressPct;
+    const pct=(pctRaw==null||pctRaw===undefined||pctRaw==='')?null:Number(pctRaw);
+    seamlessJobs[key]={
+      jobId:jobId,
+      status:d.status||'running',
+      progress:d.progress||'',
+      progressPct:(pct!=null && !isNaN(pct))?pct:(cur&&cur.progressPct!=null?cur.progressPct:null),
+      error:d.error||null,
+      outputName:d.outputName||null,
+      names:Array.isArray(d.names)?d.names:(cur&&cur.names)||[]
+    };
+    renderHist();
+    if(d.status==='done'){
+      if(!seamlessJobsNotified.has(jobId)){
+        seamlessJobsNotified.add(jobId);
+        flashOk('Seamless ready: '+(d.outputName||'done'));
+        fireNotify('tar-seamless-'+jobId, 'Seamless recording ready', d.outputName||key);
+        try{ await fetchHelperFiles(); }catch(e){}
+        renderHist();
+        if(d.outputName) triggerNamedDownload(d.outputName);
+      }
+      return;
+    }
+    if(d.status==='error'){
+      if(!seamlessJobsNotified.has(jobId)){
+        seamlessJobsNotified.add(jobId);
+        flashErr('Seamless join failed: '+(d.error||'unknown'));
+        fireNotify('tar-seamless-'+jobId, 'Seamless join failed', d.error||key);
+      }
+      return;
+    }
+  }
+  flashErr('Seamless join timed out');
+}
+function maybeAutoSeamlessAfterStop(segments){
+  if(cfg.seamlessRecordings===false) return;
+  const names=(segments||[]).filter(Boolean);
+  if(names.length<2) return;
+  queueSeamlessJoin(names, {auto:true, silent:false});
+}
+// v6.23: Auto Music only — queue Demucs on finished helper segments (never the growing active file).
+function maybeAutoMusicOnlyAfterStop(segments){
+  if(cfg.autoMusicOnly===false) return;
+  const names=(segments||[]).filter(Boolean);
+  if(!names.length) return;
+  queueAutoMusicOnlyNames(names, {reason:'stop'});
+}
+function queueAutoMusicOnlyNames(names, opts){
+  opts=opts||{};
+  if(cfg.autoMusicOnly===false) return;
+  const list=[];
+  const seen=new Set();
+  for(const raw of (names||[])){
+    const name=String(raw||'').split(/[/\\]/).pop();
+    if(!name || seen.has(name)) continue;
+    seen.add(name);
+    if(isMusicExportName(name) || isSeamlessExportName(name)) continue;
+    list.push(name);
+  }
+  for(const name of list){
+    queueAutoMusicOnly(name, opts).catch(function(e){ console.warn('auto music only', name, e); });
+  }
+}
+async function queueAutoMusicOnly(name, opts){
+  opts=opts||{};
+  if(cfg.autoMusicOnly===false) return null;
+  name=String(name||'').split(/[/\\]/).pop();
+  if(!name) return null;
+  if(isMusicExportName(name) || isSeamlessExportName(name)) return null;
+  if(!helper.ok) return null;
+  // Deduplicate: already auto-queued, musicJobs in flight, or helper alreadyRunning / -music exists
+  if(autoMusicQueued.has(name)) return null;
+  const existing=musicJobs[name];
+  if(existing && (existing.status==='queued'||existing.status==='running')) return null;
+  if(findSiblingExport(name,'music')) return null;
+  // Skip if History still marks this basename as recording (active growing file)
+  for(const r of recordings){
+    if(r && r.name===name && (r.recording || r.dur==='recording…')) return null;
+  }
+  // v6.24: soft-skip when demucs missing — noticeHelperDemucs owns the one-shot UX
+  if(!helper.demucs){
+    return null;
+  }
+  autoMusicQueued.add(name);
+  try{
+    const d=await helperFetch('/api/music-only', {name:name, redo:false}, 8000);
+    if(!d || !d.ok){
+      autoMusicQueued.delete(name);
+      // 409 still-recording is expected if we raced the active file — stay quiet unless unexpected
+      const err=(d && d.error) || 'Music only failed to start';
+      if(/still recording/i.test(err)) return null;
+      if(!opts.silent) flashErr('Auto Music only: '+err);
+      return null;
+    }
+    if(d.already){
+      // Sibling already on disk — nothing to queue
+      return d;
+    }
+    if(d.alreadyRunning && d.jobId){
+      musicJobs[name]={jobId:d.jobId, status:'queued', progress:'Already running…', progressPct:0};
+      renderHist();
+      refreshMusicUploadMeterFromJobs();
+      pollMusicOnlyJob(name, d.jobId);
+      return d;
+    }
+    if(!d.jobId){
+      autoMusicQueued.delete(name);
+      return null;
+    }
+    musicJobs[name]={jobId:d.jobId, status:'queued', progress:'Auto queued…', progressPct:0};
+    renderHist();
+    refreshMusicUploadMeterFromJobs();
+    flashOk('Auto Music only queued for '+name);
+    pollMusicOnlyJob(name, d.jobId);
+    return d;
+  }catch(e){
+    autoMusicQueued.delete(name);
+    if(!opts.silent) flashErr('Auto Music only failed: '+(e.message||e));
+    return null;
+  }
+}
+function pingHelperAndStatus(){
+  // Serialize overlapping health/status fetches (Worker tick + pollAll + manual).
+  // Callers that await still see a completed refresh (not a skipped no-op).
+  const run=async function(){
+  const wasOk=helper.ok;
+  try{
+    const d=await helperFetch('/api/health', undefined, 1000);
+    if(d && d.ok){
+      helper.ok=true;
+      helper.streamlink=!!d.streamlink;
+      helper.ffmpeg=!!d.ffmpeg;
+      helper.seamless=!!(d.seamless!=null?d.seamless:d.ffmpeg);
+      helper.demucs=!!d.demucs;
+      helper.version=d.version?String(d.version):'';
+      helper.demucsHint=d.demucsHint||(!d.demucs?'pip install demucs (first run downloads models)':'');
+      helper.recordingsDir=d.recordingsDir||'';
+      helper.installHint=d.installHint||(!d.streamlink?'pip install streamlink':'');
+      if(d.lastErrors && typeof d.lastErrors==='object') helper.lastErrors=d.lastErrors;
+      helper.diskFree=(typeof d.diskFree==='number')?d.diskFree:null;
+      helper.diskTotal=(typeof d.diskTotal==='number')?d.diskTotal:null;
+      helper.diskWarn=!!d.diskWarn;
+      helper.diskBlock=!!d.diskBlock;
+      noticeHelperDisk();
+      noticeHelperDemucs();
+      updateDemucsUi();
+      if(Array.isArray(d.musicJobs)) applyMusicJobsFromHealth(d.musicJobs);
+      if(Array.isArray(d.seamlessJobs)) applySeamlessJobsFromHealth(d.seamlessJobs);
+    }else{
+      markHelperDown(wasOk);
+      return;
+    }
+  }catch(e){
+    markHelperDown(wasOk);
+    return;
+  }
+  try{
+    const st=await helperFetch('/api/status', undefined, 1000);
+    helper.active=(st && Array.isArray(st.active)) ? st.active : [];
+    if(st && st.lastErrors && typeof st.lastErrors==='object') helper.lastErrors=st.lastErrors;
+  }catch(e){ helper.active=[]; }
+  noticeHelperMidStream();
+  updateHelperBar();
+  updateStatusUI();
+  renderStreamers();
+  // Fresh connect / reconnect: merge disk files and immediately kick live Auto-Rec
+  if(helper.ok && !wasOk){
+    const hadDrop=helperDropNotified;
+    helperDropNotified=false;
+    helperActiveOnDrop=[];
+    fetchHelperFiles().catch(function(){});
+    if(helper.streamlink){
+      kickLiveAutoRecAfterHelperReconnect().catch(function(e){ console.warn('reconnect kick', e); });
+      // If nobody live to kick, still acknowledge recovery after a drop notify.
+      if(hadDrop){
+        const anyLiveAuto=streamers.some(function(s){ return s.autoRec && s.isLive; });
+        if(!anyLiveAuto){
+          flashOk('Helper reconnected (streamlink ready).');
+          fireNotify('tar-helper', 'Helper reconnected', 'Streamlink ready again');
+        }
+      }
+    }else{
+      flashOk('Helper server is back, but streamlink is still missing.');
+      fireNotify('tar-helper', 'Helper reconnected', 'Server up — install streamlink to auto-record');
+    }
+  }
+  };
+  const p=helperPingChain.then(run, run);
+  helperPingChain=p.catch(function(){});
+  return p;
+}
+function helperJobFor(username){
+  const n=String(username||'').toLowerCase();
+  return (helper.active||[]).find(a=>a.username===n)||null;
+}
+function helperLastError(username){
+  const n=String(username||'').toLowerCase();
+  const job=helperJobFor(n);
+  if(job && job.lastError) return job.lastError;
+  return (helper.lastErrors && helper.lastErrors[n]) || '';
+}
+function helperIsRetrying(username){
+  const job=helperJobFor(username);
+  return !!(job && job.retrying);
+}
+function helperIsActiveUser(username){
+  const n=String(username||'').toLowerCase();
+  return (helper.active||[]).some(function(a){ return a && String(a.username).toLowerCase()===n; });
+}
+function otherHelperRecordingOk(exceptUsername){
+  // True when some other username is actively recording (not just retrying establish).
+  const ex=String(exceptUsername||'').toLowerCase();
+  return (helper.active||[]).some(function(a){
+    if(!a || !a.username) return false;
+    if(String(a.username).toLowerCase()===ex) return false;
+    if(a.retrying) return false;
+    return true;
+  });
+}
+function helperErrorInfo(username){
+  // Live failure only if that username is in helper.active or retrying.
+  // Otherwise it's a stale last miss (offline) — muted / dismissable / auto-hide.
+  const n=String(username||'').toLowerCase();
+  const raw=String(helperLastError(n)||'');
+  if(!raw) return null;
+  if(dismissedHelperErrors[n]===raw) return null;
+  const active=helperIsActiveUser(n);
+  const retrying=helperIsRetrying(n);
+  if(active || retrying){
+    return {text:raw, stale:false};
+  }
+  // Auto-hide stale offline misses once someone else is successfully recording.
+  if(otherHelperRecordingOk(n)){
+    dismissedHelperErrors[n]=raw;
+    return null;
+  }
+  return {text:raw, stale:true};
+}
+function helperErrorHTML(username, prefix){
+  const info=helperErrorInfo(username);
+  if(!info) return '';
+  const n=String(username||'').toLowerCase();
+  const safe=String(info.text).replace(/</g,'&lt;');
+  const label=info.stale ? ('last miss (offline): '+safe) : ((prefix||'')+safe);
+  const cls=info.stale ? 's-herr muted' : 's-herr';
+  return '<div class="'+cls+'">'+label
+    +' <button type="button" class="btn btn-gray btn-sm" onclick="clearHelperError(\''+n+'\')">Clear</button></div>';
+}
+async function clearHelperError(username){
+  const n=String(username||'').toLowerCase();
+  const cur=String(helperLastError(n)||'');
+  if(cur) dismissedHelperErrors[n]=cur;
+  if(helper.lastErrors && n) delete helper.lastErrors[n];
+  const job=helperJobFor(n);
+  if(job) job.lastError='';
+  renderStreamers();
+  updateStatusUI();
+  if(!helper.ok) return;
+  try{
+    const body=n?{username:n}:{};
+    await helperFetch('/api/errors/clear', body, 3000);
+  }catch(e){}
+  try{ await pingHelperAndStatus(); }catch(e){}
+  renderStreamers();
+  updateStatusUI();
+}
+function noticeHelperMidStream(){
+  // Fire once per mid-stream death; flashOk once when retrying→recording again.
+  // Also notice mid-resume give-up (slot dropped; stream likely offline / orphaned supervisor).
+  const active=helper.active||[];
+  const seen=new Set();
+  for(const job of active){
+    if(!job || !job.username) continue;
+    const u=String(job.username).toLowerCase();
+    seen.add(u);
+    const err=String(job.lastError||(helper.lastErrors&&helper.lastErrors[u])||'');
+    const isMid=/mid-stream|stalled/i.test(err);
+    const retrying=!!job.retrying;
+    let mem=helperMidRemember[u];
+    if(!mem) mem=helperMidRemember[u]={ lastMidErr:'', wasRetrying:false, notifiedAt:0, lastGiveUp:'', lastSessionSegs:[] };
+    if(Array.isArray(job.sessionSegments) && job.sessionSegments.length){
+      mem.lastSessionSegs=job.sessionSegments.slice();
+    }
+    if(isMid && err && err!==mem.lastMidErr){
+      mem.lastMidErr=err;
+      mem.wasRetrying=true;
+      const now=Date.now();
+      if(now-(mem.notifiedAt||0)>=4000){
+        mem.notifiedAt=now;
+        fireNotify('tar-mid-'+u, u+' stream interrupted', err);
+        flashErr(u+': '+err);
+      }
+    }
+    if(mem.wasRetrying && mem.lastMidErr && !retrying && !isMid){
+      mem.wasRetrying=false;
+      mem.lastMidErr='';
+      flashOk(u+': new segment started (mid-stream resume)');
+      fireNotify('tar-mid-'+u, 'Recording '+u+' resumed', 'New segment file started — prior segment is in History');
+      // Prior finished segment is on disk now — surface Download without waiting for History tab.
+      // v6.23: Auto Music only on finished prior segment(s) while next segment may still record.
+      const finishedSegs=(Array.isArray(job.sessionSegments)?job.sessionSegments.slice():[]);
+      mem.lastSessionSegs=finishedSegs.slice();
+      fetchHelperFiles().then(function(){
+        if(cfg.autoMusicOnly!==false && finishedSegs.length){
+          queueAutoMusicOnlyNames(finishedSegs, {reason:'mid-stream'});
+        }
+      }).catch(function(){});
+    }else if(retrying && mem.lastMidErr){
+      mem.wasRetrying=true;
+    }
+  }
+  // Give-up: username no longer ACTIVE but lastErrors says mid-resume gave up
+  const errs=helper.lastErrors||{};
+  for(const u of Object.keys(errs)){
+    const le=String(errs[u]||'');
+    if(!/gave up after .+ mid-resume/i.test(le)) continue;
+    if(seen.has(u)) continue; // still active — not a finished give-up
+    let mem=helperMidRemember[u];
+    if(!mem) mem=helperMidRemember[u]={ lastMidErr:'', wasRetrying:false, notifiedAt:0, lastGiveUp:'', lastSessionSegs:[] };
+    if(le===mem.lastGiveUp) continue;
+    mem.lastGiveUp=le;
+    mem.wasRetrying=false;
+    mem.lastMidErr='';
+    const giveUpSegs=(mem.lastSessionSegs||[]).slice();
+    flashErr(u+': helper stopped retrying — '+le);
+    fireNotify('tar-mid-'+u, u+' recording ended', 'Helper gave up mid-resume (stream likely offline)');
+    // Prior finished segments are on disk — merge History without waiting for the History tab.
+    fetchHelperFiles().then(function(){
+      if(cfg.seamlessRecordings!==false){
+        queueSeamlessForUsername(u, {auto:true, silent:false}).catch(function(){});
+      }
+      if(cfg.autoMusicOnly!==false){
+        if(giveUpSegs.length){
+          queueAutoMusicOnlyNames(giveUpSegs, {reason:'give-up'});
+        }else{
+          // Fallback: any finished History natives for this username without -music / in-flight job
+          const fallback=[];
+          const prefix=String(u).toLowerCase()+'-';
+          for(const r of recordings){
+            if(!r || !r.name) continue;
+            if(r.recording || r.dur==='recording…') continue;
+            if(isMusicExportName(r.name) || isSeamlessExportName(r.name)) continue;
+            if(!String(r.name).toLowerCase().startsWith(prefix)) continue;
+            fallback.push(r.name);
+          }
+          if(fallback.length) queueAutoMusicOnlyNames(fallback, {reason:'give-up'});
+        }
+      }
+    }).catch(function(){});
+    // Don't wait for the next Helix poll tick if we already know they are still live.
+    kickAutoRecAfterGiveUp(u);
+  }
+  // Drop remember for usernames no longer active (optional tidy)
+  for(const u of Object.keys(helperMidRemember)){
+    if(!seen.has(u)){
+      const le=String((helper.lastErrors&&helper.lastErrors[u])||'');
+      if(!/mid-stream|stalled|gave up after/i.test(le)) delete helperMidRemember[u];
+    }
+  }
+}
+function kickAutoRecAfterGiveUp(username){
+  // Mid-resume supervisor gave up; if Helix still says live + Auto-Rec, POST /api/record now
+  // instead of waiting up to one full poll interval (missed recording risk).
+  const s=findStreamer(username);
+  if(!s || !s.autoRec || !s.isLive) return;
+  if(!helperReady()) return;
+  if(isHelperRecording(s) || isTabRecording(s) || s.helperStarting) return;
+  s.lastStartFailFlash=0;
+  s.needArmNotified=false;
+  flashOk(s.username+': Auto-Rec restarting after mid-resume give-up (still marked live).');
+  fireNotify('tar-mid-'+s.username, 'Auto-Rec restarting '+s.username, 'Helper gave up mid-resume but stream still looks live');
+  Promise.resolve().then(function(){ return startRec(s.username, true); })
+    .catch(function(e){ console.warn('give-up Auto-Rec kick failed', username, e); });
+}
+async function fetchHelperFiles(){
+  if(!helper.ok) return;
+  try{
+    const d=await helperFetch('/api/files', undefined, 3000);
+    if(!d || !d.ok || !Array.isArray(d.files)) return;
+    mergeDiskFilesIntoHistory(d.files);
+  }catch(e){}
+}
+function helperDownloadUrl(fOrName){
+  if(!fOrName) return '';
+  if(typeof fOrName==='object'){
+    if(fOrName.url) return HELPER_URL + fOrName.url;
+    if(fOrName.name) return HELPER_URL + '/api/download/' + encodeURIComponent(fOrName.name);
+    return '';
+  }
+  return HELPER_URL + '/api/download/' + encodeURIComponent(String(fOrName));
+}
+function isMusicExportName(name){
+  if(!name) return false;
+  const stem=String(name).replace(/\.[^.]+$/,'');
+  return /-(music|vocals)(?:-\d+)?$/.test(stem);
+}
+function isSeamlessExportName(name){
+  if(!name) return false;
+  const stem=String(name).replace(/\.[^.]+$/,'');
+  return /-seamless(?:-\d+)?$/.test(stem);
+}
+function findSeamlessSibling(firstName){
+  if(!firstName) return null;
+  const stem=String(firstName).replace(/\.[^.]+$/,'');
+  const ext=(String(firstName).match(/(\.[^.]+)$/)||[])[1]||'.mp4';
+  const candidates=[stem+'-seamless'+ext];
+  for(let n=2;n<20;n++) candidates.push(stem+'-seamless-'+n+ext);
+  for(const n of candidates){
+    if(diskFileIndex[n]) return n;
+    for(const r of recordings){ if(r && r.name===n) return n; }
+  }
+  return null;
+}
+function musicNativeStem(name){
+  const stem=String(name||'').replace(/\.[^.]+$/,'');
+  const m=stem.match(/^(.*)-(music|vocals)(?:-\d+)?$/);
+  return m ? m[1] : stem;
+}
+function findSiblingExport(nativeName, kind){
+  if(!nativeName || (kind!=='music' && kind!=='vocals')) return null;
+  const stem=musicNativeStem(nativeName);
+  const exts=['.mp3','.m4a','.wav'];
+  for(const ext of exts){
+    const n=stem+'-'+kind+ext;
+    if(diskFileIndex[n]) return n;
+  }
+  // Also accept already-tracked history rows / job output
+  for(const ext of exts){
+    const n=stem+'-'+kind+ext;
+    for(const r of recordings){
+      if(r && r.name===n) return n;
+    }
+  }
+  return null;
+}
+function mergeDiskFilesIntoHistory(files){
+  let changed=0;
+  const nextIndex={};
+  for(const f of (files||[])){
+    if(f && f.name) nextIndex[f.name]=f;
+  }
+  diskFileIndex=nextIndex;
+  for(const f of files){
+    if(!f || !f.name) continue;
+    // Skip empty/tiny failed-establish leftovers (helper also scrubs these going forward).
+    if(!f.recording && typeof f.size==='number' && f.size>0 && f.size<=8192) continue;
+    if(!f.recording && typeof f.size==='number' && f.size===0) continue;
+    // Keep -music / -vocals as siblings of the native row (not separate History entries).
+    if(isMusicExportName(f.name)) continue;
+    const dl=helperDownloadUrl(f);
+    let matched=false;
+    for(const r of recordings){
+      if(!r) continue;
+      const base=r.helperFile ? String(r.helperFile).split(/[/\\]/).pop() : '';
+      if(r.name===f.name || base===f.name){
+        matched=true;
+        if(dl && r.downloadUrl!==dl){ r.downloadUrl=dl; changed++; }
+        if(typeof f.size==='number' && !r.url){
+          const ns=((f.size||0)/1048576).toFixed(2)+' MB';
+          if(r.size!==ns){ r.size=ns; changed++; }
+        }
+        if(f.recording && r.dur==='disk'){ r.dur='recording…'; changed++; }
+        if(!!r.recording !== !!f.recording){ r.recording=!!f.recording; changed++; }
+        if(!f.recording && r.dur==='recording…'){ r.dur='disk'; changed++; }
+      }
+    }
+    if(matched) continue;
+    recordings.push({
+      name:f.name,
+      dur:f.recording?'recording…':'disk',
+      size:((f.size||0)/1048576).toFixed(2)+' MB',
+      url:null,
+      downloadUrl:dl||null,
+      helperFile:f.path||f.name,
+      fromDisk:true,
+      recording:!!f.recording,
+      mtime:f.mtime||0
+    });
+    changed++;
+  }
+  // Always refresh so Download music / vocals appear when only siblings changed.
+  renderHist();
+}
+function fmtDiskBytes(n){
+  if(typeof n!=='number' || !isFinite(n) || n<0) return '—';
+  const gb=n/(1024*1024*1024);
+  if(gb>=10) return gb.toFixed(0)+' GB';
+  if(gb>=1) return gb.toFixed(1)+' GB';
+  const mb=n/(1024*1024);
+  return mb.toFixed(0)+' MB';
+}
+function noticeHelperDisk(){
+  // One notify/flash per warn episode; reset when free space recovers above warn.
+  if(!helper.ok) return;
+  if(!(helper.diskWarn || helper.diskBlock)){
+    helperDiskNotified=false;
+    return;
+  }
+  if(helperDiskNotified) return;
+  helperDiskNotified=true;
+  const free=fmtDiskBytes(helper.diskFree);
+  if(helper.diskBlock){
+    flashErr('Recordings disk almost full ('+free+' free) — helper will refuse new starts until you free space.');
+    fireNotify('tar-disk', 'Disk almost full', free+' free under TwitchRecordings — recordings may stop');
+  }else{
+    flashErr('Recordings disk getting low ('+free+' free under TwitchRecordings).');
+    fireNotify('tar-disk', 'Disk space low', free+' free — free space before a long stream');
+  }
+}
+// v6.24: one-shot demucs-missing status when Auto Music only is on (soft-skip auto-queue until demucs true).
+function demucsInstallMsg(){
+  return helper.demucsHint || 'pip install demucs (first run downloads models)';
+}
+function noticeHelperDemucs(){
+  if(!helper.ok) return;
+  const ban=document.getElementById('demucsMissingBanner');
+  if(helper.demucs){
+    if(helperDemucsMissingNotified){
+      flashOk('demucs detected — Auto Music only / Music only ready again.');
+      fireNotify('tar-demucs', 'demucs ready', 'Music only can run again');
+    }
+    helperDemucsMissingNotified=false;
+    if(ban){ ban.classList.add('hidden'); ban.innerHTML=''; }
+    return;
+  }
+  // Sticky banner while demucs missing (even if Auto Music only is off — History/Convert need it too)
+  if(ban){
+    ban.innerHTML='❌ <strong>demucs not installed</strong> — Music only / Auto Music only unavailable. Install with <code>'+demucsInstallMsg().replace(/</g,'&lt;')+'</code>, then restart the helper (LaunchAgent). Native recordings still work.';
+    ban.classList.remove('hidden');
+  }
+  // One-shot flash+notify only when Auto Music only would have tried to queue
+  if(cfg.autoMusicOnly===false) return;
+  if(helperDemucsMissingNotified) return;
+  helperDemucsMissingNotified=true;
+  flashErr('Auto Music only paused — demucs missing. '+demucsInstallMsg()+', then restart the helper.');
+  fireNotify('tar-demucs', 'demucs missing', 'Auto Music only soft-skipped until you pip install demucs and restart the helper');
+}
+let _demucsUiPrev = null; // v6.24: only re-render History when demucs availability flips
+function updateDemucsUi(){
+  const btn=document.getElementById('musicUploadBtn');
+  const hint=document.getElementById('demucsConvertHint');
+  const need=helper.ok && !helper.demucs;
+  if(btn){
+    btn.disabled=!!need;
+    btn.title=need?('demucs not installed — '+demucsInstallMsg()):'Upload a finished recording and run Demucs Music only';
+  }
+  if(hint){
+    hint.style.display=need?'block':'none';
+  }
+  const sig=helper.ok?(helper.demucs?'1':'0'):'x';
+  if(_demucsUiPrev!==sig){
+    _demucsUiPrev=sig;
+    try{ renderHist(); }catch(e){}
+  }
+}
+function updateHelperBar(){
+  const dot=document.getElementById('helperDot');
+  const txt=document.getElementById('helperTxt');
+  if(!dot||!txt) return;
+  if(helper.ok && helper.streamlink){
+    const diskBit=(helper.diskFree!=null)?(' · '+fmtDiskBytes(helper.diskFree)+' free'):'';
+    const demucsBit=helper.demucs?'':' · demucs missing';
+    if(helper.diskBlock){
+      dot.className='dot err';
+      txt.textContent='Disk almost full ('+fmtDiskBytes(helper.diskFree)+' free) — new recordings blocked'+(helper.recordingsDir?' — '+helper.recordingsDir:'');
+    }else if(helper.diskWarn){
+      dot.className='dot spin';
+      txt.textContent='Connected (low disk'+diskBit+demucsBit+')'+(helper.recordingsDir?' — '+helper.recordingsDir:'');
+    }else if(!helper.demucs){
+      // v6.24: surface demucs gap without looking fully "ok"
+      dot.className='dot spin';
+      txt.textContent='Connected (streamlink ready · demucs missing — Music only unavailable)'+diskBit+(helper.recordingsDir?' — '+helper.recordingsDir:'');
+    }else{
+      dot.className='dot ok';
+      txt.textContent='Connected (streamlink ready)'+diskBit+(helper.recordingsDir?' — '+helper.recordingsDir:'');
+    }
+  }else if(helper.ok && !helper.streamlink){
+    const demucsBit=helper.demucs?'':' · demucs missing';
+    dot.className='dot spin';
+    txt.textContent='Server up but streamlink not installed — '+(helper.installHint||'pip install streamlink')+demucsBit;
+  }else{
+    dot.className='dot';
+    txt.textContent='Not running — using tab capture';
+  }
+}
+async function startHelperRec(s, isAuto){
+  if(!s) return;
+  if(s.helperStarting) return;
+  // Idempotent server: still skip if already ACTIVE (incl. retrying) to avoid UI spam
+  if(isHelperRecording(s)) return;
+  s.helperStarting=true;
+  try{
+    const d=await helperFetch('/api/record', {username:s.username, quality:cfg.helperQuality||'best'}, 8000);
+    if(!d || !d.ok) throw new Error((d && d.error) || 'helper record failed');
+    if(!d.already){
+      if(d.retrying){
+        flashOk('Helper retrying streamlink for '+s.username+'…');
+      }else{
+        flashOk('Helper recording '+s.username+(d.file?(' → '+d.file):''));
+      }
+      fireNotify('tar-'+s.username, 'Recording '+s.username, d.retrying?'Helper retrying streamlink':'Helper started streamlink');
+    }
+    await pingHelperAndStatus();
+  }catch(e){
+    const msg=(e && e.name==='AbortError') ? 'helper timed out' : (e.message||String(e));
+    if(isAuto){
+      const now=Date.now();
+      if(now-(s.lastStartFailFlash||0)>=60000){
+        s.lastStartFailFlash=now;
+        flashErr('Auto-start failed for '+s.username+': '+msg);
+        fireNotify('tar-'+s.username, 'Auto-start failed', s.username+': '+msg);
+      }
+    }else flashErr(msg);
+  }finally{
+    s.helperStarting=false;
+    updateStatusUI();
+  }
+}
+function addHelperHist(rec, secs){
+  if(!rec) return;
+  const file=rec.file||'';
+  const base=file.split(/[/\\]/).pop()||'recording';
+  const size=rec.size||0;
+  recordings.unshift({
+    name:base,
+    dur:typeof secs==='number'?fmt(secs):'helper',
+    size:(size/1048576).toFixed(2)+' MB',
+    url:null,
+    downloadUrl: helper.ok ? helperDownloadUrl(base) : null,
+    helperFile:file
+  });
+  renderHist();
+}
+async function helperStop(username){
+  const job=(helper.active||[]).find(a=>a.username===username);
+  let secs=0;
+  if(job){
+    const started=Date.parse(job.startedAt);
+    if(isFinite(started)) secs=Math.max(0, Math.floor((Date.now()-started)/1000));
+  }
+  // Snapshot finished mid-resume segments before stop (active file excluded until stop returns).
+  const priorSegs=(job && Array.isArray(job.sessionSegments)) ? job.sessionSegments.slice() : [];
+  try{
+    const d=await helperFetch('/api/stop', {username:username}, 8000);
+    if(!d || !d.ok) throw new Error((d && d.error) || 'stop failed');
+    addHelperHist(d, secs);
+    flashOk('Stopped helper recording '+username+(d.file?(' — '+d.file):''));
+    fireNotify('tar-'+username, 'Saved '+username, d.file||'Helper recording stopped');
+    await pingHelperAndStatus();
+    // Pick up any earlier mid-resume segments that were never History-merged.
+    await fetchHelperFiles().catch(function(){});
+    const segs=(Array.isArray(d.segments) && d.segments.length) ? d.segments : priorSegs;
+    maybeAutoSeamlessAfterStop(segs);
+    maybeAutoMusicOnlyAfterStop(segs);
+  }catch(e){
+    const msg=(e && e.name==='AbortError') ? 'helper timed out' : (e.message||String(e));
+    flashErr('Helper stop failed: '+msg);
+  }
+}
+async function helperStopAll(){
+  const snapshot=(helper.active||[]).slice();
+  try{
+    const d=await helperFetch('/api/stop-all', {}, 8000);
+    if(d && d.ok){
+      for(const rec of (d.stopped||[])){
+        if(rec && rec.ok){
+          addHelperHist(rec);
+          maybeAutoSeamlessAfterStop(rec.segments||[]);
+          maybeAutoMusicOnlyAfterStop(rec.segments||[]);
+        }
+      }
+      flashOk('Stopped helper recording(s)');
+      if(snapshot.length){
+        fireNotify('tar-'+snapshot[0].username, 'Helper recordings stopped', snapshot.map(a=>a.username).join(', '));
+      }
+    }
+    await pingHelperAndStatus();
+    await fetchHelperFiles().catch(function(){});
+  }catch(e){ flashErr('Helper stop-all failed: '+(e.message||e)); }
+}
+function initHelperQuality(){
+  const sel=document.getElementById('helperQualitySel');
+  if(!sel) return;
+  sel.value=cfg.helperQuality==='audio_only'?'audio_only':'best';
+  sel.onchange=()=>{ cfg.helperQuality=sel.value==='audio_only'?'audio_only':'best'; persist(); };
+}
+function saveSeamlessToggle(){
+  const el=document.getElementById('seamlessToggle');
+  cfg.seamlessRecordings=el?!!el.checked:true;
+  persist();
+  flashOk(cfg.seamlessRecordings
+    ? 'Seamless recordings on — multi-segment sessions join into one file after stop (segments kept on disk).'
+    : 'Seamless recordings off — mid-stream segments stay as separate History files.');
+}
+function initSeamlessToggle(){
+  const el=document.getElementById('seamlessToggle');
+  if(!el) return;
+  el.checked=cfg.seamlessRecordings!==false;
+}
+function saveAutoMusicOnlyToggle(){
+  const el=document.getElementById('autoMusicOnlyToggle');
+  cfg.autoMusicOnly=el?!!el.checked:true;
+  persist();
+  if(cfg.autoMusicOnly && helper.ok && !helper.demucs){
+    // v6.24: turning it on while demucs missing — reset one-shot so user sees the pause reason again
+    helperDemucsMissingNotified=false;
+    noticeHelperDemucs();
+    updateDemucsUi();
+    return;
+  }
+  flashOk(cfg.autoMusicOnly
+    ? 'Auto Music only on — finished segments queue Demucs (-music / -vocals) while capture may continue.'
+    : 'Auto Music only off — use History / Convert Music only manually.');
+}
+function initAutoMusicOnlyToggle(){
+  const el=document.getElementById('autoMusicOnlyToggle');
+  if(!el) return;
+  el.checked=cfg.autoMusicOnly!==false;
+}
+
+// ─── INDEXEDDB (crash-proof tab-capture chunks) ──────
+function openIdb(){
+  if(typeof indexedDB==='undefined') return Promise.reject(new Error('no indexedDB'));
+  if(idbPromise) return idbPromise;
+  idbPromise=new Promise((resolve,reject)=>{
+    const req=indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded=function(e){
+      const db=e.target.result;
+      if(!db.objectStoreNames.contains(IDB_STORE)){
+        const st=db.createObjectStore(IDB_STORE, {keyPath:'id', autoIncrement:true});
+        st.createIndex('recId', 'recId', {unique:false});
+      }
+    };
+    req.onsuccess=function(){ resolve(req.result); };
+    req.onerror=function(){ idbPromise=null; reject(req.error); };
+  });
+  return idbPromise;
+}
+function idbAppendChunk(meta, blob, seq, secs){
+  return openIdb().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(IDB_STORE,'readwrite');
+    tx.objectStore(IDB_STORE).add({
+      recId:meta.recId, username:meta.username, mime:meta.mime,
+      startedAt:meta.startedAt, ext:meta.ext, seq:seq, secs:secs||0, blob:blob
+    });
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error);
+  })).catch(err=>{ console.warn('idb append failed', err); });
+}
+function idbGetSession(recId){
+  return openIdb().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(IDB_STORE,'readonly');
+    const req=tx.objectStore(IDB_STORE).index('recId').getAll(recId);
+    req.onsuccess=()=>resolve((req.result||[]).slice().sort((a,b)=>(a.seq||0)-(b.seq||0)));
+    req.onerror=()=>reject(req.error);
+  }));
+}
+function idbDeleteRec(recId){
+  return openIdb().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(IDB_STORE,'readwrite');
+    const store=tx.objectStore(IDB_STORE);
+    const req=store.index('recId').openCursor(IDBKeyRange.only(recId));
+    req.onsuccess=function(){
+      const cursor=req.result;
+      if(cursor){ cursor.delete(); cursor.continue(); }
+    };
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error);
+  })).catch(err=>{ console.warn('idb delete failed', err); });
+}
+function idbListByRecId(){
+  return openIdb().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(IDB_STORE,'readonly');
+    const req=tx.objectStore(IDB_STORE).getAll();
+    req.onsuccess=()=>{
+      const by={};
+      for(const row of (req.result||[])){
+        if(!row.recId) continue;
+        if(!by[row.recId]) by[row.recId]=[];
+        by[row.recId].push(row);
+      }
+      resolve(by);
+    };
+    req.onerror=()=>reject(req.error);
+  }));
+}
+async function recoverIdbRecordings(){
+  try{
+    const by=await idbListByRecId();
+    const recIds=Object.keys(by);
+    if(!recIds.length) return;
+    let n=0;
+    for(const recId of recIds){
+      const rows=(by[recId]||[]).slice().sort((a,b)=>(a.seq||0)-(b.seq||0));
+      const blobs=rows.map(r=>r.blob).filter(b=>b && b.size>0);
+      if(!blobs.length){ await idbDeleteRec(recId); continue; }
+      const meta=rows[0]||{};
+      const mime=((meta.mime||'audio/webm')+'').split(';')[0];
+      const ext=meta.ext||'webm';
+      const username=meta.username||'stream';
+      const secs=Math.max(rows.reduce((m,r)=>Math.max(m, r.secs||0), 0), blobs.length);
+      let blob=new Blob(blobs, {type:mime});
+      if(!blob.size){ await idbDeleteRec(recId); continue; }
+      blob=await fixWebmDuration(blob, secs);
+      let stamp;
+      try{ stamp=recordingStamp(meta.startedAt||Date.now()); }
+      catch(e){ stamp=recordingStamp(new Date()); }
+      const name=username+'-'+stamp+'.'+ext;
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement('a');
+      a.href=url; a.download=name; a.style.display='none';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      recordings.unshift({name, dur:fmt(secs)+' · Recovered', size:(blob.size/1048576).toFixed(2)+' MB', url, blob, recovered:true});
+      await idbDeleteRec(recId);
+      n++;
+      fireNotify('tar-'+username, 'Recovered '+username, name);
+    }
+    if(n){
+      renderHist();
+      flashOk('✅ Recovered '+n+' recording'+(n===1?'':'s')+' from crash-safe storage');
+    }
+  }catch(e){ console.warn('IDB recovery skipped', e); }
+}
+
+
+// ─── STREAMER MANAGEMENT ─────────────────────────────
+async function addStreamer(){
+  const raw=document.getElementById('addInput').value;
+  const name=parseUsername(raw);
+  if(!name){sMsg('error','Enter a username.');return;}
+  if(streamers.find(s=>s.username===name)){sMsg('error',`${name} is already in the list.`);return;}
+  const color=COLORS[streamers.length%COLORS.length];
+  const s=makeStreamer(name, color, true);
+  streamers.push(s);
+  persist();
+  document.getElementById('addInput').value='';
+  renderStreamers();
+  updateStatusUI();
+  if(connected){
+    try{
+      s.broadcasterId=await getBroadcasterId(name);
+      sMsg('ok',`✅ Added ${name}`);
+    }catch(e){ sMsg('error',`Added ${name} but couldn't resolve ID: ${e.message}`); }
+    await pollOne(s);
+    renderStreamers();
+    loadSchedule();
+  }else{
+    sMsg('info',`Added ${name}. Connect the API to start monitoring.`);
+  }
+}
+
+function removeStreamer(username){
+  const idx=streamers.findIndex(s=>s.username===username);
+  if(idx<0) return;
+  const s=streamers[idx];
+  if(isTabRecording(s)) stopRec(s.username, 'tab');
+  if(helper.active.some(a=>a.username===username)) helperStop(username);
+  teardownCapture(s);
+  streamers.splice(idx,1);
+  persist();
+  renderStreamers(); loadSchedule(); renderLiveBanners(); updateNeedArmBanner(); updateNextSched(); updateStatusUI(); updateHealthPanel();
+}
+
+function toggleAutoRec(username){
+  const s=findStreamer(username);
+  if(!s) return;
+  s.autoRec=!s.autoRec;
+  persist();
+  renderStreamers();
+  updateNeedArmBanner();
+  if(s.autoRec&&s.isLive&&!isRecording(s)){
+    if(helperReady()){
+      flashOk(`🎙️ ${s.username} is already live — starting helper recording.`);
+      startRec(s.username, false);
+    }else if(s.captureArmed){
+      flashOk(`🎙️ ${s.username} is already live — starting recording.`);
+      startRec(s.username, false);
+    }
+  }
+}
+
+function renderStreamers(){
+  const el=document.getElementById('streamerList');
+  if(!el) return;
+  if(!streamers.length){el.innerHTML='<div style="text-align:center;padding:1.5rem;color:#555;font-size:.88rem">No streamers yet — add one below.</div>';return;}
+  el.innerHTML=streamers.map(s=>`
+    <div class="streamer-row">
+      <div class="s-dot" style="background:${s.color}"></div>
+      <div>
+        <div class="s-name">${s.username}
+          ${s.isLive?'<span class="s-live"> ● LIVE</span>':'<span class="s-status"> offline</span>'}
+          ${isRecording(s)?'<span class="s-rec"> ● REC</span>':''}
+          ${helperIsRetrying(s.username)?'<span class="s-retry">● RETRYING</span>':''}
+          ${(!helperReady() && s.captureArmed)?'<span class="s-armed">● ARMED</span>':''}
+        </div>
+        ${s.liveData?`<div style="font-size:.7rem;color:#9ca3af;font-weight:400;margin-top:.1rem">${s.liveData.title||''}</div>`:''}
+        ${helperErrorHTML(s.username, 'Helper: ')}
+      </div>
+      <div class="streamer-controls">
+        <div class="s-arm">
+          Auto-Rec
+          <label class="switch">
+            <input type="checkbox" ${s.autoRec?'checked':''} onchange="toggleAutoRec('${s.username}')">
+            <span class="slider"></span>
+          </label>
+        </div>
+        ${helperReady()
+          ? `<span class="s-armed">Helper will record this (no tab needed)</span>`
+          : (s.captureArmed
+          ? `<span class="state-chip" style="background:rgba(16,185,129,.18);color:#6ee7b7;border:1px solid rgba(16,185,129,.35)">ARMED</span>
+             <button class="btn btn-gray btn-sm" onclick="disarmCapture('${s.username}')">Disarm</button>`
+          : `<button class="btn btn-purple btn-sm" onclick="armCapture('${s.username}')">🎧 Arm</button>`)}
+        <button class="btn btn-red btn-sm" onclick="removeStreamer('${s.username}')">✕</button>
+      </div>
+    </div>`).join('');
+}
+
+// ─── TWITCH API ───────────────────────────────────────
+async function getToken(){
+  if(token&&Date.now()<tokenExpiry-60000)return token;
+  const r=await fetch(`https://id.twitch.tv/oauth2/token?client_id=${cfg.clientId}&client_secret=${cfg.clientSecret}&grant_type=client_credentials`,{method:'POST'});
+  if(!r.ok)throw new Error(`Token failed (${r.status}) — check Client ID & Secret.`);
+  const d=await r.json(); token=d.access_token; tokenExpiry=Date.now()+d.expires_in*1000; return token;
+}
+async function twitchGet(path){
+  async function once(){
+    const tok=await getToken();
+    return fetch(`https://api.twitch.tv/helix/${path}`,{headers:{'Client-ID':cfg.clientId,'Authorization':`Bearer ${tok}`}});
+  }
+  let r=await once();
+  if(r.status===401){
+    // Stale app token — clear and retry once so one bad token doesn't brick the whole poll.
+    token=null; tokenExpiry=0;
+    r=await once();
+  }
+  // v6.11: one Retry-After-aware wait + retry for rate-limit / transient Helix blips.
+  if(r.status===429 || r.status===503){
+    let waitSec=3;
+    const ra=r.headers.get('Retry-After');
+    if(ra!=null){
+      const n=parseFloat(ra);
+      if(!Number.isNaN(n) && n>=0) waitSec=n;
+    }
+    waitSec=Math.min(Math.max(waitSec, 0), 12); // cap ~10–15s
+    await new Promise(res=>setTimeout(res, waitSec*1000));
+    r=await once();
+  }
+  if(!r.ok){
+    let msg=`Helix API (${r.status})`;
+    if(r.status===429) msg='Helix API (429) — rate limited';
+    else if(r.status===503) msg='Helix API (503) — temporarily unavailable';
+    throw new Error(msg);
+  }
+  return r.json();
+}
+async function getBroadcasterId(login){
+  const d=await twitchGet(`users?login=${encodeURIComponent(login)}`);
+  if(!d.data.length)throw new Error(`"${login}" not found.`);
+  return d.data[0].id;
+}
+
+// ─── CONNECT ─────────────────────────────────────────
+async function connectAPI(){
+  saveCreds(); saveInterval();
+  if(!cfg.clientId||!cfg.clientSecret){setupMsg('error','Enter Client ID and Secret.');return;}
+  setApiDot('spin','Connecting…'); setupMsg('info','Testing…');
+  pingHelperAndStatus().catch(()=>{});
+  try{
+    await getToken();
+    // resolve broadcaster IDs for existing streamers
+    for(const s of streamers){
+      if(!s.broadcasterId) s.broadcasterId=await getBroadcasterId(s.username).catch(()=>null);
+    }
+    connected=true;
+    setApiDot('ok',`Connected — polling ${streamers.length} streamer(s) every ${cfg.interval}s`);
+    setupMsg('ok','✅ Connected! Polling started.');
+    startPolling();
+    await loadSchedule();
+    renderStreamers();
+  }catch(e){setApiDot('err','Failed'); setupMsg('error','❌ '+e.message);}
+}
+
+function disconnectAPI(){
+  stopPolling(); token=null; tokenExpiry=0; connected=false;
+  streamers.forEach(s=>{s.isLive=false;s.liveData=null;});
+  setApiDot('','Not connected');document.getElementById('apiDot').className='dot';
+  updateStatusUI();
+  setupMsg('info','Disconnected.');
+  const schedList=document.getElementById('schedList');
+  if(schedList) schedList.innerHTML='<div class="sched-empty">Connect to the API first.</div>';
+  renderStreamers(); renderLiveBanners(); updateNeedArmBanner(); updateHealthPanel();
+}
+
+// ─── POLLING ─────────────────────────────────────────
+// Background tabs throttle setInterval badly enough to miss a whole stream.
+// A dedicated Worker keeps ticking; we also poll immediately when the page
+// becomes visible again. pollAll is mutexed so overlapping ticks can't
+// double-start recordings. Starting TWO recordings inside one pollAll is
+// required — rec-starting mutex is per streamer, not global.
+// v6.10: one Helix /streams batch (up to 100 user_login per call), then
+// apply live/offline state, then kick Auto-Rec starts in parallel.
+// v6.11: Helix 429/503 one-shot retry; skipped Worker ticks queue via pollQueued.
+// v6.15: await fresh helper ACTIVE before Auto-Rec kicks; mid-resume give-up restarts immediately if still live.
+// v6.16: helper /api/status also runs on its own Worker (not page setInterval) so background tabs still see give-up/reconnect.
+function startPolling(){
+  stopPolling();
+  pollAll();
+  const ms=Math.max(15, cfg.interval||30)*1000;
+  try{
+    const src='setInterval(function(){postMessage("tick");},'+ms+');';
+    const blob=new Blob([src],{type:'text/javascript'});
+    pollWorkerUrl=URL.createObjectURL(blob);
+    pollWorker=new Worker(pollWorkerUrl);
+    pollWorker.onmessage=function(){ pollAll(); };
+  }catch(e){
+    console.warn('Worker poller unavailable, falling back to setInterval', e);
+    pollTimer=setInterval(pollAll, ms);
+  }
+}
+function stopPolling(){
+  if(pollTimer){ clearInterval(pollTimer); pollTimer=null; }
+  if(pollWorker){ try{pollWorker.terminate();}catch(e){} pollWorker=null; }
+  if(pollWorkerUrl){ try{URL.revokeObjectURL(pollWorkerUrl);}catch(e){} pollWorkerUrl=null; }
+  pollQueued=false;
+}
+
+async function fetchStreamsByLogins(logins){
+  // Helix GET /streams accepts up to 100 user_login params per request.
+  const liveByLogin=new Map();
+  const uniq=[];
+  const seen=new Set();
+  for(const raw of logins){
+    const u=String(raw||'').toLowerCase();
+    if(!u || seen.has(u)) continue;
+    seen.add(u); uniq.push(u);
+  }
+  for(let i=0;i<uniq.length;i+=100){
+    const chunk=uniq.slice(i,i+100);
+    const q=chunk.map(u=>`user_login=${encodeURIComponent(u)}`).join('&');
+    const d=await twitchGet(`streams?${q}`);
+    for(const row of (d.data||[])){
+      const key=String(row.user_login||'').toLowerCase();
+      if(key) liveByLogin.set(key, row);
+    }
+  }
+  return liveByLogin;
+}
+
+function notePollError(e){
+  const now=Date.now();
+  if(now-lastPollErrAt>=60000){
+    lastPollErrAt=now;
+    const msg=e&&e.message?e.message:String(e);
+    flashErr('Poll failed: '+msg+' (will keep retrying; this notice is throttled)');
+    setApiDot('err','Poll error — '+msg);
+  }
+}
+
+/** Apply Helix live payload: update isLive/liveData + go-offline stops.
+ *  Does NOT await startRec — returns a start Promise (or null) for parallel kick. */
+function applyLiveStatus(s, data){
+  const isLive=!!data;
+  const wasLive=s.isLive;
+  s.isLive=isLive; s.liveData=data||null;
+  let startP=null;
+
+  if(isLive){
+    if(!wasLive){
+      setApiDot('ok',`🔴 ${s.username} is LIVE`);
+      if(s.autoRec) fireNotify('tar-'+s.username, s.username+' is live', 'Auto-Rec streamer went live');
+    }
+    // Helper resume: auto-rec + live + not currently helper-recording → POST /api/record
+    // (server mid-stream auto-resumes while ACTIVE; this covers drop-outs / late go-live)
+    if(s.autoRec && helperReady() && !isHelperRecording(s) && !isTabRecording(s)){
+      if(!wasLive){
+        flashOk(`🎙️ ${s.username} just went live — starting helper record.`);
+        s.lastStartFailFlash=0; // go-live failure must not be throttled away
+      }
+      startP=Promise.resolve().then(()=>startRec(s.username, true));
+    }else if(s.autoRec&&!isRecording(s)){
+      if(s.captureArmed){
+        if(!wasLive){
+          flashOk(`🎙️ ${s.username} just went live — starting auto-record!`);
+          s.lastStartFailFlash=0;
+        }
+        startP=Promise.resolve().then(()=>startRec(s.username, true));
+      }else if(!helper.ok){
+        if(!s.needArmNotified){
+          s.needArmNotified=true;
+          fireNotify('tar-'+s.username, 'Arm capture for '+s.username, 'Helper is not running — share their Twitch tab to record');
+        }
+      }else if(helper.ok && !helper.streamlink){
+        // Helper reachable but streamlink missing — previously a silent no-op
+        if(!s.needArmNotified){
+          s.needArmNotified=true;
+          flashErr(s.username+' is live — install/run streamlink (`pip install streamlink`) or Arm tab capture');
+          fireNotify('tar-'+s.username, 'Cannot auto-record '+s.username, 'Helper is up but streamlink is missing. Install streamlink or Arm tab capture.');
+        }
+      }else{
+        // helperReady false for any other reason, capture not armed
+        if(!s.needArmNotified){
+          s.needArmNotified=true;
+          flashErr(s.username+' is live (Auto-Rec) but recording did not start — click Start Now, Arm tab capture, or restart the helper.');
+          fireNotify('tar-'+s.username, 'Auto-Rec stuck for '+s.username, 'Start Now / Arm tab capture / restart helper');
+        }
+      }
+    }
+  }
+  if(!isLive&&wasLive){
+    s.needArmNotified=false;
+    if(isTabRecording(s)){
+      flashOk(`📴 ${s.username} went offline — stopping recording.`);
+      stopRec(s.username, 'tab');
+    }
+    if(helper.active.some(a=>a.username===s.username)){
+      flashOk(`📴 ${s.username} went offline — stopping helper recording.`);
+      stopRec(s.username, 'helper');
+    }
+  }
+  return startP;
+}
+
+async function pollAll(){
+  if(!connected) return;
+  if(pollInFlight){ pollQueued=true; return; }
+  pollInFlight=true;
+  // Helper ping runs in parallel with Helix, but we await it BEFORE start/stop decisions
+  // so Auto-Rec does not use a stale ACTIVE map (e.g. mid-resume give-up cleared the slot
+  // while /streams was in flight — that used to delay restart until the next poll tick).
+  const helperP=pingHelperAndStatus().catch(()=>{});
+  try{
+    const starts=[];
+    let liveByLogin=null;
+    if(streamers.length){
+      try{
+        liveByLogin=await fetchStreamsByLogins(streamers.map(s=>s.username));
+      }catch(e){
+        notePollError(e);
+      }
+    }
+    await helperP;
+    if(liveByLogin){
+      for(const s of streamers){
+        try{
+          const data=liveByLogin.get(s.username)||null;
+          const p=applyLiveStatus(s, data);
+          if(p) starts.push(p);
+        }catch(e){
+          notePollError(e);
+        }
+      }
+    }
+    // Kick Auto-Rec starts in parallel — don't serialize ~8s helper POSTs behind Helix.
+    if(starts.length) await Promise.allSettled(starts);
+    renderStreamers(); renderLiveBanners(); updateNeedArmBanner(); updateHealthPanel(); updateNextSched(); updateStatusUI();
+  }finally{
+    await helperP;
+    pollInFlight=false;
+    if(pollQueued){
+      pollQueued=false;
+      Promise.resolve().then(()=>pollAll());
+    }
+  }
+}
+
+async function pollOne(s){
+  // Single-streamer refresh (e.g. after addStreamer). Same apply/start path as batch poll.
+  try{
+    const liveByLogin=await fetchStreamsByLogins([s.username]);
+    const data=liveByLogin.get(s.username)||null;
+    const p=applyLiveStatus(s, data);
+    if(p) await p;
+  }catch(e){
+    notePollError(e);
+  }
+}
+
+// ─── ARM / DISARM CAPTURE (per streamer) ──────────────
+// getDisplayMedia() MUST be called from inside a real click handler — Chrome and
+// Firefox both reject it (NotAllowedError) if it's invoked from setInterval/async
+// polling with no "user activation". Grab the tab-audio stream ONCE per streamer,
+// here, from a genuine click, and keep it alive/reusable so the poller can start
+// and stop MediaRecorder instances against it without ever prompting again.
+//
+// Chrome tab-audio is tied to the video capture track. NEVER stop video tracks
+// (or detach audio into a new MediaStream and drop the original) until Disarm /
+// the browser ends sharing — that leaves a 'live' audio track that encodes silence.
+
+function captureKeepaliveHost(){
+  let host=document.getElementById('captureKeepalives');
+  if(!host){
+    host=document.createElement('div');
+    host.id='captureKeepalives';
+    host.className='capture-keep';
+    host.setAttribute('aria-hidden','true');
+    document.body.appendChild(host);
+  }
+  return host;
+}
+
+function attachCaptureVideo(s, stream){
+  detachCaptureVideo(s);
+  const v=document.createElement('video');
+  v.muted=true;
+  v.defaultMuted=true;
+  v.autoplay=true;
+  v.playsInline=true;
+  v.setAttribute('playsinline','');
+  v.setAttribute('webkit-playsinline','');
+  v.setAttribute('data-streamer', s.username);
+  v.width=16;
+  v.height=16;
+  v.srcObject=stream;
+  captureKeepaliveHost().appendChild(v);
+  s.captureVideoEl=v;
+  const play=()=>{ v.play().catch(()=>{}); };
+  s._capturePlay=play;
+  v.addEventListener('pause', play);
+  play();
+}
+
+function detachCaptureVideo(s){
+  const v=s&&s.captureVideoEl;
+  if(!v) return;
+  try{ if(s._capturePlay) v.removeEventListener('pause', s._capturePlay); }catch(e){}
+  try{ v.pause(); }catch(e){}
+  try{ v.srcObject=null; }catch(e){}
+  try{ v.remove(); }catch(e){}
+  s.captureVideoEl=null;
+  s._capturePlay=null;
+}
+
+async function ensureCaptureAudioCtx(s){
+  const AC=window.AudioContext||window.webkitAudioContext;
+  if(!AC) return null;
+  if(!s.captureAudioCtx || s.captureAudioCtx.state==='closed'){
+    s.captureAudioCtx=new AC();
+  }
+  try{ await s.captureAudioCtx.resume(); }catch(e){}
+  return s.captureAudioCtx;
+}
+
+function stopCaptureLevelWatch(s, closeCtx){
+  if(!s) return;
+  if(s.captureLevelTimer){ clearInterval(s.captureLevelTimer); s.captureLevelTimer=null; }
+  try{ if(s.captureAnalyserSrc) s.captureAnalyserSrc.disconnect(); }catch(e){}
+  try{ if(s.captureAnalyser) s.captureAnalyser.disconnect(); }catch(e){}
+  s.captureAnalyserSrc=null;
+  s.captureAnalyser=null;
+  if(closeCtx && s.captureAudioCtx){
+    try{ s.captureAudioCtx.close(); }catch(e){}
+    s.captureAudioCtx=null;
+  }
+}
+
+const VU_BARS=14;
+const helperVuMem={}; // username -> {lastSize,lastAt,activity,peakHold[]}
+let lastRecCardSig='';
+
+function vuIdPrefix(username, helper){
+  return helper ? ('h-'+username) : String(username);
+}
+function vuBarColor(h, mode){
+  if(mode==='silent' || mode==='stalled' || h<0.03) return '#f59e0b';
+  if(h>=0.88) return '#ef4444';
+  if(h>=0.55) return '#a78bfa';
+  return '#6ee7b7';
+}
+function vuHTML(username, helper){
+  const p=vuIdPrefix(username, !!helper);
+  let bars='';
+  for(let i=0;i<VU_BARS;i++){
+    bars+='<span class="rec-vu-bar" id="vu-'+p+'-'+i+'" style="height:6%"></span>';
+  }
+  return '<div class="rec-vu silent" id="recLevel-'+p+'"><div class="rec-vu-bars">'+bars+'</div><span class="rec-vu-txt" id="recLevelTxt-'+p+'">'+(helper?'writing':'silent')+'</span></div>';
+}
+function paintVuBars(idPrefix, levels, label){
+  const wrap=document.getElementById('recLevel-'+idPrefix);
+  const txt=document.getElementById('recLevelTxt-'+idPrefix);
+  if(!wrap) return;
+  const arr=levels||[];
+  let maxH=0;
+  for(let i=0;i<VU_BARS;i++){
+    const raw=typeof arr[i]==='number' ? arr[i] : 0;
+    const h=Math.max(0.06, Math.min(1, raw));
+    if(h>maxH) maxH=h;
+    const el=document.getElementById('vu-'+idPrefix+'-'+i);
+    if(el){
+      el.style.height=Math.round(h*100)+'%';
+      el.style.background=vuBarColor(h, label);
+    }
+  }
+  const mode=(label==='silent'||label==='stalled')?label:(maxH>=0.88?'hot':'');
+  wrap.classList.toggle('silent', label==='silent');
+  wrap.classList.toggle('stalled', label==='stalled');
+  wrap.classList.toggle('hot', mode==='hot');
+  if(txt) txt.textContent=label||'signal';
+}
+function activityToBars(activity, peakHold){
+  const a=Math.max(0, Math.min(1, activity||0));
+  const bars=[];
+  for(let i=0;i<VU_BARS;i++){
+    // Mid bars taller, edges quieter — classic VU shape from a single activity scalar.
+    const pos=i/(VU_BARS-1);
+    const shape=0.35+0.65*Math.sin(Math.PI*pos);
+    const jitter=0.85+0.15*Math.sin((i+1)*2.7+a*9);
+    let h=a*shape*jitter;
+    if(a<0.02) h=0.06+Math.random()*0.02;
+    if(peakHold){
+      if(h>=(peakHold[i]||0)) peakHold[i]=h;
+      else peakHold[i]=Math.max(0.06, (peakHold[i]||0)-0.045);
+      h=peakHold[i];
+    }
+    bars.push(h);
+  }
+  return bars;
+}
+function paintCaptureLevel(s){
+  if(!s) return;
+  const p=vuIdPrefix(s.username, false);
+  const lvl=s.captureLevel||0;
+  const silent=lvl<0.02;
+  const bars=s.vuBars||activityToBars(lvl, s.vuPeakHold||(s.vuPeakHold=[]));
+  paintVuBars(p, bars, silent?'silent':'signal');
+}
+function paintHelperVu(job){
+  if(!job || !job.username) return;
+  const u=String(job.username).toLowerCase();
+  const pfx=vuIdPrefix(u, true);
+  // mp4/ffmpeg writes in bursts — bps often hits 0 between flushes. Only call it
+  // "stalled" after sustained no-growth, not a single quiet poll.
+  if(!helperVuMem[u]) helperVuMem[u]={lastSize:0, quietPolls:0, ema:0, peakHold:[]};
+  const st=helperVuMem[u];
+  const size=Number(job.size)||0;
+  const bps=Number(job.bps)||0;
+  const grew=size>st.lastSize;
+  if(grew || bps>=512){
+    st.quietPolls=0;
+    st.ema=Math.max((st.ema||0)*0.55, bps || (grew ? 12000 : 0));
+  }else{
+    st.quietPolls=(st.quietPolls||0)+1;
+    st.ema=(st.ema||0)*0.72;
+  }
+  st.lastSize=size;
+
+  let act=0;
+  const peak=(job.peak!=null)?Number(job.peak):((job.level!=null)?Number(job.level):NaN);
+  const hasPeak=Number.isFinite(peak) && peak>=0;
+  if(hasPeak && peak>0){
+    act=Math.max(0, Math.min(1, peak));
+  }else{
+    // map ema write-rate to 0..1 (audio_only often ~8–40 KB/s when flushing)
+    act=Math.max(0, Math.min(1, Math.log10(10+(st.ema||0))/5));
+  }
+
+  let label='writing';
+  if(job.retrying) label='stalled';
+  else if(hasPeak && peak>0) label=(peak<0.02)?'silent':'signal';
+  else if(st.quietPolls>=6) label='stalled';
+  else label='writing';
+
+  if(!st.peakHold || st.peakHold.length!==VU_BARS) st.peakHold=new Array(VU_BARS).fill(0.06);
+  const bars=activityToBars(act, st.peakHold);
+  paintVuBars(pfx, bars, label);
+}
+
+function startCaptureLevelWatch(s){
+  stopCaptureLevelWatch(s, false);
+  const ctx=s.captureAudioCtx;
+  const orig=s.captureStream;
+  if(!ctx || !orig) return;
+  const tracks=orig.getAudioTracks().filter(t=>t.readyState==='live');
+  if(!tracks.length) return;
+  try{
+    if(ctx.state==='suspended') ctx.resume().catch(()=>{});
+    s.captureAnalyserSrc=ctx.createMediaStreamSource(new MediaStream(tracks));
+    s.captureAnalyser=ctx.createAnalyser();
+    s.captureAnalyser.fftSize=256;
+    s.captureAnalyser.smoothingTimeConstant=0.45;
+    s.captureAnalyserSrc.connect(s.captureAnalyser);
+  }catch(e){
+    console.warn('capture analyser failed', e);
+    return;
+  }
+  s.silenceMs=0;
+  s.silenceWarned=false;
+  s.captureLevel=0;
+  s.vuPeakHold=[];
+  s.vuBars=[];
+  const timeData=new Uint8Array(s.captureAnalyser.fftSize);
+  const freqData=new Uint8Array(s.captureAnalyser.frequencyBinCount);
+  s.captureLevelTimer=setInterval(()=>{
+    if(!s.captureAnalyser) return;
+    s.captureAnalyser.getByteTimeDomainData(timeData);
+    s.captureAnalyser.getByteFrequencyData(freqData);
+    let peak=0;
+    for(let i=0;i<timeData.length;i++){
+      const d=Math.abs(timeData[i]-128);
+      if(d>peak) peak=d;
+    }
+    s.captureLevel=peak/128;
+    // Frequency bins → VU bars with slight peak-hold decay.
+    if(!s.vuPeakHold || s.vuPeakHold.length!==VU_BARS) s.vuPeakHold=[];
+    const binPer=Math.max(1, Math.floor(freqData.length/VU_BARS));
+    const bars=[];
+    for(let i=0;i<VU_BARS;i++){
+      let sum=0, n=0;
+      const start=i*binPer;
+      for(let j=0;j<binPer && start+j<freqData.length;j++){ sum+=freqData[start+j]; n++; }
+      let h=(n?sum/n:0)/255;
+      // Slight bass emphasis so meters look alive on speech.
+      h=Math.min(1, h*1.25);
+      if(h>=(s.vuPeakHold[i]||0)) s.vuPeakHold[i]=h;
+      else s.vuPeakHold[i]=Math.max(0.06, (s.vuPeakHold[i]||0)-0.04);
+      bars.push(s.vuPeakHold[i]);
+    }
+    s.vuBars=bars;
+    paintCaptureLevel(s);
+    const silent=peak<=2;
+    if(silent){
+      s.silenceMs=(s.silenceMs||0)+120;
+      if(s.silenceMs>=8000 && !s.silenceWarned && s.rec){
+        s.silenceWarned=true;
+        flashErr('No streamer audio from '+s.username+' (near-silence for ~8s). Unmute the Twitch player in that tab, pick a TAB not a window/screen, check Share tab audio, and don\'t share the recorder page.');
+      }
+    }else{
+      s.silenceMs=0;
+    }
+  },120);
+}
+
+function looksLikeRecorderPage(stream){
+  const labels=[];
+  try{ stream.getTracks().forEach(t=>{ if(t.label) labels.push(t.label); }); }catch(e){}
+  const blob=labels.join(' ').toLowerCase();
+  const title=(document.title||'').toLowerCase();
+  if(title && blob.indexOf(title)!==-1) return true;
+  if(/twitch auto-recorder|auto-recorder\.html|twitch-auto-recorder/.test(blob)) return true;
+  return false;
+}
+
+async function requestDisplayStream(){
+  const audio={echoCancellation:false,noiseSuppression:false,autoGainControl:false};
+  try{
+    return await navigator.mediaDevices.getDisplayMedia({
+      video:{displaySurface:'browser',frameRate:1,width:16,height:16},
+      audio:audio,
+      selfBrowserSurface:'exclude',
+      systemAudio:'exclude',
+      monitorTypeSurfaces:'exclude',
+      surfaceSwitching:'exclude'
+    });
+  }catch(e){
+    const name=e&&e.name;
+    if(name==='NotAllowedError'||name==='AbortError') throw e;
+    return await navigator.mediaDevices.getDisplayMedia({video:true,audio:audio});
+  }
+}
+
+function teardownCapture(s){
+  if(!s) return;
+  stopCaptureLevelWatch(s, true);
+  const orig=s.captureStream;
+  if(orig){
+    orig.getTracks().forEach(t=>{ try{t.onended=null;}catch(e){} });
+  }
+  if(s.captureTrack){
+    try{s.captureTrack.onended=null;}catch(e){}
+  }
+  detachCaptureVideo(s);
+  if(orig){
+    orig.getTracks().forEach(t=>{ try{t.stop();}catch(e){} });
+  }
+  s.captureArmed=false;
+  s.captureStream=null;
+  s.captureTrack=null;
+  s.captureLevel=0;
+  s.silenceMs=0;
+  s.silenceWarned=false;
+}
+
+function handleCaptureEnded(s){
+  if(!s || !s.captureArmed) return;
+  flashErr('Tab sharing ended for '+s.username+' (closed from the browser bar) — capture disarmed.');
+  if(isTabRecording(s)) stopRec(s.username, 'tab');
+  teardownCapture(s);
+  renderStreamers();
+  updateStatusUI();
+}
+
+async function armCapture(username){
+  const s=findStreamer(username);
+  if(!s){flashErr('Unknown streamer.');return;}
+  if(s.captureArmed&&s.captureTrack&&s.captureTrack.readyState==='live'){
+    flashOk(`Already armed for ${s.username}.`);
+    return;
+  }
+  try{
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getDisplayMedia){
+      throw new Error('Screen/tab capture is not supported in this browser context. Open this file directly (file:// or a real http server), not inside an iframe or sandboxed preview.');
+    }
+    // Resume AudioContext on the arm click (user gesture) WITHOUT awaiting, so
+    // getDisplayMedia still sees user activation. Watchdog uses this ctx later.
+    const AC=window.AudioContext||window.webkitAudioContext;
+    if(AC){
+      if(!s.captureAudioCtx || s.captureAudioCtx.state==='closed'){
+        s.captureAudioCtx=new AC();
+      }
+      try{ s.captureAudioCtx.resume(); }catch(e){}
+    }
+    const stream=await requestDisplayStream();
+    const at=stream.getAudioTracks();
+    if(!at.length){
+      stream.getTracks().forEach(t=>t.stop());
+      throw new Error('No audio track was shared. In the picker, select a browser TAB (not a window/screen) and check "Share tab audio".');
+    }
+    // Keep the ORIGINAL display MediaStream alive. Do NOT stop video tracks.
+    s.captureStream=stream;
+    s.captureTrack=at[0];
+    s.captureArmed=true;
+    needsRearmNotice=false;
+    attachCaptureVideo(s, stream);
+    stream.getTracks().forEach(t=>{
+      t.onended=()=>handleCaptureEnded(s);
+    });
+    if(looksLikeRecorderPage(stream)){
+      flashErr('That share looks like this recorder page itself for '+s.username+' — pick the Twitch tab, not the recorder. Unmute the Twitch player and check Share tab audio.');
+    }
+    renderStreamers();
+    updateStatusUI();
+    flashOk('🎧 Capture armed for '+s.username+'. Auto-record will fire for them independently.');
+    // Catch the case where this streamer is ALREADY live at the moment we arm.
+    if(s.autoRec&&s.isLive&&!isRecording(s)&&!helperReady()){
+      flashOk(`🎙️ ${s.username} is already live — starting recording.`);
+      startRec(s.username, false);
+    }
+  }catch(e){
+    console.error('armCapture error:',e);
+    flashErr('Could not arm capture for '+(s?s.username:'streamer')+': '+e.message);
+  }
+}
+
+function armCaptureFromPicker(){
+  const name=document.getElementById('armPickSel')?.value;
+  if(!name){flashErr('Add a streamer first, then Arm their Twitch tab.');return;}
+  armCapture(name);
+}
+
+function disarmCapture(username){
+  const s=findStreamer(username);
+  if(!s) return;
+  if(isTabRecording(s)){
+    stopRec(s.username, 'tab');
+  }
+  teardownCapture(s);
+  renderStreamers();
+  updateStatusUI();
+  flashOk('Capture disarmed for '+s.username+'.');
+}
+
+function renderArmList(){
+  const el=document.getElementById('armList');
+  if(!el) return;
+  if(!streamers.length){el.innerHTML='<span class="arm-chip off">No streamers yet</span>';return;}
+  el.innerHTML=streamers.map(s=>{
+    let cls='off', label='not armed';
+    if(helperIsRetrying(s.username)){cls='rec';label='helper retrying';}
+    else if(isHelperRecording(s)){cls='rec';label='helper rec';}
+    else if(isTabRecording(s)){cls='rec';label='recording';}
+    else if(helperReady() && s.autoRec){cls='on';label='helper will record';}
+    else if(s.captureArmed){cls='on';label='capture-armed';}
+    return `<span class="arm-chip ${cls}">${s.username} · ${label}</span>`;
+  }).join('');
+}
+
+function renderArmPicker(){
+  const sel=document.getElementById('armPickSel');
+  if(!sel) return;
+  const cur=sel.value;
+  if(!streamers.length){
+    sel.innerHTML='<option value="">Add a streamer first</option>';
+    return;
+  }
+  sel.innerHTML=streamers.map(s=>{
+    const tag=isRecording(s)?' (rec)':(s.captureArmed?' (armed)':'');
+    return `<option value="${s.username}">${s.username}${tag}</option>`;
+  }).join('');
+  if(streamers.find(x=>x.username===cur)) sel.value=cur;
+}
+
+function updateStatusUI(){
+  const tabRecs=streamers.filter(isTabRecording);
+  const helperJobs=helper.active||[];
+  const n=tabRecs.length+helperJobs.length;
+  const armedN=streamers.filter(s=>s.captureArmed).length;
+
+  const dot=document.getElementById('armDot'), txt=document.getElementById('armTxt');
+  const pick=document.querySelector('.arm-pick');
+  if(helperReady()){
+    if(dot) dot.className='dot ok';
+    if(txt) txt.textContent='Helper will record Auto-Rec streamers (no tab needed). Arm is optional fallback.';
+    if(pick) pick.classList.add('hidden');
+  }else{
+    if(pick) pick.classList.remove('hidden');
+    if(armedN){
+      if(dot) dot.className='dot ok';
+      if(txt) txt.textContent=armedN+' streamer'+(armedN===1?'':'s')+' capture-armed — auto-record is live-ready for them. Arm others on the Streamers tab.';
+    }else{
+      if(dot) dot.className='dot';
+      if(txt){
+        txt.textContent=needsRearmNotice
+          ? 'No capture armed after reload — arm each streamer on the Streamers tab (browsers cannot persist shared tabs).'
+          : 'Arm capture per streamer on the Streamers tab — each needs their own Twitch tab share.';
+      }
+    }
+  }
+
+  renderArmList();
+  renderArmPicker();
+
+  const cards=document.getElementById('recCards');
+  const idleStats=document.getElementById('idleStats');
+
+  if(n===0){
+    setStatus((helperReady()||armedN)?'🟢 Armed':'⚪ Idle',
+      helperReady()?'Helper is watching — live Auto-Rec streamers start streamlink automatically.':
+      (armedN?'Watching for streamers to go live… Each armed streamer records independently.':'Arm each streamer\'s tab capture, run the helper, or hit Start Now'),
+      false);
+    if(cards) cards.innerHTML='';
+    lastRecCardSig='';
+    if(idleStats) idleStats.classList.remove('hidden');
+    hide('stopAllBtn');
+    const sDur=document.getElementById('sDur');
+    const sSize=document.getElementById('sSize');
+    if(sDur) sDur.textContent='00:00:00';
+    if(sSize) sSize.textContent='0 MB';
+  }else{
+    const names=tabRecs.map(s=>s.username).concat(helperJobs.map(a=>a.username));
+    setStatus(n===1?('🔴 RECORDING '+names[0]):('🔴 Recording '+n+' streamers'),
+      names.join(', '),
+      true);
+    if(cards){
+      const sig=tabRecs.map(s=>'t:'+s.username).concat(helperJobs.map(a=>'h:'+a.username+(a.retrying?':r':''))).join('|');
+      if(sig!==lastRecCardSig){
+        lastRecCardSig=sig;
+        cards.innerHTML=tabRecs.map(s=>recCardHTML(s, null)).join('')
+          +helperJobs.map(a=>recCardHTML(findStreamer(a.username)||{username:a.username,color:'#9146ff'}, a)).join('');
+      }
+      tabRecs.forEach(paintCaptureLevel);
+      helperJobs.forEach(paintHelperVu);
+    }
+    if(idleStats) idleStats.classList.add('hidden');
+    show('stopAllBtn');
+  }
+  updateNeedArmBanner();
+  updateHealthPanel();
+}
+
+function recCardHTML(s, helperJob){
+  if(helperJob){
+    // Prefer session start so mid-stream resume does not reset the visible timer to 0.
+    const sess=Date.parse(helperJob.sessionStartedAt||helperJob.startedAt);
+    const secs=isFinite(sess)?Math.max(0, Math.floor((Date.now()-sess)/1000)):0;
+    const size=((helperJob.size||0)/1048576).toFixed(1)+' MB';
+    const ext=((helperJob.file||'').split('.').pop()||'mp4').toUpperCase();
+    const color=s.color||'#9146ff';
+    const retrying=!!helperJob.retrying;
+    const resumes=Math.max(0, parseInt(helperJob.resumes,10)||0);
+    const segBit=resumes>0?(' · seg '+(resumes+1)):'';
+    const tag=retrying?'<span class="s-retry">retrying</span>':'<span class="s-armed">helper</span>';
+    // Only show live/retry errors on the active card; stale offline misses stay on Streamers tab (muted).
+    const errLine=(retrying || helperJob.lastError) ? helperErrorHTML(s.username, '') : '';
+    return `
+    <div class="rec-card" style="border-left-color:${color}">
+      <div>
+        <div class="who">${s.username} <span class="s-live">● REC</span> ${tag}</div>
+        <div class="meta"><span id="recDur-h-${s.username}">${fmt(secs)}</span> · <span id="recSize-h-${s.username}">${size}</span> · ${ext}<span id="recSeg-h-${s.username}">${segBit}</span></div>
+        ${vuHTML(s.username, true)}
+        ${errLine}
+      </div>
+      <button class="btn btn-stop btn-sm" onclick="stopRec('${s.username}','helper')">⏹ Stop</button>
+    </div>`;
+  }
+  const rec=s.rec;
+  const dur=fmt(rec?rec.secs:0);
+  const size=((rec?rec.bytes:0)/1048576).toFixed(1)+' MB';
+  const ext=((rec&&rec.fmt&&rec.fmt.ext)||(chosenFmt&&chosenFmt.ext)||'ogg').toUpperCase();
+  return `
+    <div class="rec-card" style="border-left-color:${s.color}">
+      <div>
+        <div class="who">${s.username} <span class="s-live">● REC</span></div>
+        <div class="meta"><span id="recDur-${s.username}">${dur}</span> · <span id="recSize-${s.username}">${size}</span> · ${ext}</div>
+        ${vuHTML(s.username, false)}
+      </div>
+      <button class="btn btn-stop btn-sm" onclick="stopRec('${s.username}','tab')">⏹ Stop</button>
+    </div>`;
+}
+
+function updateNeedArmBanner(){
+  const el=document.getElementById('needArmBanner');
+  if(!el) return;
+  if(helperReady()){ el.classList.add('hidden'); el.textContent=''; return; }
+  // Keep banner while live+autoRec+!recording+!helperReady+!captureArmed
+  const liveNeedArm=streamers.filter(s=>s.autoRec&&s.isLive&&!isRecording(s)&&!s.captureArmed);
+  if(!liveNeedArm.length){ el.classList.add('hidden'); el.textContent=''; return; }
+  const names=liveNeedArm.map(s=>s.username).join(', ');
+  const verb=liveNeedArm.length===1?'is':'are';
+  if(helper.ok && !helper.streamlink){
+    el.textContent=names+' '+verb+' live — helper is up but streamlink is missing. Install with: pip install streamlink (restart helper), or Arm tab capture on the Streamers tab.';
+  }else if(!helper.ok){
+    el.textContent=names+' '+verb+" live but capture isn't armed — click Arm on that streamer's row (Streamers tab) and share their Twitch tab audio";
+  }else{
+    el.textContent=names+' '+verb+' live (Auto-Rec) but recording did not start — click Start Now, Arm tab capture, or restart the helper.';
+  }
+  el.classList.remove('hidden');
+}
+
+// ─── WEBM DURATION FIX ────────────────────────────────
+// Chrome's MediaRecorder writes WebM/Opus audio (the "OGG Opus (Chromium)" and
+// "WebM Audio" options above are actually WebM containers under the hood, just
+// given an .ogg extension) with the Segment marked as unknown-size and NO
+// Duration element in Info at all — confirmed by hex-dumping this recorder's
+// own output. That's a live-stream idiom Chrome uses because it doesn't know
+// the final length while recording, and it never goes back to fill it in when
+// you stop. Result: saved files report 0:00 / unknown duration and don't seek
+// properly until something remuxes them. This patches a correct Duration
+// element into Info (based on the wall-clock `secs` counter) right before the
+// file is saved, so recordings play and scrub correctly immediately — no
+// after-the-fact fix-up step needed.
+async function fixWebmDuration(blob, durationSeconds){
+  try{
+    if(!durationSeconds || durationSeconds<=0) return blob;
+    const bytes=new Uint8Array(await blob.arrayBuffer());
+    const fixed=patchEbmlDuration(bytes, durationSeconds);
+    return fixed ? new Blob([fixed],{type:blob.type}) : blob;
+  }catch(e){
+    console.error('fixWebmDuration failed — saving file without the fix:',e);
+    return blob; // never let this block an actual save
+  }
+}
+
+function ebmlReadVint(bytes,pos,keepMarker){
+  const first=bytes[pos];
+  if(first===undefined)return null;
+  let mask=0x80,len=1;
+  while(len<=8&&!(first&mask)){mask>>=1;len++;}
+  if(len>8)return null;
+  let value=keepMarker?first:(first&(mask-1));
+  let allOnes=(first&(mask-1))===(mask-1);
+  for(let i=1;i<len;i++){
+    const b=bytes[pos+i];
+    if(b===undefined)return null;
+    value=value*256+b;
+    if(b!==0xff)allOnes=false;
+  }
+  return {value,len,unknown:allOnes&&!keepMarker};
+}
+
+function ebmlFindChild(bytes,start,end,targetId){
+  let pos=start;
+  while(pos<end){
+    const id=ebmlReadVint(bytes,pos,true);
+    if(!id)return null;
+    const size=ebmlReadVint(bytes,pos+id.len,false);
+    if(!size)return null;
+    const dataStart=pos+id.len+size.len;
+    if(id.value===targetId)return {idPos:pos,sizePos:pos+id.len,sizeLen:size.len,size:size.value,unknownSize:size.unknown,dataStart};
+    if(size.unknown)return null; // can't safely skip past an unknown-size sibling
+    pos=dataStart+size.value;
+  }
+  return null;
+}
+
+function ebmlEncodeVint(value,minLen){
+  let len=minLen||1;
+  while(value>Math.pow(2,7*len)-2)len++; // -2 keeps the reserved all-1s ("unknown") value free
+  const out=new Array(len);
+  let v=value;
+  for(let i=len-1;i>=0;i--){out[i]=v&0xff;v=Math.floor(v/256);}
+  out[0]|=(0x80>>(len-1));
+  return {bytes:new Uint8Array(out),len};
+}
+
+function ebmlDoubleBytes(num){
+  const buf=new ArrayBuffer(8);
+  new DataView(buf).setFloat64(0,num,false); // EBML floats are big-endian
+  return new Uint8Array(buf);
+}
+
+function patchEbmlDuration(bytes,durationSeconds){
+  const SEGMENT=0x18538067, INFO=0x1549A966, TIMECODESCALE=0x2AD7B1, DURATION_ID=0x4489;
+
+  const seg=ebmlFindChild(bytes,0,bytes.length,SEGMENT);
+  if(!seg)return null; // not an EBML/Matroska file (e.g. a real Ogg container) — nothing to patch
+  const segEnd=seg.unknownSize?bytes.length:seg.dataStart+seg.size;
+
+  const info=ebmlFindChild(bytes,seg.dataStart,segEnd,INFO);
+  if(!info||info.unknownSize)return null;
+
+  let timecodeScale=1000000; // Matroska default: 1,000,000 ns/tick = 1ms/tick
+  const tcsEl=ebmlFindChild(bytes,info.dataStart,info.dataStart+info.size,TIMECODESCALE);
+  if(tcsEl){
+    let v=0;
+    for(let i=0;i<tcsEl.size;i++)v=v*256+bytes[tcsEl.dataStart+i];
+    if(v>0)timecodeScale=v;
+  }
+  const durationTicks=durationSeconds*1e9/timecodeScale;
+
+  const sizeVint=ebmlEncodeVint(8);
+  const newDurationEl=new Uint8Array(2+sizeVint.len+8);
+  newDurationEl.set([0x44,0x89],0);
+  newDurationEl.set(sizeVint.bytes,2);
+  newDurationEl.set(ebmlDoubleBytes(durationTicks),2+sizeVint.len);
+
+  const existing=ebmlFindChild(bytes,info.dataStart,info.dataStart+info.size,DURATION_ID);
+  const insertPos=existing?existing.idPos:(info.dataStart+info.size);
+  const removeLen=existing?(existing.dataStart-existing.idPos+existing.size):0;
+  const newInfoSize=info.size+(newDurationEl.length-removeLen);
+  const infoSizeVint=ebmlEncodeVint(newInfoSize,info.sizeLen);
+
+  if(infoSizeVint.len!==info.sizeLen)return null; // would require resizing an ancestor's size field too — bail out safely rather than risk corrupting the file
+
+  const head=bytes.slice(0,info.sizePos);
+  const middle=bytes.slice(info.sizePos+info.sizeLen,insertPos);
+  const tail=bytes.slice(insertPos+removeLen);
+
+  const out=new Uint8Array(head.length+infoSizeVint.bytes.length+middle.length+newDurationEl.length+tail.length);
+  let o=0;
+  out.set(head,o);o+=head.length;
+  out.set(infoSizeVint.bytes,o);o+=infoSizeVint.bytes.length;
+  out.set(middle,o);o+=middle.length;
+  out.set(newDurationEl,o);o+=newDurationEl.length;
+  out.set(tail,o);
+
+  if(!seg.unknownSize){
+    // Segment has a definite size (unusual for MediaRecorder output, which streams
+    // with unknown size) — grow it to match, but only if it fits in the same VINT
+    // width; otherwise skip rather than risk a partial/inconsistent rewrite.
+    const growth=out.length-bytes.length;
+    const segSizeVint=ebmlEncodeVint(seg.size+growth,seg.sizeLen);
+    if(segSizeVint.len===seg.sizeLen)out.set(segSizeVint.bytes,seg.sizePos);
+  }
+
+  return out;
+}
+
+// ─── RECORDING (per streamer) ────────────────────────
+async function startRec(forStreamer, isAuto){
+  // Manual Start Now (no username): pick who to start — never silently no-op.
+  if(!forStreamer){
+    if(helperReady()){
+      const liveAutoH=streamers.filter(s=>s.autoRec&&s.isLive);
+      if(liveAutoH.length){
+        const readyH=liveAutoH.filter(s=>!isRecording(s));
+        const alreadyH=liveAutoH.filter(isRecording);
+        if(readyH.length){
+          flashOk('Starting helper recording for '+readyH.map(s=>s.username).join(', ')+'.');
+          for(const s of readyH) await startRec(s.username, false);
+        }
+        if(!readyH.length && alreadyH.length) flashOk('Already recording all live Auto-Rec streamers.');
+        if(!readyH.length && !alreadyH.length) flashErr('Could not start helper recording.');
+        return;
+      }
+      const pickH=document.getElementById('armPickSel')?.value;
+      if(pickH) return startRec(pickH, false);
+      flashErr('Nobody is live. Select a streamer, then Start Now (helper will invoke streamlink).');
+      return;
+    }
+    const liveAuto=streamers.filter(s=>s.autoRec&&s.isLive);
+    if(liveAuto.length===1){
+      return startRec(liveAuto[0].username, false);
+    }
+    if(liveAuto.length>1){
+      const ready=liveAuto.filter(s=>s.captureArmed&&!isRecording(s));
+      const already=liveAuto.filter(isRecording);
+      const needArm=liveAuto.filter(s=>!s.captureArmed);
+      if(ready.length){
+        flashOk('Starting recording for '+ready.map(s=>s.username).join(', ')+'.');
+        for(const s of ready) await startRec(s.username, false);
+      }
+      if(needArm.length){
+        flashErr(needArm.map(s=>s.username).join(', ')+' '+(needArm.length===1?'is':'are')+" live but not capture-armed — click Arm on each row.");
+      }
+      if(!ready.length && !needArm.length && already.length){
+        flashOk('Already recording all live Auto-Rec streamers.');
+      }
+      if(!ready.length && !needArm.length && !already.length){
+        flashErr('Could not start — arm capture for the live streamers first.');
+      }
+      return;
+    }
+    // none live (or none Auto-Rec live) — start the selected picker streamer
+    const pick=document.getElementById('armPickSel')?.value;
+    if(pick){
+      const s=findStreamer(pick);
+      if(!s){flashErr('Pick a streamer to record.');return;}
+      if(isRecording(s)){flashOk(s.username+' is already recording.');return;}
+      if(!s.captureArmed){
+        flashErr(s.username+" isn't capture-armed. Click Arm, share their Twitch tab, then Start Now.");
+        return;
+      }
+      return startRec(s.username, false);
+    }
+    flashErr('Nobody is live. Select a streamer in the dropdown, Arm their Twitch tab, then Start Now.');
+    return;
+  }
+
+  const s=findStreamer(forStreamer);
+  if(!s){flashErr('Unknown streamer: '+forStreamer);return;}
+  if(s.helperStarting) return;
+  if(s.rec && s.rec.recStarting) return; // per-streamer mutex
+  if(isRecording(s)) return; // idempotent for THIS streamer — others may already be recording
+
+  if(helperReady()){
+    return startHelperRec(s, isAuto);
+  }
+
+  s.rec={ mediaRecorder:null, chunks:[], secs:0, bytes:0, timer:null, recStarting:true, fmt:chosenFmt, recId:null, startedAt:Date.now(), nextSeq:0, idbChain:Promise.resolve() };
+  s.rec.recId=s.username+'-'+s.rec.startedAt;
+  try{
+    if(!(s.captureArmed && s.captureStream && s.captureTrack && s.captureTrack.readyState==='live')){
+      s.captureArmed=false;
+      throw new Error(s.username+' is not capture-armed. Click Arm on their Streamers row, share their Twitch tab, and check "Share tab audio". Other recordings are unaffected.');
+    }
+    const orig=s.captureStream;
+    const liveAudio=orig.getAudioTracks().filter(t=>t.readyState==='live');
+    if(!liveAudio.length){
+      throw new Error('No audio track was shared. In the picker, select a browser TAB (not a window/screen) and check "Share tab audio".');
+    }
+    // AUDIO ONLY for MediaRecorder — leave video tracks running on the original display stream
+    const aStream=new MediaStream(liveAudio);
+
+    // verify the chosen mime is actually supported right now; fall back if not
+    let mime=chosenFmt.mime;
+    let recFmt=chosenFmt;
+    if(!MediaRecorder.isTypeSupported(mime)){
+      const fallback=FMTS.find(f=>MediaRecorder.isTypeSupported(f.mime));
+      if(!fallback){ throw new Error('No supported audio recording format found in this browser.'); }
+      chosenFmt=fallback; mime=fallback.mime; recFmt=fallback;
+      const sFmt=document.getElementById('sFmt');
+      if(sFmt) sFmt.textContent=chosenFmt.ext.toUpperCase();
+    }
+    s.rec.fmt=recFmt;
+
+    const mediaRecorder=new MediaRecorder(aStream,{mimeType:mime,audioBitsPerSecond:192000});
+    s.rec.mediaRecorder=mediaRecorder;
+    mediaRecorder.ondataavailable=e=>{
+      if(!s.rec) return;
+      if(e.data&&e.data.size>0){
+        s.rec.chunks.push(e.data);
+        s.rec.bytes+=e.data.size;
+        const el=document.getElementById('recSize-'+s.username);
+        if(el) el.textContent=(s.rec.bytes/1048576).toFixed(1)+' MB';
+        const seq=s.rec.nextSeq++;
+        const recId=s.rec.recId;
+        const meta={ recId, username:s.username, mime:s.rec.fmt.mime, startedAt:s.rec.startedAt, ext:s.rec.fmt.ext };
+        const blob=e.data;
+        const secs=s.rec.secs;
+        s.rec.idbChain=(s.rec.idbChain||Promise.resolve()).then(()=>idbAppendChunk(meta, blob, seq, secs));
+      }
+    };
+    mediaRecorder.onerror=e=>{console.error('MediaRecorder error:',e.error||e);flashErr('Recording error ('+s.username+'): '+(e.error?.message||'unknown error'));};
+    mediaRecorder.onstop=()=>{
+      // NOTE: tracks are NOT stopped here — this streamer's share stays alive for the next auto-trigger
+      stopCaptureLevelWatch(s, false);
+      const rec=s.rec;
+      const chunks=rec?rec.chunks.slice():[];
+      const secs=rec?rec.secs:0;
+      const fmtUsed=rec&&rec.fmt?rec.fmt:chosenFmt;
+      const uname=s.username;
+      const recId=rec?rec.recId:null;
+      const chain=rec&&rec.idbChain?rec.idbChain:Promise.resolve();
+      if(rec&&rec.timer){clearInterval(rec.timer);rec.timer=null;}
+      s.rec=null;
+      chain.then(()=>saveFile(uname, chunks, secs, fmtUsed, recId))
+        .catch(()=>saveFile(uname, chunks, secs, fmtUsed, recId));
+      renderStreamers();
+      updateStatusUI();
+    };
+    mediaRecorder.start(1000);
+    startCaptureLevelWatch(s);
+    fireNotify('tar-'+s.username, 'Recording '+s.username, 'Tab capture started');
+    s.rec.timer=setInterval(()=>{
+      if(!s.rec) return;
+      s.rec.secs++;
+      const el=document.getElementById('recDur-'+s.username);
+      if(el) el.textContent=fmt(s.rec.secs);
+    },1000);
+    renderStreamers();
+    updateStatusUI();
+  }catch(e){
+    console.error('startRec error:',e);
+    if(s.rec && !isTabRecording(s)) s.rec=null;
+    updateNeedArmBanner();
+    if(isAuto){
+      const now=Date.now();
+      if(now-(s.lastStartFailFlash||0)>=60000){
+        s.lastStartFailFlash=now;
+        flashErr('Auto-start failed for '+s.username+': '+e.message);
+        fireNotify('tar-'+s.username, 'Auto-start failed', s.username+': '+e.message);
+      }
+    }else{
+      flashErr(e.message);
+    }
+    updateStatusUI();
+  }finally{
+    if(s.rec) s.rec.recStarting=false;
+  }
+}
+
+function stopRec(username, source){
+  if(!username){flashErr('Pick a recording to stop, or use Stop All.');return;}
+  const s=findStreamer(username);
+  const helperJob=(helper.active||[]).some(a=>a.username===username);
+  if(source==='helper' || (!source && helperJob && !isTabRecording(s))){
+    helperStop(username);
+    return;
+  }
+  if(source==='tab' || isTabRecording(s)){
+    if(!s || !s.rec || !s.rec.mediaRecorder || s.rec.mediaRecorder.state==='inactive'){
+      if(helperJob){ helperStop(username); return; }
+      flashErr('Not currently recording'+(username?' '+username:'.'));
+      return;
+    }
+    try{
+      if(s.rec.mediaRecorder.state==='recording'){
+        s.rec.mediaRecorder.requestData(); // flush any buffered audio before stopping
+      }
+      s.rec.mediaRecorder.stop();
+    }catch(e){console.error('stopRec error:',e);flashErr('Error stopping recorder: '+e.message);}
+    if(s.rec&&s.rec.timer){clearInterval(s.rec.timer);s.rec.timer=null;}
+    updateStatusUI();
+    return;
+  }
+  if(helperJob){
+    helperStop(username);
+    return;
+  }
+  flashErr('Not currently recording'+(username?' '+username:'.'));
+}
+
+function stopAll(){
+  const tabs=streamers.filter(isTabRecording);
+  const hadHelper=!!(helper.ok && (helper.active||[]).length);
+  tabs.forEach(s=>stopRec(s.username, 'tab'));
+  if(helper.ok) helperStopAll();
+  if(!tabs.length && !hadHelper){
+    flashErr('Not currently recording.');
+  }
+}
+
+
+function recordingStamp(d){
+  // Local time + weekday (Sun/Mon/Tue/…) for easy export sorting.
+  const dt=d instanceof Date ? d : new Date(d||Date.now());
+  if(isNaN(dt.getTime())) return recordingStamp(new Date());
+  const days=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const p=n=>String(n).padStart(2,'0');
+  return days[dt.getDay()]+'-'+dt.getFullYear()+'-'+p(dt.getMonth()+1)+'-'+p(dt.getDate())
+    +'T'+p(dt.getHours())+'-'+p(dt.getMinutes())+'-'+p(dt.getSeconds());
+}
+
+async function saveFile(username, chunks, secs, fmtUsed, recId){
+  const fmtObj=fmtUsed||chosenFmt;
+  try{
+    let use=chunks||[];
+    if(recId){
+      try{
+        const rows=await idbGetSession(recId);
+        const blobs=(rows||[]).map(r=>r.blob).filter(b=>b && b.size>0);
+        if(blobs.length) use=blobs; // IDB is source of truth if chunks grew there
+      }catch(e){ console.warn('idb read on save failed', e); }
+    }
+    if(!use.length){
+      flashErr('No audio data was captured for '+(username||'stream')+' — the share may have ended instantly. Try again and make sure "Share tab audio" is checked.');
+      if(recId) await idbDeleteRec(recId);
+      updateStatusUI();
+      return;
+    }
+    const blobType=fmtObj.mime.split(';')[0];
+    let blob=new Blob(use,{type:blobType});
+    if(blob.size===0){
+      flashErr('Recorded file for '+(username||'stream')+' is empty (0 bytes). The audio source may not have had sound.');
+      if(recId) await idbDeleteRec(recId);
+      updateStatusUI();
+      return;
+    }
+    blob=await fixWebmDuration(blob,secs); // patch in a correct, seekable duration before saving
+    const name=(username||'stream')+'-'+recordingStamp(new Date())+'.'+fmtObj.ext;
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download=name; a.style.display='none';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    // keep url alive for re-download from History tab; only revoke on clearHist()
+    recordings.unshift({name,dur:fmt(secs),size:(blob.size/1048576).toFixed(2)+' MB',url,blob});
+    renderHist();
+    flashOk(`✅ Saved <strong>${name}</strong> (${fmt(secs)}, ${(blob.size/1048576).toFixed(2)} MB)`);
+    fireNotify('tar-'+(username||'stream'), 'Saved '+(username||'stream'), name);
+    if(recId) await idbDeleteRec(recId);
+  }catch(e){
+    console.error('saveFile error:',e);
+    flashErr('Failed to save file: '+e.message);
+  }
+  updateStatusUI();
+  updateNeedArmBanner();
+}
+
+// ─── LIVE BANNERS ────────────────────────────────────
+function renderLiveBanners(){
+  const box=document.getElementById('liveNowBox');
+  if(!box) return;
+  const live=streamers.filter(s=>s.isLive);
+  if(!live.length){box.innerHTML='';return;}
+  box.innerHTML=live.map(s=>`
+    <div style="background:rgba(239,68,68,.1);border:1px solid #ef4444;border-left:4px solid ${s.color};border-radius:.6rem;padding:.65rem 1rem;margin-bottom:.4rem;display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;font-size:.82rem;">
+      <div class="s-dot" style="background:${s.color}"></div>
+      <strong>${s.username}</strong> is <span style="color:#ff6b6b;font-weight:800">LIVE</span>
+      ${s.liveData?.title?`<span style="color:#9ca3af">— ${s.liveData.title}</span>`:''}
+      ${s.liveData?.game_name?`<span style="background:#2d2d35;padding:.1rem .5rem;border-radius:999px;color:#bf94ff;font-size:.7rem">🎮 ${s.liveData.game_name}</span>`:''}
+      ${s.liveData?.viewer_count!==undefined?`<span style="color:#9ca3af;margin-left:auto">${Number(s.liveData.viewer_count).toLocaleString()} viewers</span>`:''}
+    </div>`).join('');
+}
+
+// ─── SCHEDULE ────────────────────────────────────────
+let schedFilter = 'all';
+async function loadSchedule(){
+  const el=document.getElementById('schedList');
+  const ready=streamers.filter(s=>s.broadcasterId);
+  if(!ready.length){el.innerHTML='<div class="sched-empty">Add streamers and connect the API first.</div>';return;}
+  el.innerHTML='<div class="sched-empty" style="color:#bf94ff">Loading schedules…</div>';
+
+  // build filter buttons
+  const fb=document.getElementById('schedFilters');
+  fb.innerHTML=`<button class="filter-btn ${schedFilter==='all'?'active':''}" onclick="setSchedFilter('all')">All</button>`
+    +ready.map(s=>`<button class="filter-btn ${schedFilter===s.username?'active':''}" onclick="setSchedFilter('${s.username}')" style="${schedFilter===s.username?`background:${s.color};border-color:${s.color}`:''}">
+      <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${s.color};margin-right:.3rem;vertical-align:middle"></span>${s.username}</button>`).join('');
+
+  const allSegs=[];
+  for(const s of ready){
+    try{
+      const d=await twitchGet(`schedule?broadcaster_id=${s.broadcasterId}&first=10`);
+      (d.data.segments||[]).forEach(seg=>allSegs.push({...seg,_streamer:s}));
+    }catch(e){/* skip */}
+  }
+
+  if(!allSegs.length){el.innerHTML='<div class="sched-empty">No upcoming schedule found for any streamer.</div>';document.getElementById('nextSchedBanner').classList.add('hidden');return;}
+
+  // sort by start time
+  allSegs.sort((a,b)=>new Date(a.start_time)-new Date(b.start_time));
+  const filtered=schedFilter==='all'?allSegs:allSegs.filter(s=>s._streamer.username===schedFilter);
+  renderScheduleItems(filtered);
+  updateNextSched(allSegs);
+}
+
+function setSchedFilter(f){schedFilter=f;loadSchedule();}
+
+function renderScheduleItems(segs){
+  const el=document.getElementById('schedList');
+  if(!segs.length){el.innerHTML='<div class="sched-empty">No results for this filter.</div>';return;}
+  const now=new Date();
+  const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const DAY=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  let lastDay='';
+  el.innerHTML='';
+  segs.forEach(seg=>{
+    const s=seg._streamer;
+    const start=new Date(seg.start_time);
+    const end=seg.end_time?new Date(seg.end_time):null;
+    const isNow=start<=now&&(!end||end>=now);
+    const isToday=start.toDateString()===now.toDateString();
+    const isSoon=!isNow&&start-now<3*60*60*1000&&start>now;
+    const cancelled=!!seg.canceled_until;
+    const dayKey=start.toDateString();
+    if(dayKey!==lastDay){
+      lastDay=dayKey;
+      const label=isToday?'Today — '+MON[start.getMonth()]+' '+start.getDate():DAY[start.getDay()]+', '+MON[start.getMonth()]+' '+start.getDate();
+      el.insertAdjacentHTML('beforeend',`<div class="sched-day-header">${label}</div>`);
+    }
+    const timeStr=start.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+    const endStr=end?end.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'';
+    const dur=end?Math.round((end-start)/60000):null;
+    let tag,tagCls;
+    if(cancelled){tag='Cancelled';tagCls='tag-cancel';}
+    else if(isNow){tag='LIVE NOW';tagCls='tag-live';}
+    else if(isSoon){tag='Soon';tagCls='tag-soon';}
+    else if(isToday){tag='Today';tagCls='tag-today';}
+    else{tag='Scheduled';tagCls='tag-sched';}
+    el.insertAdjacentHTML('beforeend',`
+      <div class="sched-item ${isNow?'now':''}" style="border-left-color:${s.color}">
+        <div class="sched-date"><div class="t">${timeStr}</div>${endStr?'→ '+endStr:''}</div>
+        <div>
+          <div class="sched-streamer-chip" style="background:${s.color}">${s.username}</div>
+          <div class="sched-title">${seg.title||'(No title)'}</div>
+          <div class="sched-meta">
+            ${seg.category?'🎮 '+seg.category.name:''}
+            ${dur?' · ⏱ '+Math.floor(dur/60)+'h'+(dur%60?' '+(dur%60)+'m':''):''}
+            ${seg.is_recurring?' · 🔁 Recurring':''}
+          </div>
+        </div>
+        <div class="sched-tags"><span class="tag ${tagCls}">${tag}</span></div>
+      </div>`);
+  });
+}
+
+function updateNextSched(segs){
+  if(!segs){segs=[];} // called without args on streamer add
+  const now=new Date();
+  const next=segs.filter(s=>!s.canceled_until&&new Date(s.start_time)>=now).sort((a,b)=>new Date(a.start_time)-new Date(b.start_time))[0];
+  if(!next){document.getElementById('nextSchedBanner').classList.add('hidden');return;}
+  const start=new Date(next.start_time);
+  const s=next._streamer;
+  const DAY=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const isToday=start.toDateString()===now.toDateString();
+  const dayLabel=isToday?'Today':DAY[start.getDay()];
+  const timeStr=start.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  document.getElementById('nextSchedTxt').innerHTML=
+    `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${s.color};margin-right:.35rem;vertical-align:middle"></span>`
+    +`<strong>${s.username}</strong> — ${dayLabel} @ ${timeStr}`
+    +(next.title?` — "${next.title}"`:'')
+    +(next.category?` <span style="color:#9ca3af">(${next.category.name})</span>`:'');
+  document.getElementById('nextSchedBanner').classList.remove('hidden');
+}
+
+// ─── HISTORY ─────────────────────────────────────────
+// v6.21: Music only progressPct meter (demucs stream); Seamless join + Music upload (v6.20); health resume (v6.19); Redo (v6.18).
+function syncMusicBtnLabel(i){
+  const btn=document.querySelector('button[data-music-btn="'+i+'"]');
+  const cb=document.querySelector('input[data-music-redo="'+i+'"]');
+  if(!btn) return;
+  const has=btn.getAttribute('data-has-music')==='1';
+  if(has && cb && cb.checked) btn.textContent='Redo music';
+  else if(has) btn.textContent='Music ready';
+  else btn.textContent='Music only';
+}
+function renderHist(){
+  const countEl=document.getElementById('histCount');
+  const lastEl=document.getElementById('histLast');
+  const fmtEl=document.getElementById('histFmt');
+  if(countEl) countEl.textContent=recordings.length+' file'+(recordings.length===1?'':'s');
+  if(lastEl) lastEl.textContent=recordings[0]?recordings[0].name:'None yet';
+  if(fmtEl){
+    if(recordings[0]&&recordings[0].name){
+      const parts=recordings[0].name.split('.');
+      fmtEl.textContent=(parts.length>1?parts.pop():(chosenFmt&&chosenFmt.ext)||'').toUpperCase()||'—';
+    }else{
+      fmtEl.textContent='—';
+    }
+  }
+  const el=document.getElementById('histList');
+  if(!el) return;
+  if(!recordings.length){el.innerHTML='<div style="text-align:center;padding:2rem;color:#555">No recordings this session.</div>';return;}
+  el.innerHTML=recordings.map((h,i)=>{
+    const diskish=!!(h.fromDisk || h.helperFile);
+    let dl=h.downloadUrl||'';
+    if(!dl && diskish && helper.ok && h.name) dl=helperDownloadUrl(h.name);
+    const stillRec=h.dur==='recording…' || !!h.recording;
+    const dlBtn=stillRec
+      ? `<span class="btn btn-gray btn-sm" title="File is still growing — stop or wait for the segment to finish">Recording…</span>`
+      : (dl
+        ? `<a class="btn btn-purple btn-sm" href="${dl}" download="${String(h.name).replace(/"/g,'')}">Download</a>`
+        : '');
+    const blobBtn=h.url
+      ? `<button class="btn btn-purple btn-sm" onclick="reDl(${i})">💾</button>`
+      : ((!dl && !stillRec) ? `<button class="btn btn-gray btn-sm" onclick="reDl(${i})">💾</button>` : '');
+    let musicBtns='';
+    let seamlessBtns='';
+    if(diskish && !stillRec && h.name && !isMusicExportName(h.name)){
+      const musicName=findSiblingExport(h.name,'music');
+      const vocalsName=findSiblingExport(h.name,'vocals');
+      const mj=musicJobs[h.name];
+      const running=mj && (mj.status==='queued'||mj.status==='running');
+      let pairDl='';
+      if(musicName){
+        pairDl+=`<a class="btn btn-gray btn-sm" href="${helperDownloadUrl(musicName)}" download="${String(musicName).replace(/"/g,'')}" title="Instrumental / no_vocals">Download music</a>`;
+      }
+      if(vocalsName){
+        pairDl+=`<a class="btn btn-gray btn-sm" href="${helperDownloadUrl(vocalsName)}" download="${String(vocalsName).replace(/"/g,'')}" title="Vocals stem">Download vocals</a>`;
+      }
+      let musicCtrl='';
+      if(running){
+        const prog=(mj.progress||'Working…').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+        musicCtrl=`<span class="btn btn-gray btn-sm" title="${prog}">Music…</span>`;
+      }else if(helper.ok && !helper.demucs){
+        // v6.24: explain unavailable instead of opaque click → flashErr
+        const tip=('demucs not installed — '+demucsInstallMsg()).replace(/"/g,'&quot;');
+        musicCtrl=`<span class="btn btn-gray btn-sm" title="${tip}" style="opacity:.7;cursor:not-allowed">Need demucs</span>`;
+      }else{
+        const hasMusic=!!musicName;
+        const label=hasMusic?'Music ready':'Music only';
+        const errTitle=(mj && mj.status==='error')?String(mj.error||'error').replace(/"/g,'&quot;'):'Export instrumental (demucs); native file stays untouched';
+        musicCtrl=`<label class="music-redo" title="When checked, replace existing -music / -vocals export"><input type="checkbox" data-music-redo="${i}" onchange="syncMusicBtnLabel(${i})"> Redo</label>`
+          +`<button class="btn ${hasMusic?'btn-gray':'btn-purple'} btn-sm" data-music-btn="${i}" data-has-music="${hasMusic?'1':'0'}" onclick="startMusicOnly(${i})" title="${errTitle}">${label}</button>`;
+      }
+      musicBtns=pairDl+musicCtrl;
+    }
+    if(diskish && !stillRec && h.name && !isMusicExportName(h.name) && !isSeamlessExportName(h.name)){
+      const group=findRelatedSegmentGroup(h.name);
+      const seamlessName=findSeamlessSibling(h.name) || (group && group[0] ? findSeamlessSibling(group[0]) : null);
+      const sj=seamlessJobs[h.name] || (group && group[0] ? seamlessJobs[group[0]] : null);
+      const sRunning=sj && (sj.status==='queued'||sj.status==='running');
+      if(seamlessName){
+        seamlessBtns+=`<a class="btn btn-gray btn-sm" href="${helperDownloadUrl(seamlessName)}" download="${String(seamlessName).replace(/"/g,'')}" title="Joined continuous file">Download seamless</a>`;
+      }
+      if(sRunning){
+        const prog=(sj.progress||'Joining…').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+        seamlessBtns+=`<span class="btn btn-gray btn-sm" title="${prog}">Joining…</span>`;
+      }else if(group && group.length>=2 && group[0]===h.name){
+        // Offer Join on the earliest segment of a related cluster
+        const title=seamlessName?'Re-join seamless from these segments':'Join '+group.length+' related segments into one continuous file';
+        seamlessBtns+=`<button class="btn ${seamlessName?'btn-gray':'btn-purple'} btn-sm" onclick="startSeamlessFromHist(${i})" title="${title.replace(/"/g,'&quot;')}">Join seamless</button>`;
+      }
+    }
+    const notes=[];
+    let meterHtml='';
+    if(musicJobs[h.name] && (musicJobs[h.name].status==='queued'||musicJobs[h.name].status==='running')){
+      meterHtml+=musicProgressHtml(musicJobs[h.name], {fallback:'Music only…'});
+    }
+    const sjNote=seamlessJobs[h.name];
+    if(sjNote && (sjNote.status==='queued'||sjNote.status==='running')){
+      meterHtml+=musicProgressHtml(sjNote, {fallback:'Joining…'});
+    }
+    if(isSeamlessExportName(h.name)) notes.push('<span style="color:#86efac">seamless</span>');
+    const rowNote=notes.length?(' · '+notes.join(' · ')):'';
+    return `
+    <div class="hist-item">
+      <div><strong>${h.name}</strong><small>${h.dur} · ${h.size}${h.recovered?' · Recovered':''}${h.fromDisk?' · disk/helper':(h.helperFile?' · disk':'')}${rowNote}</small>${meterHtml}</div>
+      <div class="hist-actions">${dlBtn}${seamlessBtns}${musicBtns}${blobBtn}</div>
+    </div>`;
+  }).join('');
+}
+function reDl(i){
+  const r=recordings[i];
+  if(!r) return;
+  if(r.dur==='recording…' || r.recording){
+    flashErr('Still recording — stop first or wait for this segment to finish before downloading.');
+    return;
+  }
+  if(r.url){
+    const a=document.createElement('a');a.href=r.url;a.download=r.name;a.style.display='none';document.body.appendChild(a);a.click();document.body.removeChild(a);
+    return;
+  }
+  const dl=r.downloadUrl || (helper.ok && r.name ? helperDownloadUrl(r.name) : '');
+  if(dl){
+    const a=document.createElement('a');a.href=dl;a.download=r.name;a.style.display='none';document.body.appendChild(a);a.click();document.body.removeChild(a);
+    return;
+  }
+  flashOk('File is on disk'+(r.helperFile?(': '+r.helperFile):' in ~/TwitchRecordings')+' — start the helper (127.0.0.1:8765) for Download links.');
+}
+function triggerNamedDownload(name){
+  if(!name || !helper.ok) return;
+  try{
+    const url=helperDownloadUrl(name);
+    const a=document.createElement('a');
+    a.href=url; a.download=name; a.style.display='none';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  }catch(e){}
+}
+async function startMusicOnly(i){
+  const r=recordings[i];
+  if(!r || !r.name) return;
+  if(r.dur==='recording…' || r.recording){
+    flashErr('Still recording — stop first before Music only.');
+    return;
+  }
+  if(isMusicExportName(r.name)){
+    flashErr('Pick the native recording — not a -music / -vocals export.');
+    return;
+  }
+  if(!helper.ok){
+    flashErr('Local helper not running — start twitch-recorder-server.py for Music only.');
+    return;
+  }
+  const cb=document.querySelector('input[data-music-redo="'+i+'"]');
+  const redo=!!(cb && cb.checked);
+  const musicName=findSiblingExport(r.name,'music');
+  if(musicName && !redo){
+    flashOk('Music ready: '+musicName+' (check Redo to re-export)');
+    triggerNamedDownload(musicName);
+    return;
+  }
+  if(!helper.demucs){
+    flashErr('demucs not installed — pip install demucs (first run downloads models)');
+    return;
+  }
+  const existing=musicJobs[r.name];
+  if(existing && (existing.status==='queued'||existing.status==='running')){
+    flashOk('Music only already running for '+r.name);
+    return;
+  }
+  try{
+    const d=await helperFetch('/api/music-only', {name:r.name, redo:!!redo}, 8000);
+    if(!d || !d.ok){
+      flashErr((d && d.error) || 'Music only failed to start');
+      return;
+    }
+    if(d.already){
+      flashOk('Already have music: '+(d.outputName||'ready')+(redo?'':' — check Redo to replace'));
+      try{ await fetchHelperFiles(); }catch(e){}
+      renderHist();
+      if(d.outputName) triggerNamedDownload(d.outputName);
+      return;
+    }
+    if(d.alreadyRunning && d.jobId){
+      musicJobs[r.name]={jobId:d.jobId, status:'queued', progress:'Already running…', progressPct:0};
+      renderHist();
+      flashOk('Music only already running for '+r.name+' — reattached');
+      pollMusicOnlyJob(r.name, d.jobId);
+      return;
+    }
+    if(!d.jobId){
+      flashErr('Music only failed to start');
+      return;
+    }
+    musicJobs[r.name]={jobId:d.jobId, status:'queued', progress:redo?'Redo queued…':'Queued…', progressPct:0};
+    renderHist();
+    flashOk((redo?'Redo music':'Music only')+' started for '+r.name+' — demucs can take a while (native kept)');
+    pollMusicOnlyJob(r.name, d.jobId);
+  }catch(e){
+    flashErr('Music only failed: '+(e.message||e));
+  }
+}
+async function pollMusicOnlyJob(name, jobId){
+  // Light backup to health Worker sync (v6.19). Health path owns notify when possible.
+  const maxTries=3600; // ~2 hours at 2s
+  for(let n=0;n<maxTries;n++){
+    await new Promise(function(res){ setTimeout(res, 2000); });
+    const cur=musicJobs[name];
+    if(cur && cur.jobId===jobId && (cur.status==='done'||cur.status==='error') && musicJobsNotified.has(jobId)){
+      return;
+    }
+    let d=null;
+    try{
+      d=await helperFetch('/api/music-only/'+encodeURIComponent(jobId), undefined, 5000);
+    }catch(e){
+      continue;
+    }
+    if(!d || !d.ok){
+      if(d && d.error){
+        musicJobs[name]={jobId:jobId, status:'error', progress:'Error', error:d.error, progressPct:(musicJobs[name]&&musicJobs[name].progressPct!=null)?musicJobs[name].progressPct:null};
+        renderHist();
+        if(!musicJobsNotified.has(jobId)){
+          musicJobsNotified.add(jobId);
+          flashErr('Music only: '+d.error);
+          fireNotify('tar-music-'+jobId, 'Music only failed', d.error);
+        }
+        return;
+      }
+      continue;
+    }
+    const pctRaw=d.progressPct;
+    const pct=(pctRaw==null||pctRaw===undefined||pctRaw==='')?null:Number(pctRaw);
+    musicJobs[name]={
+      jobId:jobId,
+      status:d.status||'running',
+      progress:d.progress||'',
+      progressPct:(pct!=null && !isNaN(pct))?pct:(musicJobs[name]&&musicJobs[name].progressPct!=null?musicJobs[name].progressPct:null),
+      error:d.error||null,
+      outputName:d.outputName||null,
+      vocalsName:d.vocalsName||null
+    };
+    renderHist();
+    refreshMusicUploadMeterFromJobs();
+    if(d.status==='done'){
+      if(!musicJobsNotified.has(jobId)){
+        musicJobsNotified.add(jobId);
+        flashOk('Music ready: '+(d.outputName||'done')+(d.vocalsName?' · vocals: '+d.vocalsName:''));
+        fireNotify('tar-music-'+jobId, 'Music ready', d.outputName||name);
+        try{ await fetchHelperFiles(); }catch(e){}
+        renderHist();
+        if(d.outputName) triggerNamedDownload(d.outputName);
+      }
+      return;
+    }
+    if(d.status==='error'){
+      if(!musicJobsNotified.has(jobId)){
+        musicJobsNotified.add(jobId);
+        flashErr('Music only failed: '+(d.error||'unknown'));
+        fireNotify('tar-music-'+jobId, 'Music only failed', d.error||name);
+      }
+      return;
+    }
+  }
+  flashErr('Music only timed out waiting for '+name);
+}
+function startSeamlessFromHist(i){
+  const r=recordings[i];
+  if(!r || !r.name) return;
+  if(r.dur==='recording…' || r.recording){
+    flashErr('Still recording — wait for segments to finish before joining.');
+    return;
+  }
+  const group=findRelatedSegmentGroup(r.name);
+  if(!group || group.length<2){
+    flashErr('No related finished segments found to join for '+r.name);
+    return;
+  }
+  queueSeamlessJoin(group, {force:false, silent:false});
+}
+async function uploadMusicOnly(){
+  const input=document.getElementById('musicUploadInput');
+  if(!input || !input.files || !input.files[0]){
+    flashErr('Choose a recording file to upload for Music only.');
+    return;
+  }
+  if(!helper.ok){
+    flashErr('Local helper not running — start twitch-recorder-server.py for Music only upload.');
+    return;
+  }
+  if(!helper.demucs){
+    flashErr('demucs not installed — pip install demucs (first run downloads models)');
+    return;
+  }
+  const file=input.files[0];
+  if(!file.size){
+    flashErr('Empty file — nothing to upload.');
+    return;
+  }
+  const maxBytes=4*1024*1024*1024;
+  if(file.size>maxBytes){
+    flashErr('File too large (max 4 GB).');
+    return;
+  }
+  const fd=new FormData();
+  fd.append('file', file, file.name);
+  const uploadKey='__upload__:'+file.name;
+  setMusicUploadMeter({status:'uploading', progress:'Uploading 0%', progressPct:0}, uploadKey);
+  flashOk('Uploading '+file.name+' for Music only…');
+  let d=null;
+  try{
+    d=await new Promise(function(resolve, reject){
+      const xhr=new XMLHttpRequest();
+      xhr.open('POST', HELPER_URL+'/api/music-only-upload');
+      xhr.timeout=120000;
+      xhr.upload.onprogress=function(ev){
+        if(!ev.lengthComputable) return;
+        const pct=Math.max(0, Math.min(99, Math.round((ev.loaded/ev.total)*100)));
+        setMusicUploadMeter({
+          status:'uploading',
+          progress:'Uploading '+pct+'% ('+Math.round(ev.loaded/1048576)+' / '+Math.round(ev.total/1048576)+' MB)',
+          progressPct:pct
+        }, uploadKey);
+      };
+      xhr.onload=function(){
+        let parsed=null;
+        try{ parsed=JSON.parse(xhr.responseText); }catch(e){ parsed={ok:false, error:'bad json'}; }
+        resolve(parsed);
+      };
+      xhr.onerror=function(){ reject(new Error('network error')); };
+      xhr.ontimeout=function(){ reject(new Error('upload timed out')); };
+      xhr.send(fd);
+    });
+  }catch(e){
+    const msg=(e && e.message)||String(e);
+    flashErr('Music only upload failed: '+msg);
+    setMusicUploadMeter({status:'error', progress:'Upload failed', progressPct:null}, uploadKey);
+    return;
+  }
+  if(!d || !d.ok){
+    flashErr((d && d.error) || 'Music only upload failed');
+    setMusicUploadMeter({status:'error', progress:(d&&d.error)||'Upload failed', progressPct:null}, uploadKey);
+    return;
+  }
+  const name=d.savedName || d.savedAs || d.name || file.name;
+  try{ await fetchHelperFiles(); }catch(e){}
+  if(d.already){
+    flashOk('Already have music for '+name+': '+(d.outputName||'ready')+(d.path?' · '+d.path:''));
+    if(d.outputName) triggerNamedDownload(d.outputName);
+    setMusicUploadMeter({status:'done', progress:'Already ready', progressPct:100}, name);
+    renderHist();
+    return;
+  }
+  if(d.alreadyRunning && d.jobId){
+    musicJobs[name]={jobId:d.jobId, status:'queued', progress:'Already running…', progressPct:0};
+    setMusicUploadMeter(musicJobs[name], name);
+    renderHist();
+    flashOk('Music only already running for '+name+' — reattached');
+    pollMusicOnlyJob(name, d.jobId);
+    return;
+  }
+  if(!d.jobId){
+    flashErr('Music only failed to start after upload');
+    return;
+  }
+  musicJobs[name]={jobId:d.jobId, status:'queued', progress:'Queued…', progressPct:0};
+  setMusicUploadMeter(musicJobs[name], name);
+  renderHist();
+  flashOk('Uploaded '+(d.savedAs||name)+(d.path?' → '+d.path:'')+' — Music only started (native kept)');
+  fireNotify('tar-music-'+d.jobId, 'Music only started', name);
+  pollMusicOnlyJob(name, d.jobId);
+  try{ input.value=''; }catch(e){}
+}
+
+function clearHist(){recordings.forEach(h=>{try{if(h.url) URL.revokeObjectURL(h.url);}catch(e){}});recordings=[];musicJobs={};musicJobsNotified=new Set();autoMusicQueued=new Set();seamlessJobs={};seamlessJobsNotified=new Set();seamlessAutoStarted=new Set();diskFileIndex={};renderHist();}
+
+// ─── UI HELPERS ──────────────────────────────────────
+function switchTab(el,id){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));
+  el.classList.add('active');document.getElementById(id).classList.add('active');
+  if(id==='hist'){ renderHist(); if(helper.ok) fetchHelperFiles().catch(function(){}); }
+  if(id==='sched'&&connected)loadSchedule();
+  if(id==='streamers')renderStreamers();
+}
+function setApiDot(state,msg){
+  const dot=document.getElementById('apiDot');
+  const txt=document.getElementById('apiTxt');
+  if(dot) dot.className='dot'+(state?' '+state:'');
+  if(txt) txt.textContent=msg;
+}
+function setStatus(main,sub,isRec){
+  const m=document.getElementById('statusMain');
+  const s=document.getElementById('statusSub');
+  const box=document.getElementById('statusBig');
+  if(m) m.textContent=main;
+  if(s) s.textContent=sub;
+  if(box) box.className='status-big'+(isRec?' rec':'');
+}
+function setupMsg(type,msg){const el=document.getElementById('setupMsg');if(!el)return;el.className='alert '+(type==='error'?'alert-err':type==='ok'?'alert-ok':'alert-info');el.innerHTML=msg;el.classList.remove('hidden');}
+function sMsg(type,msg){const el=document.getElementById('streamerMsg');if(!el)return;el.className='alert '+(type==='error'?'alert-err':type==='ok'?'alert-ok':'alert-info');el.innerHTML=msg;el.classList.remove('hidden');setTimeout(()=>el.classList.add('hidden'),5000);}
+function flashErr(msg){const el=document.getElementById('errBox');if(!el)return;el.innerHTML='❌ '+msg;el.classList.remove('hidden');setTimeout(()=>el.classList.add('hidden'),9000);}
+function flashOk(msg){const el=document.getElementById('okBox');if(!el)return;el.innerHTML=msg;el.classList.remove('hidden');setTimeout(()=>el.classList.add('hidden'),7000);}
+function fmt(s){return[Math.floor(s/3600),Math.floor(s%3600/60),s%60].map(v=>String(v).padStart(2,'0')).join(':');}
+function show(id){document.getElementById(id)?.classList.remove('hidden');}
+function hide(id){document.getElementById(id)?.classList.add('hidden');}
+
+// Was called in 5 places (armCapture→updateArmUI, pollAll, removeStreamer, disconnectAPI,
+// and on initial load) but never defined — threw an uncaught ReferenceError every time.
+// That crash aborted armCapture() right after arming succeeded, which skipped the
+// "streamer is already live — start recording now" check and surfaced a false
+// "Could not arm capture" error even though the tab-audio share had actually worked.
+// This build has no health-panel markup in the DOM, so this is a safe no-op stub —
+// it just needs to exist so the calls above don't throw.
+function updateHealthPanel(){}
+
+// v6.16: Worker-driven helper status (same reason Helix uses a Worker).
+function startHelperStatusPolling(){
+  stopHelperStatusPolling();
+  pingHelperAndStatus().catch(function(){});
+  try{
+    const src='setInterval(function(){postMessage("tick");},2000);';
+    const blob=new Blob([src],{type:'text/javascript'});
+    helperPingWorkerUrl=URL.createObjectURL(blob);
+    helperPingWorker=new Worker(helperPingWorkerUrl);
+    helperPingWorker.onmessage=function(){ pingHelperAndStatus().catch(function(){}); };
+  }catch(e){
+    console.warn('Helper status Worker unavailable, falling back to setInterval', e);
+    helperPingTimer=setInterval(function(){ pingHelperAndStatus().catch(function(){}); }, 2000);
+  }
+}
+function stopHelperStatusPolling(){
+  if(helperPingTimer){ clearInterval(helperPingTimer); helperPingTimer=null; }
+  if(helperPingWorker){ try{helperPingWorker.terminate();}catch(e){} helperPingWorker=null; }
+  if(helperPingWorkerUrl){ try{URL.revokeObjectURL(helperPingWorkerUrl);}catch(e){} helperPingWorkerUrl=null; }
+}
+
+document.addEventListener('visibilitychange', function(){
+  // Always refresh helper ACTIVE on foreground — give-up / reconnect must not wait for Helix.
+  if(document.visibilityState!=='visible') return;
+  pingHelperAndStatus().catch(function(){});
+  if(connected) pollAll();
+});
+restoreSettings();
+seedDefaultStreamers();
+initFormats();
+initHelperQuality();
+initSeamlessToggle();
+initAutoMusicOnlyToggle();
+renderStreamers();
+renderHist();
+updateNotifyBtn();
+updateStatusUI();
+updateNeedArmBanner();
+updateHealthPanel();
+updateHelperBar();
+startHelperStatusPolling();
+setInterval(function(){
+  (helper.active||[]).forEach(function(a){
+    var el=document.getElementById('recDur-h-'+a.username);
+    if(!el) return;
+    var started=Date.parse(a.sessionStartedAt||a.startedAt);
+    var secs=isFinite(started)?Math.max(0, Math.floor((Date.now()-started)/1000)):0;
+    el.textContent=fmt(secs);
+    var szEl=document.getElementById('recSize-h-'+a.username);
+    if(szEl) szEl.textContent=((a.size||0)/1048576).toFixed(1)+' MB';
+    var segEl=document.getElementById('recSeg-h-'+a.username);
+    if(segEl){
+      var resumes=Math.max(0, parseInt(a.resumes,10)||0);
+      segEl.textContent=resumes>0?(' · seg '+(resumes+1)):'';
+    }
+    paintHelperVu(a);
+  });
+}, 1000);
+recoverIdbRecordings();
+if(cfg.clientId && cfg.clientSecret) connectAPI();
+
+</script>
+</body>
+</html>
