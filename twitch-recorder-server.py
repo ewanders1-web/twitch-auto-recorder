@@ -17,7 +17,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8765
-HELPER_VERSION = "6.25"
+HELPER_VERSION = "6.26"
 REC_DIR = Path.home() / "TwitchRecordings"
 HTML_NAME = "twitch-auto-recorder.html"
 HERE = Path(__file__).resolve().parent
