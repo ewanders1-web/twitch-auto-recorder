@@ -17,7 +17,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8765
-HELPER_VERSION = "6.27"
+HELPER_VERSION = "6.28"
 REC_DIR = Path.home() / "TwitchRecordings"
 HTML_NAME = "twitch-auto-recorder.html"
 HERE = Path(__file__).resolve().parent
@@ -100,6 +100,9 @@ MUSIC_JOBS = {}
 MUSIC_JOBS_LOCK = threading.Lock()
 # Keep done/error snapshots so a refreshed page can still see result once.
 MUSIC_JOB_KEEP_FINISHED_SECS = 15 * 60
+# v6.28: demucs is CPU/RAM heavy — run one at a time; extras stay queued (Auto Music mid-stream safe).
+DEMUCS_MAX_CONCURRENT = 1
+DEMUCS_SLOTS = threading.Semaphore(DEMUCS_MAX_CONCURRENT)
 
 # Seamless join (ffmpeg concat) async jobs — same shape as music for UI reuse.
 SEAMLESS_JOBS = {}
@@ -1247,6 +1250,24 @@ def music_jobs_for_health():
     return out
 
 
+def music_demucs_queue_info():
+    """Counts for UI: how many Music only jobs are running vs waiting on the demucs slot."""
+    running = 0
+    waiting = 0
+    with MUSIC_JOBS_LOCK:
+        for job in MUSIC_JOBS.values():
+            st = job.get("status") or ""
+            if st == "running":
+                running += 1
+            elif st == "queued":
+                waiting += 1
+    return {
+        "maxConcurrent": DEMUCS_MAX_CONCURRENT,
+        "running": running,
+        "waiting": waiting,
+    }
+
+
 def local_helper_version():
     """Prefer HELPER_VERSION; fall back to VERSION file next to the script."""
     ver = str(HELPER_VERSION or "").strip()
@@ -1464,6 +1485,7 @@ def health_payload():
         "diskWarn": disk["diskWarn"],
         "diskBlock": disk["diskBlock"],
         "musicJobs": music_jobs_for_health(),
+        "musicDemucsQueue": music_demucs_queue_info(),
         "seamlessJobs": seamless_jobs_for_health(),
         "updateRepo": f"https://github.com/{UPDATE_REPO}",
     }
@@ -1897,7 +1919,17 @@ def _unique_vocals_dest(src_name):
 def music_only_worker(job_id, src_path):
     src_path = Path(src_path)
     work = None
+    slot_held = False
     try:
+        # v6.28: stay queued until a demucs slot is free (one at a time).
+        _set_music_job(
+            job_id,
+            status="queued",
+            progress="Waiting for demucs (1 at a time)…",
+            progressPct=0,
+        )
+        DEMUCS_SLOTS.acquire()
+        slot_held = True
         _set_music_job(
             job_id, status="running", progress="Preparing…", progressPct=3
         )
@@ -1962,6 +1994,11 @@ def music_only_worker(job_id, src_path):
             finishedAt=time.time(),
         )
     finally:
+        if slot_held:
+            try:
+                DEMUCS_SLOTS.release()
+            except Exception:
+                pass
         if work is not None:
             try:
                 shutil.rmtree(work, ignore_errors=True)
@@ -2047,10 +2084,19 @@ def start_music_only(raw_name, redo=False):
 
     job_id = uuid.uuid4().hex[:12]
     with MUSIC_JOBS_LOCK:
+        ahead = sum(
+            1
+            for jid, job in MUSIC_JOBS.items()
+            if (job.get("status") or "") in ("queued", "running")
+        )
         MUSIC_JOBS[job_id] = {
             "jobId": job_id,
             "status": "queued",
-            "progress": "Queued…",
+            "progress": (
+                "Waiting for demucs (1 at a time)…"
+                if ahead
+                else "Queued…"
+            ),
             "progressPct": 0,
             "error": None,
             "name": target.name,
@@ -2068,8 +2114,17 @@ def start_music_only(raw_name, redo=False):
         name=f"music-only-{job_id}",
     )
     t.start()
-    log(f"music-only started job={job_id} file={target.name} redo={bool(redo)}")
-    return {"ok": True, "jobId": job_id, "redo": bool(redo)}, 200
+    log(
+        f"music-only started job={job_id} file={target.name} redo={bool(redo)}"
+        + (f" waitingBehind={ahead}" if ahead else "")
+    )
+    return {
+        "ok": True,
+        "jobId": job_id,
+        "redo": bool(redo),
+        "waitingBehind": bool(ahead),
+        "queueAhead": int(ahead),
+    }, 200
 
 
 def music_only_status(job_id):

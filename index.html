@@ -186,7 +186,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.27</span>
+    <span class="badge">v6.28</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -424,9 +424,9 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.27'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.28'; // keep in sync with badge + HELPER_VERSION
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, homeStreamer:'', returnHomeAfterSet:true };
-let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false };
+let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
 let musicJobsNotified = new Set(); // jobIds already fireNotify'd for done/error (health spam safe)
 let autoMusicQueued = new Set(); // basenames already auto-queued this session (dedupe mid-stream + stop)
@@ -675,7 +675,7 @@ function markHelperDown(wasOk){
   if(wasOk && !helperDropNotified){
     helperActiveOnDrop=(helper.active||[]).map(function(a){ return a && a.username; }).filter(Boolean);
   }
-  helper.ok=false; helper.streamlink=false; helper.ffmpeg=false; helper.seamless=false; helper.demucs=false; helper.version=''; helper.demucsHint=''; helper.installHint=''; helper.updateRepo=''; helper.active=[]; helper.lastErrors={};
+  helper.ok=false; helper.streamlink=false; helper.ffmpeg=false; helper.seamless=false; helper.demucs=false; helper.version=''; helper.demucsHint=''; helper.installHint=''; helper.updateRepo=''; helper.active=[]; helper.lastErrors={}; helper.musicDemucsQueue=null;
   helper.diskFree=null; helper.diskTotal=null; helper.diskWarn=false; helper.diskBlock=false;
   // v6.24: hide demucs sticky while helper is down (not the same as demucs missing)
   helperDemucsMissingNotified=false;
@@ -1194,10 +1194,12 @@ async function queueAutoMusicOnly(name, opts){
       autoMusicQueued.delete(name);
       return null;
     }
-    musicJobs[name]={jobId:d.jobId, status:'queued', progress:'Auto queued…', progressPct:0};
+    musicJobs[name]={jobId:d.jobId, status:'queued', progress:d.waitingBehind?'Waiting for demucs (1 at a time)…':'Auto queued…', progressPct:0};
     renderHist();
     refreshMusicUploadMeterFromJobs();
-    flashOk('Auto Music only queued for '+name);
+    flashOk(d.waitingBehind
+      ?('Auto Music only queued for '+name+' — demucs runs 1 at a time')
+      :('Auto Music only queued for '+name));
     pollMusicOnlyJob(name, d.jobId);
     return d;
   }catch(e){
@@ -1221,6 +1223,7 @@ function pingHelperAndStatus(){
       helper.demucs=!!d.demucs;
       helper.version=d.version?String(d.version):'';
       helper.demucsHint=d.demucsHint||(!d.demucs?'pip install demucs (first run downloads models)':'');
+      helper.musicDemucsQueue=(d.musicDemucsQueue && typeof d.musicDemucsQueue==='object')?d.musicDemucsQueue:null;
       helper.recordingsDir=d.recordingsDir||'';
       helper.installHint=d.installHint||(!d.streamlink?'pip install streamlink':'');
       helper.updateRepo=d.updateRepo?String(d.updateRepo):'';
@@ -1641,6 +1644,16 @@ function updateDemucsUi(){
     try{ renderHist(); }catch(e){}
   }
 }
+function musicQueueBit(){
+  // v6.28: demucs runs 1 at a time — surface waiting/running on helper bar
+  const q=helper.musicDemucsQueue;
+  if(!q || !helper.demucs) return '';
+  const run=Number(q.running)||0;
+  const wait=Number(q.waiting)||0;
+  if(run<=0 && wait<=0) return '';
+  if(wait>0) return ' · Music '+run+' running, '+wait+' waiting';
+  return ' · Music '+run+' running';
+}
 function updateHelperBar(){
   const dot=document.getElementById('helperDot');
   const txt=document.getElementById('helperTxt');
@@ -1648,19 +1661,20 @@ function updateHelperBar(){
   if(helper.ok && helper.streamlink){
     const diskBit=(helper.diskFree!=null)?(' · '+fmtDiskBytes(helper.diskFree)+' free'):'';
     const demucsBit=helper.demucs?'':' · demucs missing';
+    const mqBit=musicQueueBit();
     if(helper.diskBlock){
       dot.className='dot err';
       txt.textContent='Disk almost full ('+fmtDiskBytes(helper.diskFree)+' free) — new recordings blocked'+(helper.recordingsDir?' — '+helper.recordingsDir:'');
     }else if(helper.diskWarn){
       dot.className='dot spin';
-      txt.textContent='Connected (low disk'+diskBit+demucsBit+')'+(helper.recordingsDir?' — '+helper.recordingsDir:'');
+      txt.textContent='Connected (low disk'+diskBit+demucsBit+mqBit+')'+(helper.recordingsDir?' — '+helper.recordingsDir:'');
     }else if(!helper.demucs){
       // v6.24: surface demucs gap without looking fully "ok"
       dot.className='dot spin';
       txt.textContent='Connected (streamlink ready · demucs missing — Music only unavailable)'+diskBit+(helper.recordingsDir?' — '+helper.recordingsDir:'');
     }else{
-      dot.className='dot ok';
-      txt.textContent='Connected (streamlink ready)'+diskBit+(helper.recordingsDir?' — '+helper.recordingsDir:'');
+      dot.className=(mqBit && (helper.musicDemucsQueue.waiting>0))?'dot spin':'dot ok';
+      txt.textContent='Connected (streamlink ready)'+diskBit+mqBit+(helper.recordingsDir?' — '+helper.recordingsDir:'');
     }
   }else if(helper.ok && !helper.streamlink){
     const demucsBit=helper.demucs?'':' · demucs missing';
@@ -3672,9 +3686,10 @@ async function startMusicOnly(i){
       flashErr('Music only failed to start');
       return;
     }
-    musicJobs[r.name]={jobId:d.jobId, status:'queued', progress:redo?'Redo queued…':'Queued…', progressPct:0};
+    musicJobs[r.name]={jobId:d.jobId, status:'queued', progress:d.waitingBehind?'Waiting for demucs (1 at a time)…':(redo?'Redo queued…':'Queued…'), progressPct:0};
     renderHist();
-    flashOk((redo?'Redo music':'Music only')+' started for '+r.name+' — demucs can take a while (native kept)');
+    flashOk((redo?'Redo music':'Music only')+' '+(d.waitingBehind?'queued':'started')+' for '+r.name
+      +(d.waitingBehind?' — demucs runs 1 at a time':' — demucs can take a while')+' (native kept)');
     pollMusicOnlyJob(r.name, d.jobId);
   }catch(e){
     flashErr('Music only failed: '+(e.message||e));
@@ -3842,7 +3857,7 @@ async function uploadMusicOnly(){
     flashErr('Music only failed to start after upload');
     return;
   }
-  musicJobs[name]={jobId:d.jobId, status:'queued', progress:'Queued…', progressPct:0};
+  musicJobs[name]={jobId:d.jobId, status:'queued', progress:d.waitingBehind?'Waiting for demucs (1 at a time)…':'Queued…', progressPct:0};
   setMusicUploadMeter(musicJobs[name], name);
   renderHist();
   flashOk('Uploaded '+(d.savedAs||name)+(d.path?' → '+d.path:'')+' — Music only started (native kept)');

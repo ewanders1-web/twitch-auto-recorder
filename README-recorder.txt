@@ -1,4 +1,4 @@
-Twitch Auto-Recorder v6.27
+Twitch Auto-Recorder v6.28
 
 pip install streamlink
 python twitch-recorder-server.py
@@ -36,3 +36,4 @@ Home streamer / return after set (v6.25): persist `homeStreamer` + `returnHomeAf
 
 GitHub Pages + portable install (v6.26): Open the UI from https://ewanders1-web.github.io/twitch-auto-recorder/ on any browser/computer. Recording still requires the Python helper on the machine that should save files (streamlink → ~/TwitchRecordings). Pages cannot record by itself. Helper keeps Access-Control-Allow-Origin: * so Pages → http://127.0.0.1:8765 works when the helper runs on that same machine (localhost only — never bind 0.0.0.0). Install helper: curl -fsSL https://raw.githubusercontent.com/ewanders1-web/twitch-auto-recorder/main/install.sh | bash  (macOS → ~/Library/Application Support/TwitchRecorder; Linux → ~/.local/share/TwitchRecorder; optional --start). Windows: install.ps1 → %LOCALAPPDATA%\TwitchRecorder. Then pip install streamlink and start the helper. Check for updates still pulls from the public repo into the install dir.
 Helper OGG output + Music only OGG (v6.27): helper streamlink recordings always write OGG audio (`audio_only` + `--ffmpeg-fout ogg` when ffmpeg is present → `~/TwitchRecordings/<user>-<weekday-stamp>.ogg`). No mp4 video container. Without ffmpeg, falls back to `.ts` only. Seamless join uses ffmpeg concat on `.ogg` segments. Music only / Demucs remux prefers sibling `<stem>-music.ogg` / `-vocals.ogg` (libvorbis, then libopus); falls back to `.wav` if ogg encode fails; still finds legacy `.mp3`/`.m4a`/`.wav`. Existing mp4/mp3 files on disk are unchanged — only new recordings/exports use ogg.
+Demucs one-at-a-time queue (v6.28): Music only / Auto Music / Convert upload no longer spawn parallel demucs processes. Mid-stream finished segments still queue immediately, but demucs runs one job at a time (others stay Waiting…). Helper bar shows Music N running, M waiting. alreadyRunning / redo:false / natives-never-deleted unchanged.
