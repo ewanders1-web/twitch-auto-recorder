@@ -17,7 +17,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8765
-HELPER_VERSION = "6.28"
+HELPER_VERSION = "6.29"
 REC_DIR = Path.home() / "TwitchRecordings"
 HTML_NAME = "twitch-auto-recorder.html"
 HERE = Path(__file__).resolve().parent
@@ -103,6 +103,15 @@ MUSIC_JOB_KEEP_FINISHED_SECS = 15 * 60
 # v6.28: demucs is CPU/RAM heavy — run one at a time; extras stay queued (Auto Music mid-stream safe).
 DEMUCS_MAX_CONCURRENT = 1
 DEMUCS_SLOTS = threading.Semaphore(DEMUCS_MAX_CONCURRENT)
+# v6.29: last orphan music-only-* / seamless-*.txt cleanup summary (for /api/health flash)
+ORPHAN_TEMPS_LAST = {
+    "dirs": 0,
+    "files": 0,
+    "bytes": 0,
+    "at": None,
+    "reason": None,
+}
+_ORPHAN_DISKWARN_DONE = False
 
 # Seamless join (ffmpeg concat) async jobs — same shape as music for UI reuse.
 SEAMLESS_JOBS = {}
@@ -484,6 +493,106 @@ def disk_block_error():
         f"disk almost full ({mb:.0f} MB free under {REC_DIR}) — "
         f"free at least {DISK_BLOCK_BYTES // (1024 * 1024)} MB before recording"
     )
+
+
+def _dir_byte_size(root):
+    """Best-effort recursive size; ignores unreadable entries."""
+    total = 0
+    try:
+        for p in Path(root).rglob("*"):
+            try:
+                if p.is_file():
+                    total += int(p.stat().st_size)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return total
+
+
+def cleanup_orphan_temps(reason="startup"):
+    """Delete leftover music-only-* work dirs and stale seamless-*.txt under REC_DIR.
+
+    Never deletes user recordings or -music / -vocals / -seamless exports.
+    Safe if REC_DIR is missing or empty.
+    """
+    global ORPHAN_TEMPS_LAST
+    dirs_cleared = 0
+    files_cleared = 0
+    bytes_freed = 0
+    try:
+        if not REC_DIR.is_dir():
+            ORPHAN_TEMPS_LAST = {
+                "dirs": 0,
+                "files": 0,
+                "bytes": 0,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "reason": reason,
+            }
+            return ORPHAN_TEMPS_LAST
+        now = time.time()
+        for p in list(REC_DIR.iterdir()):
+            try:
+                name = p.name
+                # tempfile.mkdtemp(prefix="music-only-") work dirs only — never files/exports
+                if p.is_dir() and name.startswith("music-only-"):
+                    size = _dir_byte_size(p)
+                    shutil.rmtree(p, ignore_errors=True)
+                    if not p.exists():
+                        dirs_cleared += 1
+                        bytes_freed += size
+                    continue
+                # leftover ffmpeg concat list files (prefix seamless-, suffix .txt)
+                if (
+                    p.is_file()
+                    and name.startswith("seamless-")
+                    and name.endswith(".txt")
+                ):
+                    try:
+                        st = p.stat()
+                        age = now - float(st.st_mtime)
+                    except OSError:
+                        continue
+                    if age < 3600:
+                        continue
+                    size = int(st.st_size)
+                    try:
+                        p.unlink()
+                    except OSError:
+                        continue
+                    files_cleared += 1
+                    bytes_freed += size
+            except OSError:
+                continue
+    except OSError as e:
+        log(f"orphan cleanup ({reason}) skipped: {e}")
+    ORPHAN_TEMPS_LAST = {
+        "dirs": dirs_cleared,
+        "files": files_cleared,
+        "bytes": bytes_freed,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "reason": reason,
+    }
+    if dirs_cleared or files_cleared:
+        log(
+            f"orphan cleanup ({reason}): {dirs_cleared} dirs, "
+            f"{files_cleared} files, {bytes_freed} bytes freed"
+        )
+    else:
+        log(f"orphan cleanup ({reason}): nothing to clear")
+    return ORPHAN_TEMPS_LAST
+
+
+def maybe_cleanup_orphan_temps_on_diskwarn(disk):
+    """One cleanup per diskWarn episode (in addition to startup)."""
+    global _ORPHAN_DISKWARN_DONE
+    if not disk or not disk.get("diskWarn"):
+        _ORPHAN_DISKWARN_DONE = False
+        return None
+    if _ORPHAN_DISKWARN_DONE:
+        return None
+    _ORPHAN_DISKWARN_DONE = True
+    return cleanup_orphan_temps(reason="diskWarn")
 
 
 def set_last_error(username, msg):
@@ -1239,7 +1348,7 @@ def music_jobs_for_health():
     with MUSIC_JOBS_LOCK:
         for jid, job in MUSIC_JOBS.items():
             st = job.get("status") or ""
-            if st in ("done", "error"):
+            if st in ("done", "error", "cancelled"):
                 finished_at = float(job.get("finishedAt") or 0.0)
                 if finished_at and (now - finished_at) > MUSIC_JOB_KEEP_FINISHED_SECS:
                     dead.append(jid)
@@ -1465,7 +1574,9 @@ def health_payload():
         ]
     sl = which_streamlink()
     disk = disk_status()
+    maybe_cleanup_orphan_temps_on_diskwarn(disk)
     prune_recent_sessions()
+    orphan = ORPHAN_TEMPS_LAST or {}
     return {
         "ok": True,
         "version": HELPER_VERSION,
@@ -1488,6 +1599,11 @@ def health_payload():
         "musicDemucsQueue": music_demucs_queue_info(),
         "seamlessJobs": seamless_jobs_for_health(),
         "updateRepo": f"https://github.com/{UPDATE_REPO}",
+        # v6.29: last orphan temp cleanup (UI one-shot flash when non-zero after reconnect)
+        "orphanTempsCleared": int(orphan.get("dirs") or 0) + int(orphan.get("files") or 0),
+        "orphanTempsBytes": int(orphan.get("bytes") or 0),
+        "orphanTempsDirs": int(orphan.get("dirs") or 0),
+        "orphanTempsFiles": int(orphan.get("files") or 0),
     }
 
 
@@ -1916,20 +2032,66 @@ def _unique_vocals_dest(src_name):
     return _unique_sibling_dest(src_name, "vocals")
 
 
+def _music_job_is_cancelled(job_id):
+    """True if job missing, cancelRequested, or already status=cancelled."""
+    with MUSIC_JOBS_LOCK:
+        job = MUSIC_JOBS.get(job_id)
+        if not job:
+            return True
+        if job.get("cancelRequested"):
+            return True
+        return (job.get("status") or "") == "cancelled"
+
+
+def _finalize_cancelled_music_job(job_id):
+    """Ensure cancelled terminal fields (idempotent if cancel API already set them)."""
+    with MUSIC_JOBS_LOCK:
+        job = MUSIC_JOBS.get(job_id)
+        if not job:
+            return
+        if (job.get("status") or "") != "cancelled":
+            job["status"] = "cancelled"
+            job["progress"] = "Cancelled"
+            job["progressPct"] = job.get("progressPct") if job.get("progressPct") is not None else 0
+            job["finishedAt"] = time.time()
+        elif not job.get("finishedAt"):
+            job["finishedAt"] = time.time()
+        job["cancelRequested"] = True
+
+
 def music_only_worker(job_id, src_path):
     src_path = Path(src_path)
     work = None
     slot_held = False
     try:
         # v6.28: stay queued until a demucs slot is free (one at a time).
+        # v6.29: waiting is interruptible — Cancel waiting / Clear waiting Music.
         _set_music_job(
             job_id,
             status="queued",
             progress="Waiting for demucs (1 at a time)…",
             progressPct=0,
         )
-        DEMUCS_SLOTS.acquire()
-        slot_held = True
+        while True:
+            if _music_job_is_cancelled(job_id):
+                _finalize_cancelled_music_job(job_id)
+                log(f"music-only cancelled (before slot) job={job_id}")
+                return
+            got = DEMUCS_SLOTS.acquire(timeout=0.5)
+            if not got:
+                continue
+            slot_held = True
+            # Cancelled while waiting — release immediately, never start demucs.
+            if _music_job_is_cancelled(job_id):
+                try:
+                    DEMUCS_SLOTS.release()
+                except Exception:
+                    pass
+                slot_held = False
+                _finalize_cancelled_music_job(job_id)
+                log(f"music-only cancelled (after slot) job={job_id}")
+                return
+            break
         _set_music_job(
             job_id, status="running", progress="Preparing…", progressPct=3
         )
@@ -2158,6 +2320,82 @@ def music_only_status(job_id):
         }
     return payload, 200
 
+
+def cancel_music_only(body):
+    """Cancel waiting (queued) Music only jobs — never kill a running demucs.
+
+    Body:
+      { "jobId": "..." } — cancel that job if still queued
+      { "waiting": true } — cancel all currently queued jobs
+    """
+    if not isinstance(body, dict):
+        body = {}
+    job_id = body.get("jobId")
+    waiting_all = bool(body.get("waiting"))
+    if not waiting_all and not job_id:
+        return {
+            "ok": False,
+            "error": "provide jobId or waiting:true",
+            "cancelled": [],
+            "skipped": [],
+        }, 400
+
+    cancelled = []
+    skipped = []
+    now = time.time()
+
+    with MUSIC_JOBS_LOCK:
+        if waiting_all:
+            targets = [
+                jid
+                for jid, job in MUSIC_JOBS.items()
+                if (job.get("status") or "") == "queued"
+            ]
+        else:
+            job_id = str(job_id).strip()
+            if (
+                not job_id
+                or "/" in job_id
+                or "\\" in job_id
+                or len(job_id) > 64
+            ):
+                return {
+                    "ok": False,
+                    "error": "invalid jobId",
+                    "cancelled": [],
+                    "skipped": [],
+                }, 400
+            targets = [job_id]
+
+        for jid in targets:
+            job = MUSIC_JOBS.get(jid)
+            if not job:
+                skipped.append({"jobId": jid, "reason": "not found"})
+                continue
+            st = job.get("status") or ""
+            if st == "queued":
+                job["cancelRequested"] = True
+                job["status"] = "cancelled"
+                job["progress"] = "Cancelled"
+                job["finishedAt"] = now
+                cancelled.append(jid)
+            elif st == "running":
+                skipped.append({"jobId": jid, "reason": "already running"})
+            elif st == "cancelled":
+                skipped.append({"jobId": jid, "reason": "already cancelled"})
+            elif st == "done":
+                skipped.append({"jobId": jid, "reason": "already done"})
+            elif st == "error":
+                skipped.append({"jobId": jid, "reason": "already error"})
+            else:
+                skipped.append({"jobId": jid, "reason": f"status={st}"})
+
+    if cancelled:
+        log(
+            f"music-only cancel: cancelled={cancelled}"
+            + (f" skipped={skipped}" if skipped else "")
+        )
+    return {"ok": True, "cancelled": cancelled, "skipped": skipped}, 200
 
 
 def seamless_job_snapshot(job):
@@ -2885,6 +3123,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     result = clear_errors(None)
             self.send_json(result)
             return
+        if path == "/api/music-only/cancel":
+            body = self.read_json()
+            payload, status = cancel_music_only(body if isinstance(body, dict) else {})
+            self.send_json(payload, status=status)
+            return
         if path == "/api/music-only":
             body = self.read_json()
             name = (body or {}).get("name") if isinstance(body, dict) else None
@@ -2944,6 +3187,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main():
     REC_DIR.mkdir(parents=True, exist_ok=True)
+    # v6.29: clear orphan music-only-* temp dirs left by mid-demucs crashes
+    try:
+        cleanup_orphan_temps(reason="startup")
+    except Exception as e:
+        log(f"orphan cleanup startup failed: {e}")
     threading.Thread(target=reaper_loop, daemon=True).start()
     threading.Thread(target=meter_loop, daemon=True, name="meter").start()
     httpd = http.server.ThreadingHTTPServer((HOST, PORT), Handler)

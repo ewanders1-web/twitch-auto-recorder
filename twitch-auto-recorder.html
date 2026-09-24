@@ -186,7 +186,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.28</span>
+    <span class="badge">v6.29</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -207,7 +207,8 @@
     <div class="api-bar" id="helperBar">
       <div id="helperDot" class="dot"></div>
       <span id="helperTxt">Not running — using tab capture</span>
-      <button class="btn btn-gray btn-sm" style="margin-left:auto" id="checkUpdateBtn" onclick="checkForUpdates()" title="Compare local helper version to GitHub">Check for updates</button>
+      <button class="btn btn-gray btn-sm hidden" style="margin-left:auto" id="clearWaitingMusicBtn" onclick="clearWaitingMusic()" title="Cancel all waiting Music only jobs (the one currently running keeps going)">Clear waiting Music</button>
+      <button class="btn btn-gray btn-sm" id="checkUpdateBtn" onclick="checkForUpdates()" title="Compare local helper version to GitHub">Check for updates</button>
     </div>
     <div class="alert alert-info" id="anyMachineBanner" style="margin-top:0;margin-bottom:1rem;font-size:.8rem;">
       <strong>Any machine:</strong> Open this UI from
@@ -424,11 +425,12 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.28'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.29'; // keep in sync with badge + HELPER_VERSION
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, homeStreamer:'', returnHomeAfterSet:true };
-let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null };
+let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
 let musicJobsNotified = new Set(); // jobIds already fireNotify'd for done/error (health spam safe)
+let orphanTempsFlashedKey = ''; // v6.29: one soft flash per orphan cleanup summary
 let autoMusicQueued = new Set(); // basenames already auto-queued this session (dedupe mid-stream + stop)
 let helperDemucsMissingNotified = false; // v6.24: one-shot demucs-missing flash/notify per episode
 let updateCheck = { localVersion:'', remoteVersion:'', updateAvailable:false, checking:false, installing:false }; // v6.25
@@ -675,7 +677,7 @@ function markHelperDown(wasOk){
   if(wasOk && !helperDropNotified){
     helperActiveOnDrop=(helper.active||[]).map(function(a){ return a && a.username; }).filter(Boolean);
   }
-  helper.ok=false; helper.streamlink=false; helper.ffmpeg=false; helper.seamless=false; helper.demucs=false; helper.version=''; helper.demucsHint=''; helper.installHint=''; helper.updateRepo=''; helper.active=[]; helper.lastErrors={}; helper.musicDemucsQueue=null;
+  helper.ok=false; helper.streamlink=false; helper.ffmpeg=false; helper.seamless=false; helper.demucs=false; helper.version=''; helper.demucsHint=''; helper.installHint=''; helper.updateRepo=''; helper.active=[]; helper.lastErrors={}; helper.musicDemucsQueue=null; helper.orphanTempsCleared=0; helper.orphanTempsBytes=0;
   helper.diskFree=null; helper.diskTotal=null; helper.diskWarn=false; helper.diskBlock=false;
   // v6.24: hide demucs sticky while helper is down (not the same as demucs missing)
   helperDemucsMissingNotified=false;
@@ -745,7 +747,13 @@ function setMusicUploadMeter(jobOrNull, name){
   }
   if(name) el.setAttribute('data-job-name', name);
   el.classList.remove('hidden');
-  el.innerHTML=musicProgressHtml(jobOrNull, {force:true, fallback:'Music…'});
+  let html=musicProgressHtml(jobOrNull, {force:true, fallback:'Music…'});
+  // v6.29: Cancel on Convert when Music only is still Waiting (queued)
+  if(jobOrNull.status==='queued' && jobOrNull.jobId){
+    const jid=String(jobOrNull.jobId).replace(/'/g,"\\'");
+    html+='<div style="margin-top:.35rem"><button class="btn btn-gray btn-sm" onclick="cancelMusicOnly(\''+jid+'\')" title="Cancel this waiting Music only job">Cancel waiting</button></div>';
+  }
+  el.innerHTML=html;
 }
 function refreshMusicUploadMeterFromJobs(){
   const el=document.getElementById('musicUploadMeter');
@@ -756,6 +764,8 @@ function refreshMusicUploadMeterFromJobs(){
   if(!job) return;
   if(job.status==='queued'||job.status==='running'||job.status==='uploading'){
     setMusicUploadMeter(job, name);
+  }else if(job.status==='cancelled'){
+    setMusicUploadMeter(null);
   }else if(job.status==='done'||job.status==='error'){
     setMusicUploadMeter(Object.assign({}, job, {
       progressPct: job.status==='done' ? 100 : job.progressPct,
@@ -805,6 +815,10 @@ function applyMusicJobsFromHealth(jobs){
     if((status==='done'||status==='error') && !musicJobsNotified.has(j.jobId)){
       musicJobsNotified.add(j.jobId);
       finishNotify.push(entry);
+    }else if(status==='cancelled' && !musicJobsNotified.has(j.jobId)){
+      // v6.29: terminal, no failure notify; leave autoMusicQueued so Cancel sticks this session
+      musicJobsNotified.add(j.jobId);
+      needRender=true;
     }
   }
   if(needRender){ renderHist(); refreshMusicUploadMeterFromJobs(); }
@@ -1232,8 +1246,11 @@ function pingHelperAndStatus(){
       helper.diskTotal=(typeof d.diskTotal==='number')?d.diskTotal:null;
       helper.diskWarn=!!d.diskWarn;
       helper.diskBlock=!!d.diskBlock;
+      helper.orphanTempsCleared=(typeof d.orphanTempsCleared==='number')?d.orphanTempsCleared:0;
+      helper.orphanTempsBytes=(typeof d.orphanTempsBytes==='number')?d.orphanTempsBytes:0;
       noticeHelperDisk();
       noticeHelperDemucs();
+      noticeOrphanTempsCleared(wasOk);
       updateDemucsUi();
       if(Array.isArray(d.musicJobs)) applyMusicJobsFromHealth(d.musicJobs);
       if(Array.isArray(d.seamlessJobs)) applySeamlessJobsFromHealth(d.seamlessJobs);
@@ -1644,6 +1661,76 @@ function updateDemucsUi(){
     try{ renderHist(); }catch(e){}
   }
 }
+function noticeOrphanTempsCleared(wasOk){
+  // v6.29: one soft flash per orphan cleanup summary (startup reconnect or diskWarn pass)
+  if(!helper.ok) return;
+  const cleared=Number(helper.orphanTempsCleared)||0;
+  const bytes=Number(helper.orphanTempsBytes)||0;
+  if(cleared<=0 && bytes<=0) return;
+  const key=String(cleared)+':'+String(bytes)+':'+(helper.version||'');
+  if(orphanTempsFlashedKey===key) return;
+  orphanTempsFlashedKey=key;
+  const bit=bytes>0?(' · '+fmtDiskBytes(bytes)+' freed'):'';
+  flashOk('Cleared orphan Music temps ('+cleared+')'+bit);
+}
+async function cancelMusicOnly(jobId){
+  if(!jobId || !helper.ok) return;
+  try{
+    const d=await helperFetch('/api/music-only/cancel', {jobId:String(jobId)}, 5000);
+    if(!d || !d.ok){
+      flashErr((d && d.error) || 'Cancel failed');
+      return;
+    }
+    const cancelled=Array.isArray(d.cancelled)?d.cancelled:[];
+    if(!cancelled.length){
+      const sk=(d.skipped && d.skipped[0] && d.skipped[0].reason) || 'not waiting';
+      flashOk('Nothing cancelled — '+sk);
+      return;
+    }
+    for(const name of Object.keys(musicJobs)){
+      const j=musicJobs[name];
+      if(j && j.jobId && cancelled.indexOf(j.jobId)>=0){
+        musicJobs[name]=Object.assign({}, j, {status:'cancelled', progress:'Cancelled'});
+        musicJobsNotified.add(j.jobId);
+        // leave autoMusicQueued so Auto Music does not immediately re-queue this segment
+      }
+    }
+    renderHist();
+    refreshMusicUploadMeterFromJobs();
+    flashOk(cancelled.length===1?'Cancelled waiting Music only':'Cancelled '+cancelled.length+' waiting Music only jobs');
+    try{ await pingHelperAndStatus(); }catch(e){}
+  }catch(e){
+    flashErr('Cancel failed: '+(e.message||e));
+  }
+}
+async function clearWaitingMusic(){
+  if(!helper.ok) return;
+  try{
+    const d=await helperFetch('/api/music-only/cancel', {waiting:true}, 5000);
+    if(!d || !d.ok){
+      flashErr((d && d.error) || 'Clear waiting failed');
+      return;
+    }
+    const cancelled=Array.isArray(d.cancelled)?d.cancelled:[];
+    if(!cancelled.length){
+      flashOk('No waiting Music only jobs to clear');
+      return;
+    }
+    for(const name of Object.keys(musicJobs)){
+      const j=musicJobs[name];
+      if(j && j.jobId && cancelled.indexOf(j.jobId)>=0){
+        musicJobs[name]=Object.assign({}, j, {status:'cancelled', progress:'Cancelled'});
+        musicJobsNotified.add(j.jobId);
+      }
+    }
+    renderHist();
+    refreshMusicUploadMeterFromJobs();
+    flashOk('Cleared '+cancelled.length+' waiting Music only job'+(cancelled.length===1?'':'s')+' (running kept)');
+    try{ await pingHelperAndStatus(); }catch(e){}
+  }catch(e){
+    flashErr('Clear waiting failed: '+(e.message||e));
+  }
+}
 function musicQueueBit(){
   // v6.28: demucs runs 1 at a time — surface waiting/running on helper bar
   const q=helper.musicDemucsQueue;
@@ -1683,6 +1770,16 @@ function updateHelperBar(){
   }else{
     dot.className='dot';
     txt.textContent='Not running — using tab capture';
+  }
+  const clearBtn=document.getElementById('clearWaitingMusicBtn');
+  if(clearBtn){
+    const wait=(helper.ok && helper.demucs && helper.musicDemucsQueue)?(Number(helper.musicDemucsQueue.waiting)||0):0;
+    if(wait>0){
+      clearBtn.classList.remove('hidden');
+      clearBtn.textContent=wait===1?'Clear waiting Music':'Clear waiting Music ('+wait+')';
+    }else{
+      clearBtn.classList.add('hidden');
+    }
   }
 }
 async function startHelperRec(s, isAuto){
@@ -3554,7 +3651,12 @@ function renderHist(){
       let musicCtrl='';
       if(running){
         const prog=(mj.progress||'Working…').replace(/</g,'&lt;').replace(/"/g,'&quot;');
-        musicCtrl=`<span class="btn btn-gray btn-sm" title="${prog}">Music…</span>`;
+        const waiting=mj.status==='queued';
+        musicCtrl=`<span class="btn btn-gray btn-sm" title="${prog}">${waiting?'Waiting…':'Music…'}</span>`;
+        // v6.29: Cancel waiting only (not the demucs currently running)
+        if(waiting && mj.jobId){
+          musicCtrl+='<button class="btn btn-gray btn-sm" onclick="cancelMusicOnly(\''+String(mj.jobId).replace(/[^a-zA-Z0-9_-]/g,'')+'\')" title="Cancel this waiting Music only job">Cancel</button>';
+        }
       }else if(helper.ok && !helper.demucs){
         // v6.24: explain unavailable instead of opaque click → flashErr
         const tip=('demucs not installed — '+demucsInstallMsg()).replace(/"/g,'&quot;');
@@ -3701,7 +3803,7 @@ async function pollMusicOnlyJob(name, jobId){
   for(let n=0;n<maxTries;n++){
     await new Promise(function(res){ setTimeout(res, 2000); });
     const cur=musicJobs[name];
-    if(cur && cur.jobId===jobId && (cur.status==='done'||cur.status==='error') && musicJobsNotified.has(jobId)){
+    if(cur && cur.jobId===jobId && (cur.status==='done'||cur.status==='error'||cur.status==='cancelled') && musicJobsNotified.has(jobId)){
       return;
     }
     let d=null;
@@ -3753,6 +3855,14 @@ async function pollMusicOnlyJob(name, jobId){
         flashErr('Music only failed: '+(d.error||'unknown'));
         fireNotify('tar-music-'+jobId, 'Music only failed', d.error||name);
       }
+      return;
+    }
+    if(d.status==='cancelled'){
+      // v6.29: quiet terminal — Cancel already flashed
+      musicJobsNotified.add(jobId);
+      musicJobs[name]=Object.assign({}, musicJobs[name]||{}, {jobId:jobId, status:'cancelled', progress:'Cancelled'});
+      renderHist();
+      refreshMusicUploadMeterFromJobs();
       return;
     }
   }
