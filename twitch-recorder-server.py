@@ -17,7 +17,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8765
-HELPER_VERSION = "6.29"
+HELPER_VERSION = "6.30"
 REC_DIR = Path.home() / "TwitchRecordings"
 HTML_NAME = "twitch-auto-recorder.html"
 HERE = Path(__file__).resolve().parent
@@ -584,7 +584,12 @@ def cleanup_orphan_temps(reason="startup"):
 
 
 def maybe_cleanup_orphan_temps_on_diskwarn(disk):
-    """One cleanup per diskWarn episode (in addition to startup)."""
+    """One cleanup per diskWarn episode (in addition to startup).
+
+    v6.30: also cancel waiting (queued) demucs jobs once per episode so a long
+    Auto Music backlog does not start as soon as one byte frees while still under
+    warn. Running demucs is never killed.
+    """
     global _ORPHAN_DISKWARN_DONE
     if not disk or not disk.get("diskWarn"):
         _ORPHAN_DISKWARN_DONE = False
@@ -592,6 +597,16 @@ def maybe_cleanup_orphan_temps_on_diskwarn(disk):
     if _ORPHAN_DISKWARN_DONE:
         return None
     _ORPHAN_DISKWARN_DONE = True
+    try:
+        payload, _status = cancel_music_only({"waiting": True})
+        cancelled = (payload or {}).get("cancelled") or []
+        if cancelled:
+            log(
+                f"diskWarn: cancelled {len(cancelled)} waiting Music only job(s) "
+                f"(running demucs kept)"
+            )
+    except Exception as e:
+        log(f"diskWarn: cancel waiting Music failed: {e}")
     return cleanup_orphan_temps(reason="diskWarn")
 
 
@@ -2241,6 +2256,22 @@ def start_music_only(raw_name, redo=False):
             "demucs": False,
         }, 400
 
+    # v6.30: refuse new Music only / Demucs when disk almost full (diskBlock).
+    # diskWarn alone still allows manual Music only / Convert; Auto Music is
+    # soft-skipped client-side.
+    disk_err = disk_block_error()
+    if disk_err:
+        free, _total = disk_usage_for_rec_dir()
+        mb = (free or 0) / (1024 * 1024)
+        return {
+            "ok": False,
+            "error": (
+                f"disk almost full ({mb:.0f} MB free) — "
+                f"free space before Music only / Demucs"
+            ),
+            "diskBlock": True,
+        }, 507
+
     if redo:
         delete_music_siblings(target.name)
 
@@ -3164,6 +3195,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "path": str(dest),
                     },
                     status=400,
+                )
+                return
+            # v6.30: refuse Demucs start on diskBlock (file already saved above)
+            disk_err = disk_block_error()
+            if disk_err:
+                free, _total = disk_usage_for_rec_dir()
+                mb = (free or 0) / (1024 * 1024)
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": (
+                            f"disk almost full ({mb:.0f} MB free) — "
+                            f"free space before Music only / Demucs"
+                        ),
+                        "diskBlock": True,
+                        "savedName": dest.name,
+                        "savedAs": dest.name,
+                        "path": str(dest),
+                    },
+                    status=507,
                 )
                 return
             payload, status = start_music_only(dest.name, redo=False)

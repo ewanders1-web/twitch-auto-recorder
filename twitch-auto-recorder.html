@@ -186,7 +186,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.29</span>
+    <span class="badge">v6.30</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -227,6 +227,8 @@
     </div>
     <!-- v6.24: sticky one-shot when Auto Music only is on but demucs is missing -->
     <div id="demucsMissingBanner" class="alert alert-err hidden" role="status"></div>
+    <!-- v6.30: sticky when Auto Music only paused due to low disk -->
+    <div id="diskLowMusicBanner" class="alert alert-err hidden" role="status"></div>
 
     <!-- live now banners -->
     <div id="liveNowBox"></div>
@@ -425,7 +427,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.29'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.30'; // keep in sync with badge + HELPER_VERSION
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, homeStreamer:'', returnHomeAfterSet:true };
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
@@ -440,6 +442,7 @@ let seamlessJobsNotified = new Set();
 let seamlessAutoStarted = new Set(); // joinKey already auto-queued this session (avoid spam)
 let diskFileIndex = {}; // name -> file entry from last GET /api/files (pair -music/-vocals)
 let helperDiskNotified = false; // one-shot low-disk notify per warn episode
+let helperDiskMusicPaused = false; // v6.30: Auto Music was paused this disk-low episode (recovery flash)
 let helperDropNotified = false; // one-shot notify when helper was up and then vanishes
 let helperActiveOnDrop = []; // usernames that were ACTIVE when helper last dropped
 // Per-username mid-stream resume UX: avoid spamming notify/flash every poll
@@ -681,8 +684,11 @@ function markHelperDown(wasOk){
   helper.diskFree=null; helper.diskTotal=null; helper.diskWarn=false; helper.diskBlock=false;
   // v6.24: hide demucs sticky while helper is down (not the same as demucs missing)
   helperDemucsMissingNotified=false;
+  helperDiskMusicPaused=false;
   const demucsBan=document.getElementById('demucsMissingBanner');
   if(demucsBan){ demucsBan.classList.add('hidden'); demucsBan.innerHTML=''; }
+  const diskMusicBan=document.getElementById('diskLowMusicBanner');
+  if(diskMusicBan){ diskMusicBan.classList.add('hidden'); diskMusicBan.innerHTML=''; }
   noticeHelperDropped(wasOk);
   updateHelperBar();
   updateDemucsUi();
@@ -973,6 +979,10 @@ async function queueSeamlessJoin(names, opts){
     return null;
   }
   const key=seamlessJoinKey(clean);
+  // v6.30: soft-skip auto seamless only on diskBlock (warn still allows; seamless is smaller than demucs)
+  if(opts.auto && helper.diskBlock){
+    return null;
+  }
   if(opts.auto){
     if(seamlessAutoStarted.has(key)) return null;
     seamlessAutoStarted.add(key);
@@ -1180,6 +1190,10 @@ async function queueAutoMusicOnly(name, opts){
   }
   // v6.24: soft-skip when demucs missing — noticeHelperDemucs owns the one-shot UX
   if(!helper.demucs){
+    return null;
+  }
+  // v6.30: soft-skip when disk low — do NOT add to autoMusicQueued (retry when space recovers)
+  if(helper.diskWarn || helper.diskBlock){
     return null;
   }
   autoMusicQueued.add(name);
@@ -1599,20 +1613,48 @@ function fmtDiskBytes(n){
 }
 function noticeHelperDisk(){
   // One notify/flash per warn episode; reset when free space recovers above warn.
+  // v6.30: sticky Auto Music pause banner + coherent one-shot that mentions Auto Music paused.
   if(!helper.ok) return;
-  if(!(helper.diskWarn || helper.diskBlock)){
+  const ban=document.getElementById('diskLowMusicBanner');
+  const low=helper.diskWarn || helper.diskBlock;
+  if(!low){
+    if(helperDiskMusicPaused){
+      helperDiskMusicPaused=false;
+      if(ban){ ban.classList.add('hidden'); ban.innerHTML=''; }
+      if(cfg.autoMusicOnly!==false){
+        flashOk('Disk space recovered — Auto Music only can run again.');
+      }
+    }else if(ban){
+      ban.classList.add('hidden'); ban.innerHTML='';
+    }
     helperDiskNotified=false;
     return;
+  }
+  // Sticky banner while Auto Music is on and disk is low
+  if(cfg.autoMusicOnly!==false){
+    helperDiskMusicPaused=true;
+    const free=fmtDiskBytes(helper.diskFree);
+    if(ban){
+      if(helper.diskBlock){
+        ban.innerHTML='⚠️ <strong>Auto Music only paused</strong> — disk almost full ('+free+' free under TwitchRecordings). Native recording still works when space allows, but the helper also refuses new recordings. Demucs auto-queue is skipped until you free space.';
+      }else{
+        ban.innerHTML='⚠️ <strong>Auto Music only paused</strong> — disk getting low ('+free+' free under TwitchRecordings). Native recordings still work; Auto Music only / Demucs waits until free space recovers. Manual Music only / Convert still allowed.';
+      }
+      ban.classList.remove('hidden');
+    }
+  }else if(ban){
+    ban.classList.add('hidden'); ban.innerHTML='';
   }
   if(helperDiskNotified) return;
   helperDiskNotified=true;
   const free=fmtDiskBytes(helper.diskFree);
+  const musicBit=(cfg.autoMusicOnly!==false)?' Auto Music only paused until free space recovers.':'';
   if(helper.diskBlock){
-    flashErr('Recordings disk almost full ('+free+' free) — helper will refuse new starts until you free space.');
-    fireNotify('tar-disk', 'Disk almost full', free+' free under TwitchRecordings — recordings may stop');
+    flashErr('Recordings disk almost full ('+free+' free) — helper will refuse new starts until you free space.'+musicBit);
+    fireNotify('tar-disk', 'Disk almost full', free+' free under TwitchRecordings — recordings may stop'+(cfg.autoMusicOnly!==false?'; Auto Music paused':''));
   }else{
-    flashErr('Recordings disk getting low ('+free+' free under TwitchRecordings).');
-    fireNotify('tar-disk', 'Disk space low', free+' free — free space before a long stream');
+    flashErr('Recordings disk getting low ('+free+' free under TwitchRecordings).'+musicBit);
+    fireNotify('tar-disk', 'Disk space low', free+' free — free space before a long stream'+(cfg.autoMusicOnly!==false?'; Auto Music paused':''));
   }
 }
 // v6.24: one-shot demucs-missing status when Auto Music only is on (soft-skip auto-queue until demucs true).
@@ -1749,12 +1791,13 @@ function updateHelperBar(){
     const diskBit=(helper.diskFree!=null)?(' · '+fmtDiskBytes(helper.diskFree)+' free'):'';
     const demucsBit=helper.demucs?'':' · demucs missing';
     const mqBit=musicQueueBit();
+    const musicPausedBit=(cfg.autoMusicOnly!==false && (helper.diskWarn||helper.diskBlock))?' · Auto Music paused':'';
     if(helper.diskBlock){
       dot.className='dot err';
-      txt.textContent='Disk almost full ('+fmtDiskBytes(helper.diskFree)+' free) — new recordings blocked'+(helper.recordingsDir?' — '+helper.recordingsDir:'');
+      txt.textContent='Disk almost full ('+fmtDiskBytes(helper.diskFree)+' free) — new recordings blocked'+musicPausedBit+(helper.recordingsDir?' — '+helper.recordingsDir:'');
     }else if(helper.diskWarn){
       dot.className='dot spin';
-      txt.textContent='Connected (low disk'+diskBit+demucsBit+mqBit+')'+(helper.recordingsDir?' — '+helper.recordingsDir:'');
+      txt.textContent='Connected (low disk'+diskBit+demucsBit+mqBit+musicPausedBit+')'+(helper.recordingsDir?' — '+helper.recordingsDir:'');
     }else if(!helper.demucs){
       // v6.24: surface demucs gap without looking fully "ok"
       dot.className='dot spin';
