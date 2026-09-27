@@ -1,4 +1,4 @@
-Twitch Auto-Recorder v6.30
+Twitch Auto-Recorder v6.31
 
 pip install streamlink
 python twitch-recorder-server.py
@@ -39,3 +39,17 @@ Helper OGG output + Music only OGG (v6.27): helper streamlink recordings always 
 Demucs one-at-a-time queue (v6.28): Music only / Auto Music / Convert upload no longer spawn parallel demucs processes. Mid-stream finished segments still queue immediately, but demucs runs one job at a time (others stay Waiting…). Helper bar shows Music N running, M waiting. alreadyRunning / redo:false / natives-never-deleted unchanged.
 Cancel waiting Music + orphan temp cleanup (v6.29): Waiting Music only / Auto Music / Convert jobs can be cancelled without killing the helper — per-row Cancel on History/Convert, plus Clear waiting Music on the helper bar when the demucs queue has waiters. POST /api/music-only/cancel accepts { "jobId" } or { "waiting": true }; running demucs is never SIGKILL'd (skipped). Cancelled jobs stay in /api/health musicJobs ~15 min like done/error. On helper startup (and once per diskWarn episode) orphan `music-only-*` temp dirs under ~/TwitchRecordings are removed, plus stale `seamless-*.txt` list files older than 1 hour; natives and -music/-vocals/-seamless exports are never touched. /api/health reports orphanTempsCleared / orphanTempsBytes for a one-shot UI flash.
 Disk-low pause for Auto Music / Demucs (v6.30): when free space under ~/TwitchRecordings is below diskWarn (<2 GiB) or diskBlock (<512 MiB), Auto Music only soft-skips finished segments (does not mark them queued, so a later stop can retry when space recovers) and shows a sticky banner + one-shot notify that Auto Music is paused — native Auto-Rec still works. Auto seamless join soft-skips on diskBlock only (manual Join seamless still allowed on warn). Helper refuses new POST /api/music-only and Demucs start after Convert upload with HTTP 507 when diskBlock; manual Music only / Convert still allowed on warn-only. On each diskWarn episode the helper also cancels waiting (queued) demucs jobs (running demucs never killed) alongside orphan music-only-* temp cleanup so a backlog cannot start while space is still low. Helper bar appends "Auto Music paused" when applicable.
+
+Unmute add-on — auto-unmute Twitch on Arm (v6.31)
+-------------------------------------------------
+Twitch often autoplay-mutes the player, which makes tab-capture audio silent. The recorder page cannot touch other tabs, so v6.31 ships a small Chrome (MV3) extension, "Twitch Auto-Recorder Unmute" (repo folder extension/, installed/packaged as twitch-unmute-extension).
+When you click Arm (before and after the tab picker), and when the silence watchdog fires for an armed streamer (once per silence episode), the page asks the add-on to unmute that streamer. The add-on finds open tabs at twitch.tv/<username> (www./m., popout twitch.tv/popout/<username>/player, or player.twitch.tv/?channel=<username>; case-insensitive, query/hash ignored), clears Chrome's tab-level mute, and on the page: clicks Twitch's mute button when it shows "Unmute", sets the <video> unmuted, and raises volume 0 → 50%. It retries for ~10s while the player loads. You'll see "🔊 Unmuted Twitch for <name>". The recorder's own hidden keepalive <video> stays muted on purpose.
+
+Install (Chrome / Edge / Brave):
+  1) Get the folder: Mac installs put it at ~/Library/Application Support/TwitchRecorder/twitch-unmute-extension (install.sh copies it there), or unzip twitch-unmute-extension.zip, or use extension/ from the repo.
+  2) Open chrome://extensions
+  3) Turn on Developer mode (top-right toggle)
+  4) Click "Load unpacked" and pick the twitch-unmute-extension folder
+  5) Reload the recorder page (GitHub Pages or http://127.0.0.1:8765/). If you use the file:// HTML, also enable "Allow access to file URLs" on the add-on's Details page.
+
+Limitations: only tabs whose URL is the streamer's channel page (twitch.tv/<username>) or the popout/player URLs above are matched — raids/host redirects to another channel or /videos pages are not. Chrome may block unmuting a muted-autoplay video without a click (autoplay policy); then the add-on keeps it playing muted and the UI asks you to click the Twitch tab and unmute manually. If the add-on isn't detected, Arm shows a one-time dismissable hint. Manual unmute always still works.

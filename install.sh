@@ -56,6 +56,13 @@ for f in "${FILES[@]}"; do
   mv -f "${tmp}/${f}" "${INSTALL_DIR}/${f}"
 done
 
+# v6.31: Unmute add-on (Chrome extension) → ${INSTALL_DIR}/twitch-unmute-extension
+EXT_FILES=(manifest.json background.js recorder-content.js twitch-content.js icon16.png icon48.png icon128.png)
+mkdir -p "${INSTALL_DIR}/twitch-unmute-extension"
+for f in "${EXT_FILES[@]}"; do
+  curl -fsSL "${RAW}/extension/${f}" -o "${INSTALL_DIR}/twitch-unmute-extension/${f}" || echo "  (warn) could not download extension/${f}"
+done
+
 # Keep index.html in sync for local helper convenience (optional)
 cp -f "${INSTALL_DIR}/twitch-auto-recorder.html" "${INSTALL_DIR}/index.html" 2>/dev/null || true
 
@@ -76,6 +83,10 @@ echo "     Or:  \"$0\" --start"
 echo "  3) Open the UI (any machine):"
 echo "       https://ewanders1-web.github.io/twitch-auto-recorder/"
 echo "     Or locally while helper runs: http://127.0.0.1:8765/"
+echo
+echo "  4) Optional Unmute add-on (auto-unmutes Twitch when you click Arm):"
+echo "       Chrome → chrome://extensions → Developer mode → Load unpacked →"
+echo "       pick \"${INSTALL_DIR}/twitch-unmute-extension\""
 echo
 echo "Recordings save to ~/TwitchRecordings on this machine."
 echo "Helper listens on 127.0.0.1:8765 only (Pages → localhost is OK via CORS)."

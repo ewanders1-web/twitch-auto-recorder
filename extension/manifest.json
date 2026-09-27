@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Twitch Auto-Recorder Unmute",
+  "version": "6.31",
+  "description": "When you click Arm in Twitch Auto-Recorder, unmutes that streamer's Twitch tab/player so tab-capture audio isn't silent.",
+  "permissions": ["tabs", "scripting"],
+  "host_permissions": [
+    "*://*.twitch.tv/*",
+    "*://twitch.tv/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://ewanders1-web.github.io/twitch-auto-recorder/*",
+        "file:///*twitch-auto-recorder*.html",
+        "http://127.0.0.1/*",
+        "http://localhost/*"
+      ],
+      "js": ["recorder-content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://twitch.tv/*",
+        "*://*.twitch.tv/*"
+      ],
+      "js": ["twitch-content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "action": {
+    "default_title": "Twitch Auto-Recorder Unmute",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png"
+    }
+  }
+}

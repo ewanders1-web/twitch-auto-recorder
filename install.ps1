@@ -35,6 +35,12 @@ try {
     Copy-Item -Force (Join-Path $tmp $f) (Join-Path $InstallDir $f)
   }
   Copy-Item -Force (Join-Path $InstallDir "twitch-auto-recorder.html") (Join-Path $InstallDir "index.html")
+  # v6.31: Unmute add-on (Chrome extension)
+  $ExtDir = Join-Path $InstallDir "twitch-unmute-extension"
+  New-Item -ItemType Directory -Force -Path $ExtDir | Out-Null
+  foreach ($f in @("manifest.json","background.js","recorder-content.js","twitch-content.js","icon16.png","icon48.png","icon128.png")) {
+    try { Invoke-WebRequest -Uri "$Raw/extension/$f" -OutFile (Join-Path $ExtDir $f) -UseBasicParsing } catch { Write-Host "  (warn) could not download extension/$f" }
+  }
 } finally {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
@@ -54,6 +60,8 @@ Write-Host "       cd `"$InstallDir`""
 Write-Host "       python twitch-recorder-server.py"
 Write-Host "  3) Open the UI: https://ewanders1-web.github.io/twitch-auto-recorder/"
 Write-Host "     Or locally: http://127.0.0.1:8765/"
+Write-Host ""
+Write-Host "  4) Optional Unmute add-on: chrome://extensions -> Developer mode -> Load unpacked -> $InstallDir\twitch-unmute-extension"
 Write-Host ""
 Write-Host "Recordings: %USERPROFILE%\TwitchRecordings  |  Helper: 127.0.0.1:8765 only"
 Write-Host ""

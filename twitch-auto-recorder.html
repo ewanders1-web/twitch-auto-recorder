@@ -186,7 +186,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.30</span>
+    <span class="badge">v6.31</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -292,8 +292,15 @@
     </div>
     <div id="errBox" class="alert alert-err hidden"></div>
     <div id="okBox"  class="alert alert-ok  hidden"></div>
+    <!-- v6.31: one-time hint when the Unmute add-on (Chrome extension) is not installed -->
+    <div id="unmuteExtHint" class="alert alert-info hidden" role="status" style="margin-top:.5rem">
+      🔊 Tip: install the free <strong>Twitch Auto-Recorder Unmute</strong> Chrome add-on so <strong>Arm</strong> automatically unmutes that streamer's Twitch tab (Twitch often autoplay-mutes → silent capture).
+      Chrome → <code>chrome://extensions</code> → <strong>Developer mode</strong> → <strong>Load unpacked</strong> → pick the <code>twitch-unmute-extension</code> folder.
+      See <a href="https://github.com/ewanders1-web/twitch-auto-recorder/blob/main/README-recorder.txt" target="_blank" rel="noopener" style="color:#bf94ff">README</a> (“Unmute add-on”). Until then, unmute the Twitch player manually.
+      <button class="btn btn-gray btn-sm" style="margin-left:.5rem" onclick="dismissUnmuteExtHint()">Dismiss</button>
+    </div>
     <div class="alert alert-info" style="margin-top:.75rem">
-      💡 Auto-Rec is <strong>ON by default</strong>. If the <strong>local helper</strong> is running with streamlink, live Auto-Rec streamers record automatically — that path actually connects to the stream (no tab share). Otherwise arm a Twitch tab per streamer (click <strong>Arm</strong>, pick that <strong>TAB</strong> not a window/screen, check <strong>Share tab audio</strong>). Chrome must keep the shared tab's video surface; we hide a tiny muted copy so capture stays alive. Twitch often autoplay-mutes — unmute the player in the shared tab. Don't share this recorder page. Helper/streamlink is preferred. Tab-capture chunks are crash-safe in IndexedDB. Re-arm after reload. Arm must still be a real click.
+      💡 Auto-Rec is <strong>ON by default</strong>. If the <strong>local helper</strong> is running with streamlink, live Auto-Rec streamers record automatically — that path actually connects to the stream (no tab share). Otherwise arm a Twitch tab per streamer (click <strong>Arm</strong>, pick that <strong>TAB</strong> not a window/screen, check <strong>Share tab audio</strong>). Chrome must keep the shared tab's video surface; we hide a tiny muted copy so capture stays alive. Twitch often autoplay-mutes — unmute the player in the shared tab (or install the <strong>Unmute add-on</strong>, which does it automatically on Arm). Don't share this recorder page. Helper/streamlink is preferred. Tab-capture chunks are crash-safe in IndexedDB. Re-arm after reload. Arm must still be a real click.
     </div>
   </div>
 
@@ -427,7 +434,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.30'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.31'; // keep in sync with badge + HELPER_VERSION
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, homeStreamer:'', returnHomeAfterSet:true };
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
@@ -2832,12 +2839,19 @@ function startCaptureLevelWatch(s){
     const silent=peak<=2;
     if(silent){
       s.silenceMs=(s.silenceMs||0)+120;
+      // v6.31: armed + silent → ask the Unmute add-on to unmute that Twitch tab (once per silence episode).
+      if(s.silenceMs>=3000 && s.captureArmed && !s.silenceUnmuteTried){
+        s.silenceUnmuteTried=true;
+        tarRequestUnmute(s.username, 'silence');
+      }
       if(s.silenceMs>=8000 && !s.silenceWarned && s.rec){
         s.silenceWarned=true;
-        flashErr('No streamer audio from '+s.username+' (near-silence for ~8s). Unmute the Twitch player in that tab, pick a TAB not a window/screen, check Share tab audio, and don\'t share the recorder page.');
+        if(!s.silenceUnmuteTried){ s.silenceUnmuteTried=true; tarRequestUnmute(s.username, 'silence'); }
+        flashErr('No streamer audio from '+s.username+' (near-silence for ~8s). Unmute the Twitch player in that tab, pick a TAB not a window/screen, check Share tab audio, and don\'t share the recorder page.'+(tarExt.present?' (Unmute add-on was asked to unmute twitch.tv/'+s.username+'.)':''));
       }
     }else{
       s.silenceMs=0;
+      s.silenceUnmuteTried=false;
     }
   },120);
 }
@@ -2890,6 +2904,7 @@ function teardownCapture(s){
   s.captureLevel=0;
   s.silenceMs=0;
   s.silenceWarned=false;
+  s.silenceUnmuteTried=false;
 }
 
 function handleCaptureEnded(s){
@@ -2921,6 +2936,9 @@ async function armCapture(username){
       }
       try{ s.captureAudioCtx.resume(); }catch(e){}
     }
+    // v6.31: ask the Unmute add-on to unmute twitch.tv/<username> BEFORE the picker
+    // (fire-and-forget — must not await, or getDisplayMedia loses user activation).
+    tarRequestUnmute(s.username, 'arm-pre');
     const stream=await requestDisplayStream();
     const at=stream.getAudioTracks();
     if(!at.length){
@@ -2942,6 +2960,9 @@ async function armCapture(username){
     renderStreamers();
     updateStatusUI();
     flashOk('🎧 Capture armed for '+s.username+'. Auto-record will fire for them independently.');
+    // v6.31: unmute again after the share succeeds (player may have loaded late / re-muted).
+    tarRequestUnmute(s.username, 'arm-post');
+    maybeShowUnmuteExtHint();
     // Catch the case where this streamer is ALREADY live at the moment we arm.
     if(s.autoRec&&s.isLive&&!isRecording(s)&&!helperReady()){
       flashOk(`🎙️ ${s.username} is already live — starting recording.`);
@@ -4046,6 +4067,72 @@ function setStatus(main,sub,isRec){
 }
 function setupMsg(type,msg){const el=document.getElementById('setupMsg');if(!el)return;el.className='alert '+(type==='error'?'alert-err':type==='ok'?'alert-ok':'alert-info');el.innerHTML=msg;el.classList.remove('hidden');}
 function sMsg(type,msg){const el=document.getElementById('streamerMsg');if(!el)return;el.className='alert '+(type==='error'?'alert-err':type==='ok'?'alert-ok':'alert-info');el.innerHTML=msg;el.classList.remove('hidden');setTimeout(()=>el.classList.add('hidden'),5000);}
+// ── v6.31: Twitch Auto-Recorder Unmute add-on bridge ──
+// The page can't touch other tabs; the Chrome extension (extension/ in the repo,
+// installed as "twitch-unmute-extension") relays tar-unmute to its background worker,
+// which clears Chrome tab mute and unmutes the Twitch player for twitch.tv/<username>.
+const tarExt={present:false, version:null, reqSeq:0, pending:{}, lastFlash:{}};
+const TAR_HINT_KEY='tar-unmute-hint-dismissed'; // separate from LS_KEY on purpose
+let tarHintShownThisSession=false;
+window.addEventListener('message', function(ev){
+  if(ev.source!==window) return;
+  const d=ev.data;
+  if(!d || typeof d!=='object' || d.source!=='tar-ext') return;
+  if(d.type==='tar-ext-hello'){
+    tarExt.present=true; tarExt.version=d.version||null;
+    const h=document.getElementById('unmuteExtHint'); if(h) h.classList.add('hidden');
+    return;
+  }
+  if(d.type==='tar-unmute-result'){
+    tarExt.present=true;
+    const p=d.reqId && tarExt.pending[d.reqId];
+    if(p){ delete tarExt.pending[d.reqId]; tarHandleUnmuteResult(d, p.reason); }
+  }
+});
+function tarPingExt(){ try{ window.postMessage({source:'tar', type:'tar-ext-ping'}, '*'); }catch(e){} }
+function tarRequestUnmute(username, reason){
+  try{
+    const reqId='u'+(++tarExt.reqSeq)+'-'+Date.now();
+    tarExt.pending[reqId]={username:username, reason:reason||'', t:Date.now()};
+    setTimeout(function(){ delete tarExt.pending[reqId]; }, 15000);
+    window.postMessage({source:'tar', type:'tar-unmute', username:String(username||'').toLowerCase(), reqId:reqId, reason:reason||''}, '*');
+  }catch(e){ console.warn('tarRequestUnmute failed', e); }
+}
+function tarHandleUnmuteResult(d, reason){
+  console.log('[unmute add-on]', reason, d);
+  const u=d.username||'';
+  if(d.ok && (d.changed || reason==='silence')){
+    // Avoid double flashes from the pre+post Arm pair.
+    const now=Date.now();
+    if(tarExt.lastFlash[u] && now-tarExt.lastFlash[u]<4000) return;
+    tarExt.lastFlash[u]=now;
+    flashOk('🔊 Unmuted Twitch for '+u);
+    return;
+  }
+  if(d.autoplayBlocked && reason!=='arm-pre'){
+    flashErr('Chrome blocked auto-unmute for '+u+' (autoplay policy). Click once in the twitch.tv/'+u+' tab and unmute the player manually.');
+    return;
+  }
+  if(!d.tabsFound && reason!=='arm-pre'){
+    console.warn('[unmute add-on] no open twitch.tv/'+u+' tab found — unmute manually.');
+  }
+}
+function maybeShowUnmuteExtHint(){
+  if(tarExt.present || tarHintShownThisSession) return;
+  try{ if(localStorage.getItem(TAR_HINT_KEY)==='1') return; }catch(e){}
+  tarPingExt();
+  setTimeout(function(){
+    if(tarExt.present || tarHintShownThisSession) return;
+    tarHintShownThisSession=true;
+    const h=document.getElementById('unmuteExtHint'); if(h) h.classList.remove('hidden');
+  }, 1500);
+}
+function dismissUnmuteExtHint(){
+  try{ localStorage.setItem(TAR_HINT_KEY,'1'); }catch(e){}
+  const h=document.getElementById('unmuteExtHint'); if(h) h.classList.add('hidden');
+}
+setTimeout(tarPingExt, 300);
+
 function flashErr(msg){const el=document.getElementById('errBox');if(!el)return;el.innerHTML='❌ '+msg;el.classList.remove('hidden');setTimeout(()=>el.classList.add('hidden'),9000);}
 function flashOk(msg){const el=document.getElementById('okBox');if(!el)return;el.innerHTML=msg;el.classList.remove('hidden');setTimeout(()=>el.classList.add('hidden'),7000);}
 function fmt(s){return[Math.floor(s/3600),Math.floor(s%3600/60),s%60].map(v=>String(v).padStart(2,'0')).join(':');}
