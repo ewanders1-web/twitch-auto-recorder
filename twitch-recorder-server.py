@@ -17,7 +17,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8765
-HELPER_VERSION = "6.31"
+HELPER_VERSION = "6.32"
 REC_DIR = Path.home() / "TwitchRecordings"
 HTML_NAME = "twitch-auto-recorder.html"
 HERE = Path(__file__).resolve().parent
@@ -112,6 +112,9 @@ ORPHAN_TEMPS_LAST = {
     "reason": None,
 }
 _ORPHAN_DISKWARN_DONE = False
+
+# v6.32: schedule at most one idle auto-restart per process after apply_update
+_auto_restart_scheduled = False
 
 # Seamless join (ffmpeg concat) async jobs — same shape as music for UI reuse.
 SEAMLESS_JOBS = {}
@@ -1392,11 +1395,8 @@ def music_demucs_queue_info():
     }
 
 
-def local_helper_version():
-    """Prefer HELPER_VERSION; fall back to VERSION file next to the script."""
-    ver = str(HELPER_VERSION or "").strip()
-    if ver:
-        return ver
+def disk_file_version():
+    """Read INSTALL_DIR / VERSION (first line strip). Empty if missing/unreadable."""
     try:
         p = INSTALL_DIR / "VERSION"
         if p.is_file():
@@ -1404,6 +1404,118 @@ def local_helper_version():
     except OSError:
         pass
     return ""
+
+
+def local_helper_version():
+    """Prefer in-process HELPER_VERSION (running process); fall back to disk VERSION."""
+    ver = str(HELPER_VERSION or "").strip()
+    if ver:
+        return ver
+    return disk_file_version()
+
+
+def pending_restart_needed():
+    """True when disk VERSION is non-empty and differs from running HELPER_VERSION.
+
+    Signals that apply_update wrote new files while this old process is still alive.
+    """
+    disk = disk_file_version()
+    if not disk:
+        return False
+    running = str(HELPER_VERSION or "").strip()
+    return bool(running) and disk != running
+
+
+def music_jobs_busy():
+    """True if any demucs Music only job is queued or running."""
+    info = music_demucs_queue_info()
+    return (int(info.get("running") or 0) > 0) or (int(info.get("waiting") or 0) > 0)
+
+
+def schedule_graceful_restart(reason="manual"):
+    """Respond to the client first; after ~0.8s replace this process via os.execv."""
+
+    def _restart():
+        try:
+            time.sleep(0.8)
+            script = Path(__file__).resolve()
+            os.chdir(str(INSTALL_DIR))
+            argv = [sys.executable, str(script)] + list(sys.argv[1:])
+            log(f"restarting helper ({reason}): execv {argv!r}")
+            os.execv(sys.executable, argv)
+        except Exception as e:
+            log(f"restart exec failed ({reason}): {e}")
+            os._exit(1)
+
+    t = threading.Thread(target=_restart, daemon=True, name="helper-restart")
+    t.start()
+    log(f"scheduled graceful restart in ~0.8s ({reason})")
+
+
+def restart_helper(force=False):
+    """POST /api/restart. Refuse when ACTIVE or demucs busy unless force:true."""
+    with LOCK:
+        reap_locked()
+        active = list(ACTIVE.keys())
+    disk_ver = disk_file_version()
+    if active and not force:
+        return (
+            {
+                "ok": False,
+                "error": "active recordings",
+                "active": active,
+                "pendingRestart": True,
+                "version": HELPER_VERSION,
+                "diskVersion": disk_ver,
+            },
+            409,
+        )
+    if music_jobs_busy() and not force:
+        return (
+            {
+                "ok": False,
+                "error": "music jobs running",
+                "musicDemucsQueue": music_demucs_queue_info(),
+                "pendingRestart": True,
+                "version": HELPER_VERSION,
+                "diskVersion": disk_ver,
+            },
+            409,
+        )
+    reason = "force" if force else "api"
+    schedule_graceful_restart(reason=reason)
+    return (
+        {
+            "ok": True,
+            "restarting": True,
+            "version": HELPER_VERSION,
+            "diskVersion": disk_ver,
+            "note": "Helper restarting shortly — expect a brief disconnect, then reconnect.",
+        },
+        200,
+    )
+
+
+def maybe_auto_restart_idle():
+    """If disk VERSION != running and idle, schedule one graceful restart (health path)."""
+    global _auto_restart_scheduled
+    if _auto_restart_scheduled:
+        return
+    if not pending_restart_needed():
+        return
+    with LOCK:
+        reap_locked()
+        active = list(ACTIVE.keys())
+    if active:
+        return
+    if music_jobs_busy():
+        return
+    _auto_restart_scheduled = True
+    log(
+        "auto-restart scheduled (idle-after-update): "
+        f"disk v{disk_file_version()} != running v{HELPER_VERSION}"
+    )
+    schedule_graceful_restart(reason="idle-after-update")
 
 
 def _parse_version_tuple(s):
@@ -1555,13 +1667,15 @@ def apply_update():
         active = list(ACTIVE.keys())
 
     note = (
-        "Update files written. Restart the helper (LaunchAgent / Desktop launcher / "
-        "stop+start twitch-recorder-server.py), then hard-refresh the recorder page."
+        "Update files written. Helper auto-restarts when no recordings / Music jobs "
+        "are active, or use Restart helper / POST /api/restart. Then hard-refresh "
+        "the recorder page."
     )
     if active:
         note = (
             f"Update written while recording {', '.join(active)} — process left running. "
-            "Restart the helper after recordings finish, then hard-refresh the page."
+            "Helper will auto-restart when recordings finish (and no Music jobs), "
+            "or use Restart helper / POST /api/restart. Then hard-refresh the page."
         )
 
     return {
@@ -1592,9 +1706,15 @@ def health_payload():
     maybe_cleanup_orphan_temps_on_diskwarn(disk)
     prune_recent_sessions()
     orphan = ORPHAN_TEMPS_LAST or {}
+    # v6.32: if update landed on disk and we are idle, schedule one auto-restart
+    maybe_auto_restart_idle()
+    disk_ver = disk_file_version()
+    pending = pending_restart_needed()
     return {
         "ok": True,
         "version": HELPER_VERSION,
+        "diskVersion": disk_ver,
+        "pendingRestart": pending,
         "streamlink": bool(sl),
         "ffmpeg": bool(which_ffmpeg()),
         "seamless": seamless_available(),
@@ -3112,6 +3232,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/update":
             result = apply_update()
             self.send_json(result, status=200 if result.get("ok") else 400)
+            return
+        if path == "/api/restart":
+            body = self.read_json()
+            force = bool((body or {}).get("force")) if isinstance(body, dict) else False
+            result, status = restart_helper(force=force)
+            self.send_json(result, status=status)
             return
         if path == "/api/record":
             body = self.read_json()

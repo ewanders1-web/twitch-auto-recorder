@@ -186,7 +186,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.31</span>
+    <span class="badge">v6.32</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -208,6 +208,7 @@
       <div id="helperDot" class="dot"></div>
       <span id="helperTxt">Not running — using tab capture</span>
       <button class="btn btn-gray btn-sm hidden" style="margin-left:auto" id="clearWaitingMusicBtn" onclick="clearWaitingMusic()" title="Cancel all waiting Music only jobs (the one currently running keeps going)">Clear waiting Music</button>
+      <button class="btn btn-purple btn-sm hidden" id="restartHelperBtn" onclick="restartHelperNow()" title="Restart helper to load the update already on disk (refuses while recording / Music jobs)">Restart helper</button>
       <button class="btn btn-gray btn-sm" id="checkUpdateBtn" onclick="checkForUpdates()" title="Compare local helper version to GitHub">Check for updates</button>
     </div>
     <div class="alert alert-info" id="anyMachineBanner" style="margin-top:0;margin-bottom:1rem;font-size:.8rem;">
@@ -229,6 +230,8 @@
     <div id="demucsMissingBanner" class="alert alert-err hidden" role="status"></div>
     <!-- v6.30: sticky when Auto Music only paused due to low disk -->
     <div id="diskLowMusicBanner" class="alert alert-err hidden" role="status"></div>
+    <!-- v6.32: sticky when update on disk but helper process still running old version -->
+    <div id="pendingRestartBanner" class="alert alert-err hidden" role="status"></div>
 
     <!-- live now banners -->
     <div id="liveNowBox"></div>
@@ -434,9 +437,9 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.31'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.32'; // keep in sync with badge + HELPER_VERSION
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, homeStreamer:'', returnHomeAfterSet:true };
-let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
+let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
 let musicJobsNotified = new Set(); // jobIds already fireNotify'd for done/error (health spam safe)
 let orphanTempsFlashedKey = ''; // v6.29: one soft flash per orphan cleanup summary
@@ -452,6 +455,8 @@ let helperDiskNotified = false; // one-shot low-disk notify per warn episode
 let helperDiskMusicPaused = false; // v6.30: Auto Music was paused this disk-low episode (recovery flash)
 let helperDropNotified = false; // one-shot notify when helper was up and then vanishes
 let helperActiveOnDrop = []; // usernames that were ACTIVE when helper last dropped
+let helperPriorVersion = ''; // v6.32: remembered version across disconnect for upgrade flash
+let helperRestartFlashKey = ''; // v6.32: dedupe "Helper restarted — now vX"
 // Per-username mid-stream resume UX: avoid spamming notify/flash every poll
 // { lastMidErr, wasRetrying, notifiedAt }
 let helperMidRemember = {};
@@ -687,7 +692,8 @@ function markHelperDown(wasOk){
   if(wasOk && !helperDropNotified){
     helperActiveOnDrop=(helper.active||[]).map(function(a){ return a && a.username; }).filter(Boolean);
   }
-  helper.ok=false; helper.streamlink=false; helper.ffmpeg=false; helper.seamless=false; helper.demucs=false; helper.version=''; helper.demucsHint=''; helper.installHint=''; helper.updateRepo=''; helper.active=[]; helper.lastErrors={}; helper.musicDemucsQueue=null; helper.orphanTempsCleared=0; helper.orphanTempsBytes=0;
+  if(helper.version) helperPriorVersion=helper.version;
+  helper.ok=false; helper.streamlink=false; helper.ffmpeg=false; helper.seamless=false; helper.demucs=false; helper.version=''; helper.diskVersion=''; helper.pendingRestart=false; helper.demucsHint=''; helper.installHint=''; helper.updateRepo=''; helper.active=[]; helper.lastErrors={}; helper.musicDemucsQueue=null; helper.orphanTempsCleared=0; helper.orphanTempsBytes=0;
   helper.diskFree=null; helper.diskTotal=null; helper.diskWarn=false; helper.diskBlock=false;
   // v6.24: hide demucs sticky while helper is down (not the same as demucs missing)
   helperDemucsMissingNotified=false;
@@ -696,6 +702,8 @@ function markHelperDown(wasOk){
   if(demucsBan){ demucsBan.classList.add('hidden'); demucsBan.innerHTML=''; }
   const diskMusicBan=document.getElementById('diskLowMusicBanner');
   if(diskMusicBan){ diskMusicBan.classList.add('hidden'); diskMusicBan.innerHTML=''; }
+  const pendingBan=document.getElementById('pendingRestartBanner');
+  if(pendingBan){ pendingBan.classList.add('hidden'); pendingBan.innerHTML=''; }
   noticeHelperDropped(wasOk);
   updateHelperBar();
   updateDemucsUi();
@@ -1257,6 +1265,8 @@ function pingHelperAndStatus(){
       helper.seamless=!!(d.seamless!=null?d.seamless:d.ffmpeg);
       helper.demucs=!!d.demucs;
       helper.version=d.version?String(d.version):'';
+      helper.diskVersion=(d.diskVersion!=null)?String(d.diskVersion):'';
+      helper.pendingRestart=!!d.pendingRestart;
       helper.demucsHint=d.demucsHint||(!d.demucs?'pip install demucs (first run downloads models)':'');
       helper.musicDemucsQueue=(d.musicDemucsQueue && typeof d.musicDemucsQueue==='object')?d.musicDemucsQueue:null;
       helper.recordingsDir=d.recordingsDir||'';
@@ -1272,6 +1282,7 @@ function pingHelperAndStatus(){
       noticeHelperDisk();
       noticeHelperDemucs();
       noticeOrphanTempsCleared(wasOk);
+      updatePendingRestartBanner();
       updateDemucsUi();
       if(Array.isArray(d.musicJobs)) applyMusicJobsFromHealth(d.musicJobs);
       if(Array.isArray(d.seamlessJobs)) applySeamlessJobsFromHealth(d.seamlessJobs);
@@ -1290,6 +1301,7 @@ function pingHelperAndStatus(){
   }catch(e){ helper.active=[]; }
   noticeHelperMidStream();
   updateHelperBar();
+  updatePendingRestartBanner();
   updateStatusUI();
   renderStreamers();
   // Fresh connect / reconnect: merge disk files and immediately kick live Auto-Rec
@@ -1297,6 +1309,8 @@ function pingHelperAndStatus(){
     const hadDrop=helperDropNotified;
     helperDropNotified=false;
     helperActiveOnDrop=[];
+    noticeHelperVersionBump();
+    if(helper.version) helperPriorVersion=helper.version;
     fetchHelperFiles().catch(function(){});
     if(helper.streamlink){
       kickLiveAutoRecAfterHelperReconnect().catch(function(e){ console.warn('reconnect kick', e); });
@@ -1312,6 +1326,9 @@ function pingHelperAndStatus(){
       flashOk('Helper server is back, but streamlink is still missing.');
       fireNotify('tar-helper', 'Helper reconnected', 'Server up — install streamlink to auto-record');
     }
+  }else if(helper.ok && helper.version){
+    // Stay in sync while connected so the next disconnect remembers this version
+    helperPriorVersion=helper.version;
   }
   };
   const p=helperPingChain.then(run, run);
@@ -1790,10 +1807,86 @@ function musicQueueBit(){
   if(wait>0) return ' · Music '+run+' running, '+wait+' waiting';
   return ' · Music '+run+' running';
 }
+function _parseUiVersionTuple(s){
+  const parts=String(s||'').match(/\d+/g);
+  if(!parts||!parts.length) return [0];
+  return parts.map(function(x){ return parseInt(x,10)||0; });
+}
+function _versionIsNewer(a, b){
+  // true when a > b numerically (6.32 > 6.31)
+  const aa=_parseUiVersionTuple(a), bb=_parseUiVersionTuple(b);
+  const n=Math.max(aa.length, bb.length);
+  for(let i=0;i<n;i++){
+    const x=(i<aa.length)?aa[i]:0;
+    const y=(i<bb.length)?bb[i]:0;
+    if(x>y) return true;
+    if(x<y) return false;
+  }
+  return false;
+}
+function noticeHelperVersionBump(){
+  // v6.32: one soft flash when helper reconnects on a newer version than we remembered
+  if(!helper.ok || !helper.version || !helperPriorVersion) return;
+  if(!_versionIsNewer(helper.version, helperPriorVersion)) return;
+  const key=helperPriorVersion+'->'+helper.version;
+  if(helperRestartFlashKey===key) return;
+  helperRestartFlashKey=key;
+  flashOk('Helper restarted — now v'+helper.version);
+  helperPriorVersion=helper.version;
+}
+function updatePendingRestartBanner(){
+  // v6.32: sticky when update on disk but running process still old
+  const ban=document.getElementById('pendingRestartBanner');
+  if(!ban) return;
+  if(!(helper.ok && helper.pendingRestart)){
+    ban.classList.add('hidden');
+    ban.innerHTML='';
+    return;
+  }
+  const disk=helper.diskVersion||'?';
+  const ver=helper.version||'?';
+  const busyActive=(helper.active||[]).length>0;
+  const q=helper.musicDemucsQueue;
+  const busyMusic=!!(q && ((Number(q.running)||0)>0 || (Number(q.waiting)||0)>0));
+  let waitBit=' Auto-restarts when no recordings / Music jobs are active.';
+  if(busyActive || busyMusic){
+    waitBit=' Waiting until idle (active recordings or Music jobs). You can still click Restart — the helper will refuse with a clear reason if still busy.';
+  }
+  ban.innerHTML='⚠️ <strong>Update on disk (v'+disk+')</strong> — helper still running v'+ver+'.'+waitBit
+    +' <button type="button" class="btn btn-purple btn-sm" style="margin-left:.45rem" onclick="restartHelperNow()">Restart helper now</button>';
+  ban.classList.remove('hidden');
+}
+async function restartHelperNow(){
+  // v6.32: POST /api/restart without force (server enforces ACTIVE / Music busy)
+  if(!helper.ok){
+    flashErr('Helper not running — nothing to restart.');
+    return;
+  }
+  try{
+    const d=await helperFetch('/api/restart', {force:false}, 5000);
+    if(!d || !d.ok){
+      const err=(d && d.error) || 'restart refused';
+      if(err==='active recordings'){
+        const who=(Array.isArray(d.active) && d.active.length)?d.active.join(', '):'active';
+        flashErr('Cannot restart yet — active recordings: '+who+'. Will auto-restart when idle.');
+      }else if(err==='music jobs running'){
+        flashErr('Cannot restart yet — Music only / Demucs jobs still running or waiting. Will auto-restart when idle.');
+      }else{
+        flashErr('Restart refused: '+err);
+      }
+      try{ await pingHelperAndStatus(); }catch(e){}
+      return;
+    }
+    flashOk('Helper restart starting — expect a brief disconnect, then reconnect as v'+(helper.diskVersion||d.diskVersion||'?')+'.');
+  }catch(e){
+    flashErr('Restart failed: '+(e.message||e));
+  }
+}
 function updateHelperBar(){
   const dot=document.getElementById('helperDot');
   const txt=document.getElementById('helperTxt');
   if(!dot||!txt) return;
+  const pendingBit=helper.pendingRestart?(' · restart pending (disk v'+(helper.diskVersion||'?')+')'):'';
   if(helper.ok && helper.streamlink){
     const diskBit=(helper.diskFree!=null)?(' · '+fmtDiskBytes(helper.diskFree)+' free'):'';
     const demucsBit=helper.demucs?'':' · demucs missing';
@@ -1801,22 +1894,24 @@ function updateHelperBar(){
     const musicPausedBit=(cfg.autoMusicOnly!==false && (helper.diskWarn||helper.diskBlock))?' · Auto Music paused':'';
     if(helper.diskBlock){
       dot.className='dot err';
-      txt.textContent='Disk almost full ('+fmtDiskBytes(helper.diskFree)+' free) — new recordings blocked'+musicPausedBit+(helper.recordingsDir?' — '+helper.recordingsDir:'');
+      txt.textContent='Disk almost full ('+fmtDiskBytes(helper.diskFree)+' free) — new recordings blocked'+musicPausedBit+pendingBit+(helper.recordingsDir?' — '+helper.recordingsDir:'');
     }else if(helper.diskWarn){
       dot.className='dot spin';
-      txt.textContent='Connected (low disk'+diskBit+demucsBit+mqBit+musicPausedBit+')'+(helper.recordingsDir?' — '+helper.recordingsDir:'');
+      txt.textContent='Connected (low disk'+diskBit+demucsBit+mqBit+musicPausedBit+pendingBit+')'+(helper.recordingsDir?' — '+helper.recordingsDir:'');
     }else if(!helper.demucs){
       // v6.24: surface demucs gap without looking fully "ok"
       dot.className='dot spin';
-      txt.textContent='Connected (streamlink ready · demucs missing — Music only unavailable)'+diskBit+(helper.recordingsDir?' — '+helper.recordingsDir:'');
+      txt.textContent='Connected (streamlink ready · demucs missing — Music only unavailable)'+diskBit+pendingBit+(helper.recordingsDir?' — '+helper.recordingsDir:'');
     }else{
-      dot.className=(mqBit && (helper.musicDemucsQueue.waiting>0))?'dot spin':'dot ok';
-      txt.textContent='Connected (streamlink ready)'+diskBit+mqBit+(helper.recordingsDir?' — '+helper.recordingsDir:'');
+      // v6.32: spin when restart pending (or waiting Music) so it is not a quiet "ok"
+      const spinPending=!!(helper.pendingRestart || (mqBit && helper.musicDemucsQueue && helper.musicDemucsQueue.waiting>0));
+      dot.className=spinPending?'dot spin':'dot ok';
+      txt.textContent='Connected (streamlink ready)'+diskBit+mqBit+pendingBit+(helper.recordingsDir?' — '+helper.recordingsDir:'');
     }
   }else if(helper.ok && !helper.streamlink){
     const demucsBit=helper.demucs?'':' · demucs missing';
     dot.className='dot spin';
-    txt.textContent='Server up but streamlink not installed — '+(helper.installHint||'pip install streamlink')+demucsBit;
+    txt.textContent='Server up but streamlink not installed — '+(helper.installHint||'pip install streamlink')+demucsBit+pendingBit;
   }else{
     dot.className='dot';
     txt.textContent='Not running — using tab capture';
@@ -1829,6 +1924,14 @@ function updateHelperBar(){
       clearBtn.textContent=wait===1?'Clear waiting Music':'Clear waiting Music ('+wait+')';
     }else{
       clearBtn.classList.add('hidden');
+    }
+  }
+  const restartBtn=document.getElementById('restartHelperBtn');
+  if(restartBtn){
+    if(helper.ok && helper.pendingRestart){
+      restartBtn.classList.remove('hidden');
+    }else{
+      restartBtn.classList.add('hidden');
     }
   }
 }
@@ -2208,15 +2311,17 @@ async function installUpdate(){
     }
     updateCheck.updateAvailable=false;
     const ver=d.version||updateCheck.remoteVersion||'';
-    let msg='Installed v'+ver+'. Restart the helper';
-    if(d.needsRestart!==false) msg+=' (needsRestart)';
-    if(Array.isArray(d.active)&&d.active.length) msg+=' — active recording(s): '+d.active.join(', ')+' (process left running)';
-    msg+='. Then hard-refresh this page (Cmd/Ctrl+Shift+R).';
+    let msg='Installed v'+ver+' on disk.';
+    if(Array.isArray(d.active)&&d.active.length) msg+=' Active recording(s): '+d.active.join(', ')+' — process left running.';
+    msg+=' Helper will auto-restart when idle, or click Restart helper now.';
     if(d.note) msg+=' '+d.note;
-    msg+=' If you use the Desktop launcher / LaunchAgent, quit & relaunch (or restart the agent).';
+    msg+=' Then hard-refresh this page (Cmd/Ctrl+Shift+R).';
     flashOk(msg);
     showUpdatePanel(msg, false);
-    fireNotify('tar-update', 'Helper update installed', 'v'+ver+' — restart helper + hard-refresh');
+    fireNotify('tar-update', 'Helper update installed', 'v'+ver+' — auto-restarts when idle, or Restart helper now');
+    // v6.32: refresh health so pendingRestart / banner sticks (not a one-shot flash)
+    try{ await pingHelperAndStatus(); }catch(e){}
+    updatePendingRestartBanner();
   }catch(e){
     flashErr('Install failed: '+(e.message||e));
     showUpdatePanel('Install failed: '+(e.message||e), true);
