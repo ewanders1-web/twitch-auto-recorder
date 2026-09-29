@@ -1,4 +1,4 @@
-Twitch Auto-Recorder v6.32
+Twitch Auto-Recorder v6.33
 
 pip install streamlink
 python twitch-recorder-server.py
@@ -41,6 +41,8 @@ Cancel waiting Music + orphan temp cleanup (v6.29): Waiting Music only / Auto Mu
 Disk-low pause for Auto Music / Demucs (v6.30): when free space under ~/TwitchRecordings is below diskWarn (<2 GiB) or diskBlock (<512 MiB), Auto Music only soft-skips finished segments (does not mark them queued, so a later stop can retry when space recovers) and shows a sticky banner + one-shot notify that Auto Music is paused — native Auto-Rec still works. Auto seamless join soft-skips on diskBlock only (manual Join seamless still allowed on warn). Helper refuses new POST /api/music-only and Demucs start after Convert upload with HTTP 507 when diskBlock; manual Music only / Convert still allowed on warn-only. On each diskWarn episode the helper also cancels waiting (queued) demucs jobs (running demucs never killed) alongside orphan music-only-* temp cleanup so a backlog cannot start while space is still low. Helper bar appends "Auto Music paused" when applicable.
 
 Safe deferred helper restart after update (v6.32): apply_update still never self-kills (ACTIVE recordings and running demucs stay up). /api/health now exposes diskVersion + pendingRestart when the on-disk VERSION differs from the running HELPER_VERSION. When idle (no ACTIVE, no queued/running Music jobs), the helper auto-schedules one graceful restart (~0.8s then os.execv). POST /api/restart (optional {force:false}) refuses with HTTP 409 while busy unless force:true (UI never auto-forces). Sticky banner + helper-bar "restart pending (disk vX)" + Restart helper button; after Install update the banner sticks until the new process is up.
+
+Delete finished recordings from History (v6.33): History rows for finished helper/disk files get a Delete button. POST /api/delete accepts { "name" } or { "names" } with optional { "withSiblings": true } (default). Path-safe basenames only under ~/TwitchRecordings. Refuses HTTP 409 while the file is an ACTIVE/growing recording or the input of a queued/running Music only / Demucs job. When deleting a native, withSiblings also removes matching -music / -vocals / -seamless siblings (numbered variants included); deleting a sibling export removes only that file. Natives are never silently removed by Music only / Demucs (unchanged). When diskWarn/diskBlock, History shows a one-line hint that Delete frees space.
 
 Unmute add-on — auto-unmute Twitch on Arm (v6.31)
 -------------------------------------------------

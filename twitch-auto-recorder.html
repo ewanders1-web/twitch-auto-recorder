@@ -186,7 +186,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.32</span>
+    <span class="badge">v6.33</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -353,6 +353,7 @@
       <button class="btn btn-gray btn-sm" onclick="clearHist()">🗑 Clear</button>
     </div>
     <div style="font-size:.75rem;color:#9ca3af;margin-bottom:.7rem">Tab-capture is crash-safe via IndexedDB (Recovered entries auto-download once). Helper files write to ~/TwitchRecordings. Seamless joins write a sibling <code>-seamless</code> file (segments kept). For Demucs Music only on any file, use the <strong>Convert</strong> tab.</div>
+    <div id="histDeleteDiskHint" class="hint hidden" style="font-size:.75rem;color:#fbbf24;margin:-.35rem 0 .7rem">Disk space is low — use <strong>Delete</strong> on finished History rows to free space under ~/TwitchRecordings.</div>
     <div id="histList"></div>
   </div>
 
@@ -437,7 +438,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.32'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.33'; // keep in sync with badge + HELPER_VERSION
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, homeStreamer:'', returnHomeAfterSet:true };
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
@@ -702,6 +703,7 @@ function markHelperDown(wasOk){
   if(demucsBan){ demucsBan.classList.add('hidden'); demucsBan.innerHTML=''; }
   const diskMusicBan=document.getElementById('diskLowMusicBanner');
   if(diskMusicBan){ diskMusicBan.classList.add('hidden'); diskMusicBan.innerHTML=''; }
+  try{ updateHistDeleteDiskHint(); }catch(e){}
   const pendingBan=document.getElementById('pendingRestartBanner');
   if(pendingBan){ pendingBan.classList.add('hidden'); pendingBan.innerHTML=''; }
   noticeHelperDropped(wasOk);
@@ -1635,10 +1637,19 @@ function fmtDiskBytes(n){
   const mb=n/(1024*1024);
   return mb.toFixed(0)+' MB';
 }
+function updateHistDeleteDiskHint(){
+  const el=document.getElementById('histDeleteDiskHint');
+  if(!el) return;
+  const show=!!(helper.ok && (helper.diskWarn || helper.diskBlock));
+  if(show) el.classList.remove('hidden');
+  else el.classList.add('hidden');
+}
 function noticeHelperDisk(){
   // One notify/flash per warn episode; reset when free space recovers above warn.
   // v6.30: sticky Auto Music pause banner + coherent one-shot that mentions Auto Music paused.
-  if(!helper.ok) return;
+  // v6.33: History Delete frees space hint when diskWarn/diskBlock.
+  if(!helper.ok){ updateHistDeleteDiskHint(); return; }
+  updateHistDeleteDiskHint();
   const ban=document.getElementById('diskLowMusicBanner');
   const low=helper.diskWarn || helper.diskBlock;
   if(!low){
@@ -3867,10 +3878,15 @@ function renderHist(){
     }
     if(isSeamlessExportName(h.name)) notes.push('<span style="color:#86efac">seamless</span>');
     const rowNote=notes.length?(' · '+notes.join(' · ')):'';
+    // v6.33: Delete finished helper/disk files (not tab-capture blob-only, not while recording)
+    let delBtn='';
+    if(diskish && !stillRec && h.name && helper.ok){
+      delBtn=`<button class="btn btn-red btn-sm" onclick="deleteRecordingFromHist(${i})" title="Delete from ~/TwitchRecordings (frees disk; natives remove music/vocals/seamless too)">Delete</button>`;
+    }
     return `
     <div class="hist-item">
       <div><strong>${h.name}</strong><small>${h.dur} · ${h.size}${h.recovered?' · Recovered':''}${h.fromDisk?' · disk/helper':(h.helperFile?' · disk':'')}${rowNote}</small>${meterHtml}</div>
-      <div class="hist-actions">${dlBtn}${seamlessBtns}${musicBtns}${blobBtn}</div>
+      <div class="hist-actions">${dlBtn}${seamlessBtns}${musicBtns}${blobBtn}${delBtn}</div>
     </div>`;
   }).join('');
 }
@@ -4145,6 +4161,57 @@ async function uploadMusicOnly(){
   try{ input.value=''; }catch(e){}
 }
 
+async function deleteRecordingFromHist(i){
+  const r=recordings[i];
+  if(!r || !r.name) return;
+  if(r.dur==='recording…' || r.recording){
+    flashErr('Still recording — stop first before deleting.');
+    return;
+  }
+  const diskish=!!(r.fromDisk || r.helperFile);
+  if(!diskish){
+    flashErr('This History row is tab-capture only — use Clear, or Delete on a helper/disk file.');
+    return;
+  }
+  if(!helper.ok){
+    flashErr('Local helper not running — start twitch-recorder-server.py to delete from ~/TwitchRecordings.');
+    return;
+  }
+  const siblingOnly=isMusicExportName(r.name) || isSeamlessExportName(r.name);
+  const msg=siblingOnly
+    ? ('Delete '+r.name+' from ~/TwitchRecordings?')
+    : ('Delete '+r.name+' from ~/TwitchRecordings? Music/vocals/seamless siblings for this recording are removed too.');
+  if(!confirm(msg)) return;
+  try{
+    const d=await helperFetch('/api/delete', {name:r.name, withSiblings:true}, 15000);
+    if(!d || !d.ok){
+      flashErr((d && d.error) || 'Delete failed');
+      return;
+    }
+    const deleted=Array.isArray(d.deleted)?d.deleted:[];
+    const freed=(typeof d.bytesFreed==='number' && d.bytesFreed>0)?(' · '+fmtDiskBytes(d.bytesFreed)+' freed'):'';
+    const drop=new Set(deleted);
+    drop.add(r.name);
+    // Revoke blob URLs only for rows we remove that had them
+    recordings=recordings.filter(function(h){
+      if(!h || !h.name) return true;
+      if(!drop.has(h.name)) return true;
+      try{ if(h.url) URL.revokeObjectURL(h.url); }catch(e){}
+      return false;
+    });
+    deleted.forEach(function(n){
+      try{ delete diskFileIndex[n]; }catch(e){}
+      try{ delete musicJobs[n]; }catch(e){}
+      try{ delete seamlessJobs[n]; }catch(e){}
+      try{ autoMusicQueued.delete(n); }catch(e){}
+    });
+    renderHist();
+    flashOk('Deleted '+deleted.length+' file'+(deleted.length===1?'':'s')+freed);
+    try{ await fetchHelperFiles(); }catch(e){}
+  }catch(e){
+    flashErr('Delete failed: '+(e.message||e));
+  }
+}
 function clearHist(){recordings.forEach(h=>{try{if(h.url) URL.revokeObjectURL(h.url);}catch(e){}});recordings=[];musicJobs={};musicJobsNotified=new Set();autoMusicQueued=new Set();seamlessJobs={};seamlessJobsNotified=new Set();seamlessAutoStarted=new Set();diskFileIndex={};renderHist();}
 
 // ─── UI HELPERS ──────────────────────────────────────

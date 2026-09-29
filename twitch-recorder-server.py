@@ -17,7 +17,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8765
-HELPER_VERSION = "6.32"
+HELPER_VERSION = "6.33"
 REC_DIR = Path.home() / "TwitchRecordings"
 HTML_NAME = "twitch-auto-recorder.html"
 HERE = Path(__file__).resolve().parent
@@ -629,8 +629,10 @@ def clear_errors(username=None):
     return {"ok": True, "cleared": "all"}
 
 
-def resolve_download_path(raw_name):
-    """Strict basename under REC_DIR only. No path traversal. None if missing/unsafe."""
+def safe_rec_basename(raw_name):
+    """Strict basename under REC_DIR only. No path traversal. None if unsafe.
+    Does not require the file to exist (unlike resolve_download_path).
+    """
     if not raw_name or not isinstance(raw_name, str):
         return None
     name = raw_name.strip()
@@ -639,6 +641,14 @@ def resolve_download_path(raw_name):
     if "/" in name or "\\" in name:
         return None
     if os.path.basename(name) != name:
+        return None
+    return name
+
+
+def resolve_download_path(raw_name):
+    """Strict basename under REC_DIR only. No path traversal. None if missing/unsafe."""
+    name = safe_rec_basename(raw_name)
+    if not name:
         return None
     try:
         rec_root = REC_DIR.resolve()
@@ -652,6 +662,204 @@ def resolve_download_path(raw_name):
     if not target.is_file():
         return None
     return target
+
+
+def _sibling_audio_exts():
+    """Known audio/video extensions for sibling discovery (DOWNLOAD_TYPES ∪ MUSIC_UPLOAD_EXTS)."""
+    return set(DOWNLOAD_TYPES.keys()) | set(MUSIC_UPLOAD_EXTS)
+
+
+def collect_native_sibling_paths(native_name):
+    """Existing -music / -vocals / -seamless siblings for a native basename under REC_DIR.
+
+    Matches numbered variants (-music-2, -seamless-3, …). Never returns the native itself.
+    """
+    name = safe_rec_basename(native_name)
+    if not name:
+        return []
+    stem = Path(name).stem
+    import re as _re
+    pat = _re.compile(
+        r"^" + _re.escape(stem) + r"-(music|vocals|seamless)(?:-\d+)?$",
+    )
+    exts = {e.lower() for e in _sibling_audio_exts()}
+    found = []
+    try:
+        if not REC_DIR.is_dir():
+            return []
+        for p in REC_DIR.iterdir():
+            try:
+                if not p.is_file():
+                    continue
+            except OSError:
+                continue
+            if p.suffix.lower() not in exts:
+                continue
+            if pat.match(p.stem):
+                found.append(p)
+    except OSError as e:
+        log(f"delete sibling scan failed: {e}")
+    return found
+
+
+def delete_recording_files(names, with_siblings=True):
+    """Delete finished recording file(s) under REC_DIR.
+
+    Path-safe (basenames only). Never deletes ACTIVE/growing files or an in-flight
+    demucs/music-only input. When with_siblings and the request is a native, also
+    removes -music / -vocals / -seamless siblings. When the request is already a
+    sibling export, only that file is deleted.
+
+    Returns (payload, http_status).
+    """
+    if isinstance(names, str):
+        names = [names]
+    if not isinstance(names, (list, tuple)):
+        return {"ok": False, "error": "name or names required"}, 400
+
+    # Unique safe basenames, preserve order
+    seen = set()
+    primaries = []
+    for raw in names:
+        bn = safe_rec_basename(raw)
+        if not bn or bn in seen:
+            continue
+        seen.add(bn)
+        primaries.append(bn)
+    if not primaries:
+        return {"ok": False, "error": "name or names required"}, 400
+
+    # Build candidate Paths (deduped)
+    candidates = []
+    cand_names = set()
+
+    def _add(path):
+        if path is None:
+            return
+        try:
+            key = path.name
+            if key in cand_names:
+                return
+            if not path.is_file():
+                return
+            cand_names.add(key)
+            candidates.append(path)
+        except OSError:
+            return
+
+    for bn in primaries:
+        primary = resolve_download_path(bn)
+        if primary:
+            _add(primary)
+        # Expand siblings only for natives (not already -music/-vocals/-seamless)
+        if with_siblings and not is_music_export_name(bn) and not is_seamless_export_name(bn):
+            for sib in collect_native_sibling_paths(bn):
+                _add(sib)
+
+    if not candidates:
+        return {"ok": False, "error": "not found"}, 404
+
+    # Refuse if any candidate is an ACTIVE (growing) recording file
+    with LOCK:
+        reap_locked()
+        busy_users = []
+        abs_cands = {}
+        for p in candidates:
+            try:
+                abs_cands[os.path.abspath(str(p))] = p.name
+            except OSError:
+                continue
+        for user, rec in ACTIVE.items():
+            f = rec.get("file") or ""
+            if not f:
+                continue
+            try:
+                af = os.path.abspath(f)
+            except OSError:
+                continue
+            if af in abs_cands:
+                busy_users.append(user)
+        busy_users = sorted(set(busy_users))
+    if busy_users:
+        who = ", ".join(busy_users)
+        return {
+            "ok": False,
+            "error": (
+                f"still recording — cannot delete while active for {who}; "
+                f"stop first or wait for the segment to finish"
+            ),
+            "active": busy_users,
+        }, 409
+
+    # Refuse if any candidate is the input name of a queued/running demucs job
+    busy_music = []
+    with MUSIC_JOBS_LOCK:
+        for jid, job in MUSIC_JOBS.items():
+            if (job.get("status") or "") not in ("queued", "running"):
+                continue
+            jname = job.get("name") or ""
+            if jname and jname in cand_names:
+                busy_music.append(jname)
+    busy_music = sorted(set(busy_music))
+    if busy_music:
+        return {
+            "ok": False,
+            "error": (
+                "Music only / Demucs in progress for "
+                + ", ".join(busy_music)
+                + " — cancel waiting or wait for it to finish before deleting"
+            ),
+            "musicJobs": busy_music,
+        }, 409
+
+    deleted = []
+    bytes_freed = 0
+    errors = []
+    for p in candidates:
+        try:
+            sz = 0
+            try:
+                sz = int(p.stat().st_size)
+            except OSError:
+                pass
+            p.unlink()
+            deleted.append(p.name)
+            bytes_freed += max(0, sz)
+            log(f"delete removed {p.name} ({sz} bytes)")
+        except OSError as e:
+            errors.append(f"{p.name}: {e}")
+            log(f"delete failed {p.name}: {e}")
+
+    if not deleted:
+        err = "; ".join(errors) if errors else "not found"
+        return {"ok": False, "error": err}, 404
+
+    payload = {
+        "ok": True,
+        "deleted": deleted,
+        "bytesFreed": bytes_freed,
+        "dir": str(REC_DIR),
+    }
+    if errors:
+        payload["errors"] = errors
+    return payload, 200
+
+
+def api_delete_recordings(body):
+    """POST /api/delete — {name} or {names}, optional withSiblings (default true)."""
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "invalid body"}, 400
+    names = body.get("names")
+    if names is None and body.get("name") is not None:
+        names = [body.get("name")]
+    if names is None:
+        return {"ok": False, "error": "name or names required"}, 400
+    with_siblings = body.get("withSiblings")
+    if with_siblings is None:
+        with_siblings = True
+    else:
+        with_siblings = bool(with_siblings)
+    return delete_recording_files(names, with_siblings=with_siblings)
 
 
 def reap_locked():
@@ -3279,6 +3487,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with LOCK:
                     result = clear_errors(None)
             self.send_json(result)
+            return
+        if path == "/api/delete":
+            body = self.read_json()
+            payload, status = api_delete_recordings(body if isinstance(body, dict) else {})
+            self.send_json(payload, status=status)
             return
         if path == "/api/music-only/cancel":
             body = self.read_json()
