@@ -16,9 +16,11 @@ import uuid
 from pathlib import Path
 
 HOST = "127.0.0.1"
-PORT = 8765
-HELPER_VERSION = "6.34"
-REC_DIR = Path.home() / "TwitchRecordings"
+PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
+HELPER_VERSION = "6.35"
+REC_DIR = Path(
+    os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
+).expanduser()  # v6.35: env override for tests
 HTML_NAME = "twitch-auto-recorder.html"
 HERE = Path(__file__).resolve().parent
 
@@ -539,6 +541,9 @@ def cleanup_orphan_temps(reason="startup"):
                 name = p.name
                 # tempfile.mkdtemp(prefix="music-only-") work dirs only — never files/exports
                 if p.is_dir() and name.startswith("music-only-"):
+                    # v6.35: never remove the work dir of a live job (diskWarn runs mid-job)
+                    if _is_active_work_path(p):
+                        continue
                     size = _dir_byte_size(p)
                     shutil.rmtree(p, ignore_errors=True)
                     if not p.exists():
@@ -569,6 +574,12 @@ def cleanup_orphan_temps(reason="startup"):
                 continue
     except OSError as e:
         log(f"orphan cleanup ({reason}) skipped: {e}")
+    try:
+        d_removed, d_freed = cleanup_drive_temps(reason)
+        files_cleared += d_removed
+        bytes_freed += d_freed
+    except Exception as e:
+        log(f"drive temp cleanup ({reason}) skipped: {e}")
     ORPHAN_TEMPS_LAST = {
         "dirs": dirs_cleared,
         "files": files_cleared,
@@ -1675,6 +1686,29 @@ def music_job_snapshot(job):
         "vocalsName": job.get("vocalsName"),
         "redo": bool(job.get("redo")) if job.get("redo") is not None else None,
         "startedAt": job.get("startedAt"),
+        # v6.35: Drive / link jobs (absent keys = native History/Auto Music job)
+        **_drive_job_extra(job),
+    }
+
+
+def _drive_job_extra(job):
+    if job.get("source") not in ("drive", "link"):
+        return {}
+    return {
+        "source": job.get("source"),
+        "displayName": job.get("displayName"),
+        "srcPath": job.get("srcPath"),
+        "fileId": job.get("fileId"),
+        "outputPath": job.get("outputPath"),
+        "outputUrl": job.get("outputUrl"),
+        "outMode": job.get("outMode"),
+        "phase": job.get("phase"),
+        "info": job.get("info"),
+        "leadingSilence": job.get("leadingSilence"),
+        "keepSource": bool(job.get("keepSource")),
+        "keptSourceName": job.get("keptSourceName"),
+        "already": bool(job.get("already")),
+        "finishedAt": job.get("finishedAt"),
     }
 
 
@@ -2556,6 +2590,7 @@ def music_only_worker(job_id, src_path):
             work = Path(tempfile.mkdtemp(prefix="music-only-", dir=str(REC_DIR)))
         except OSError:
             work = Path(tempfile.mkdtemp(prefix="music-only-"))
+        _register_work_path(work)  # v6.35: protect from diskWarn orphan cleanup
 
         def progress(msg, pct=None):
             # pct=None → update text only (hold last progressPct).
@@ -2621,6 +2656,7 @@ def music_only_worker(job_id, src_path):
                 shutil.rmtree(work, ignore_errors=True)
             except Exception:
                 pass
+            _unregister_work_path(work)
 
 
 def start_music_only(raw_name, redo=False):
@@ -2789,6 +2825,7 @@ def music_only_status(job_id):
             "vocalsName": job.get("vocalsName"),
             "vocalsUrl": job.get("vocalsUrl"),
         }
+        payload.update(_drive_job_extra(job))
     return payload, 200
 
 
@@ -2814,6 +2851,16 @@ def cancel_music_only(body):
     cancelled = []
     skipped = []
     now = time.time()
+
+    # v6.35: Drive / link jobs can be cancelled in any phase (download, chunk, encode).
+    if job_id and not waiting_all:
+        jid = str(job_id).strip()
+        with MUSIC_JOBS_LOCK:
+            is_drive = (MUSIC_JOBS.get(jid) or {}).get("source") in ("drive", "link")
+        if is_drive:
+            if cancel_drive_job(jid):
+                return {"ok": True, "cancelled": [jid], "skipped": []}, 200
+            return {"ok": True, "cancelled": [], "skipped": [{"jobId": jid, "reason": "not active"}]}, 200
 
     with MUSIC_JOBS_LOCK:
         if waiting_all:
@@ -3362,6 +3409,1325 @@ def save_music_upload(filename, data):
     return dest
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# v6.35: Google Drive → Music only (remove voiceover)
+#   A) Drive for Desktop (~/Library/CloudStorage/GoogleDrive-*/, /Volumes/GoogleDrive)
+#   B) Paste a public Drive link (drive.usercontent.google.com confirm=t flow)
+# Both feed the same MUSIC_JOBS queue / DEMUCS_SLOTS (one demucs at a time).
+# Demucs runs on ~10 min chunks (htdemucs, --two-stems=vocals, segment 7, -j 1);
+# no_vocals stems are joined in order and encoded to OGG.
+# ─────────────────────────────────────────────────────────────────────────────
+import re as _re_drive
+import urllib.error  # noqa: E402
+
+DRIVE_INSTALL_URL = "https://www.google.com/drive/download/"
+DRIVE_MEDIA_EXTS = set(MUSIC_UPLOAD_EXTS) | {
+    ".opus", ".aif", ".aiff", ".wma", ".mpeg", ".mpg", ".3gp", ".caf", ".mka",
+}
+DRIVE_MUSIC_SUBFOLDER = "Music only"
+DRIVE_OUTPUT_MODES = ("subfolder", "sibling", "recordings")
+DRIVE_TMP_DIR = REC_DIR / ".drive-tmp"
+DRIVE_HISTORY_FILE = REC_DIR / ".drive-history.json"
+DRIVE_HISTORY_MAX = 200
+DRIVE_HISTORY_LOCK = threading.Lock()
+DEMUCS_CHUNK_SECS = max(5, int(os.environ.get("TWITCH_RECORDER_CHUNK_SECS") or 600))
+DEMUCS_SEGMENT = "7"
+DRIVE_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    f"(KHTML, like Gecko) TwitchAutoRecorder/{HELPER_VERSION}"
+)
+# Work dirs / temp files that belong to live jobs — orphan cleanup must skip them.
+ACTIVE_WORK_PATHS = set()
+ACTIVE_WORK_LOCK = threading.Lock()
+# jobId -> running subprocess (Drive/link jobs only) so Cancel can stop it.
+DRIVE_JOB_PROCS = {}
+# Remember a failed MPS device so later chunks/jobs go straight to CPU.
+_DEMUCS_DEVICE_STATE = {"mps_failed": False}
+# Browser origins allowed to call Drive / reveal endpoints (Drive file names are private).
+DRIVE_ALLOWED_ORIGINS = {
+    "null",  # file:// page
+    "https://ewanders1-web.github.io",
+}
+
+
+class _JobCancelled(Exception):
+    pass
+
+
+def _register_work_path(p):
+    with ACTIVE_WORK_LOCK:
+        ACTIVE_WORK_PATHS.add(os.path.abspath(str(p)))
+
+
+def _unregister_work_path(p):
+    with ACTIVE_WORK_LOCK:
+        ACTIVE_WORK_PATHS.discard(os.path.abspath(str(p)))
+
+
+def _is_active_work_path(p):
+    with ACTIVE_WORK_LOCK:
+        return os.path.abspath(str(p)) in ACTIVE_WORK_PATHS
+
+
+def origin_allowed(origin):
+    """Localhost / file:// / GitHub Pages only (or no Origin header, e.g. curl)."""
+    if not origin:
+        return True
+    o = origin.strip().rstrip("/")
+    if o in DRIVE_ALLOWED_ORIGINS:
+        return True
+    try:
+        u = urllib.parse.urlparse(o)
+    except ValueError:
+        return False
+    return u.scheme in ("http", "https") and (u.hostname or "") in ("127.0.0.1", "localhost")
+
+
+# ── Drive for Desktop detection / safe paths ────────────────────────────────
+
+def _cloudstorage_bases():
+    env = os.environ.get("TWITCH_RECORDER_CLOUDSTORAGE")
+    if env:
+        return [Path(p).expanduser() for p in env.split(os.pathsep) if p.strip()]
+    return [Path.home() / "Library" / "CloudStorage"]
+
+
+def _legacy_drive_volumes():
+    env = os.environ.get("TWITCH_RECORDER_DRIVE_VOLUMES")
+    if env is not None:
+        return [Path(p).expanduser() for p in env.split(os.pathsep) if p.strip()]
+    return [Path("/Volumes/GoogleDrive")]
+
+
+def detect_drive_roots():
+    """Return list of {label, path, account, kind, shortcuts:[{label,path}]} (real paths)."""
+    roots = []
+    seen = set()
+    for base in _cloudstorage_bases():
+        try:
+            if not base.is_dir():
+                continue
+            children = sorted(base.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            continue
+        for child in children:
+            try:
+                if not child.name.startswith("GoogleDrive-") or not child.is_dir():
+                    continue
+                real = os.path.realpath(str(child))
+            except OSError:
+                continue
+            if real in seen:
+                continue
+            seen.add(real)
+            account = child.name[len("GoogleDrive-"):]
+            roots.append(
+                {
+                    "label": f"Google Drive ({account})" if account else "Google Drive",
+                    "path": real,
+                    "account": account,
+                    "kind": "cloudstorage",
+                }
+            )
+    for vol in _legacy_drive_volumes():
+        try:
+            if not vol.is_dir():
+                continue
+            real = os.path.realpath(str(vol))
+        except OSError:
+            continue
+        if real in seen:
+            continue
+        seen.add(real)
+        roots.append({"label": "Google Drive (legacy volume)", "path": real, "account": "", "kind": "volume"})
+    for r in roots:
+        shortcuts = []
+        for sub in ("My Drive", "Shared drives"):
+            p = Path(r["path"]) / sub
+            try:
+                if p.is_dir():
+                    shortcuts.append({"label": sub, "path": os.path.realpath(str(p))})
+            except OSError:
+                continue
+        r["shortcuts"] = shortcuts
+    return roots
+
+
+def _path_within(real, root):
+    try:
+        return os.path.commonpath([real, root]) == root
+    except ValueError:
+        return False
+
+
+def validate_drive_path(raw, roots=None):
+    """Resolve raw absolute path; must stay inside a detected Drive root.
+
+    Rejects relative paths, '..' components, NUL, and symlinks that escape.
+    Returns (real_path_str, root_dict, None) or (None, None, error).
+    """
+    if roots is None:
+        roots = detect_drive_roots()
+    if not roots:
+        return None, None, "Google Drive for Desktop not found"
+    if not isinstance(raw, str) or not raw.strip():
+        return None, None, "path required"
+    s = raw.strip()
+    if "\x00" in s:
+        return None, None, "invalid path"
+    if s.startswith("~"):
+        s = os.path.expanduser(s)
+    if not os.path.isabs(s):
+        return None, None, "absolute path required"
+    if any(part == ".." for part in Path(s).parts):
+        return None, None, "'..' is not allowed in Drive paths"
+    try:
+        real = os.path.realpath(s)
+    except OSError:
+        return None, None, "invalid path"
+    for r in roots:
+        if _path_within(real, r["path"]):
+            return real, r, None
+    return None, None, "path is outside Google Drive"
+
+
+def _drive_output_path(src_real, mode):
+    stem = music_base_stem(Path(src_real).name)
+    name = f"{stem}-music.ogg"
+    if mode == "sibling":
+        return Path(src_real).parent / name
+    if mode == "recordings":
+        return REC_DIR / name
+    return Path(src_real).parent / DRIVE_MUSIC_SUBFOLDER / name
+
+
+def _norm_out_mode(mode):
+    return mode if mode in DRIVE_OUTPUT_MODES else "subfolder"
+
+
+def drive_status_payload():
+    roots = detect_drive_roots()
+    return {
+        "ok": True,
+        "found": bool(roots),
+        "roots": roots,
+        "installUrl": DRIVE_INSTALL_URL,
+        "platform": sys.platform,
+        "outputModes": list(DRIVE_OUTPUT_MODES),
+        "musicSubfolder": DRIVE_MUSIC_SUBFOLDER,
+        "recordingsDir": str(REC_DIR),
+        "chunkSecs": DEMUCS_CHUNK_SECS,
+        "demucs": demucs_available(),
+        "ffmpeg": bool(which_ffmpeg()),
+    }
+
+
+def drive_list_payload(raw_path, out_mode="subfolder"):
+    roots = detect_drive_roots()
+    out_mode = _norm_out_mode(out_mode)
+    if not roots:
+        return {
+            "ok": False,
+            "found": False,
+            "error": "Google Drive for Desktop not found",
+            "installUrl": DRIVE_INSTALL_URL,
+        }, 404
+    if not raw_path:
+        # Virtual top level: My Drive / Shared drives per account (or the account root).
+        dirs = []
+        for r in roots:
+            if r["shortcuts"]:
+                for sc in r["shortcuts"]:
+                    lbl = sc["label"] if len(roots) == 1 else f'{sc["label"]} — {r["account"] or r["label"]}'
+                    dirs.append({"name": lbl, "path": sc["path"]})
+            else:
+                dirs.append({"name": r["label"], "path": r["path"]})
+        return {
+            "ok": True,
+            "found": True,
+            "path": "",
+            "crumbs": [{"name": "Google Drive", "path": ""}],
+            "dirs": dirs,
+            "files": [],
+            "outMode": out_mode,
+        }, 200
+    real, root, err = validate_drive_path(raw_path, roots)
+    if err:
+        return {"ok": False, "error": err}, 400
+    if not os.path.isdir(real):
+        return {"ok": False, "error": "folder not found"}, 404
+    dirs = []
+    files = []
+    try:
+        it = list(os.scandir(real))
+    except OSError as e:
+        return {"ok": False, "error": f"cannot list folder: {e}"}, 500
+    for entry in it:
+        name = entry.name
+        if name.startswith(".") or name.startswith("~$") or name == "Icon\r":
+            continue
+        try:
+            full = os.path.join(real, name)
+            if entry.is_symlink():
+                target = os.path.realpath(full)
+                if not any(_path_within(target, r["path"]) for r in roots):
+                    continue  # symlink escapes Drive — hide it
+            if entry.is_dir(follow_symlinks=True):
+                dirs.append({"name": name, "path": os.path.realpath(full)})
+                continue
+            if not entry.is_file(follow_symlinks=True):
+                continue
+            if Path(name).suffix.lower() not in DRIVE_MEDIA_EXTS:
+                continue
+            st = entry.stat(follow_symlinks=True)
+        except OSError:
+            continue
+        real_file = os.path.realpath(full)
+        is_export = is_music_export_name(name)
+        music_path = None
+        if not is_export:
+            try:
+                cand = _drive_output_path(real_file, out_mode)
+                if cand.is_file():
+                    music_path = str(cand)
+            except OSError:
+                music_path = None
+        files.append(
+            {
+                "name": name,
+                "path": real_file,
+                "size": int(st.st_size),
+                "mtime": int(st.st_mtime),
+                "isMusicExport": is_export,
+                "musicPath": music_path,
+            }
+        )
+    dirs.sort(key=lambda d: d["name"].lower())
+    files.sort(key=lambda f: f["name"].lower())
+    # Breadcrumbs: virtual top → root → each component.
+    crumbs = [{"name": "Google Drive", "path": ""}]
+    root_path = root["path"]
+    crumbs.append({"name": root["label"], "path": root_path})
+    rel = os.path.relpath(real, root_path)
+    if rel != ".":
+        acc = root_path
+        for part in Path(rel).parts:
+            acc = os.path.join(acc, part)
+            crumbs.append({"name": part, "path": acc})
+    return {
+        "ok": True,
+        "found": True,
+        "path": real,
+        "crumbs": crumbs,
+        "dirs": dirs,
+        "files": files,
+        "outMode": out_mode,
+    }, 200
+
+
+# ── Drive link parsing / download ───────────────────────────────────────────
+
+_DRIVE_ID_RE = r"[A-Za-z0-9_-]{10,}"
+_DRIVE_HOSTS = ("drive.google.com", "docs.google.com", "drive.usercontent.google.com")
+
+
+def parse_drive_file_id(url):
+    """Extract a Drive file id from /file/d/<id>/, open?id=, uc?id= links (or a bare id)."""
+    s = (url or "").strip() if isinstance(url, str) else ""
+    if not s:
+        return None, "paste a Google Drive file link"
+    if _re_drive.fullmatch(r"[A-Za-z0-9_-]{25,}", s):
+        return s, None
+    if not _re_drive.match(r"^https?://", s, _re_drive.I):
+        s = "https://" + s
+    try:
+        u = urllib.parse.urlparse(s)
+    except ValueError:
+        return None, "not a valid link"
+    host = (u.hostname or "").lower()
+    if host not in _DRIVE_HOSTS:
+        return None, "not a Google Drive link (expected drive.google.com/file/d/…)"
+    m = _re_drive.search(r"/file/(?:u/\d+/)?d/(" + _DRIVE_ID_RE + ")", u.path)
+    if m:
+        return m.group(1), None
+    q = urllib.parse.parse_qs(u.query)
+    for key in ("id",):
+        vals = q.get(key) or []
+        if vals and _re_drive.fullmatch(_DRIVE_ID_RE, vals[0]):
+            return vals[0], None
+    if "/folders/" in u.path:
+        return None, (
+            "that is a folder link — paste a link to a single file, "
+            "or use Drive for Desktop to browse the folder"
+        )
+    return None, "could not find a file id in that link"
+
+
+def _content_disposition_filename(cd):
+    if not cd:
+        return None
+    m = _re_drive.search(r"filename\*\s*=\s*([^']*)''([^;]+)", cd, _re_drive.I)
+    if m:
+        try:
+            return urllib.parse.unquote(m.group(2).strip().strip('"'), encoding=m.group(1) or "utf-8")
+        except (LookupError, ValueError):
+            pass
+    m = _re_drive.search(r'filename\s*=\s*"([^"]+)"', cd, _re_drive.I)
+    if m:
+        return m.group(1)
+    m = _re_drive.search(r"filename\s*=\s*([^;]+)", cd, _re_drive.I)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _safe_download_name(name, file_id):
+    n = (name or "").replace("\x00", "").strip()
+    n = n.replace("/", "_").replace("\\", "_").replace(":", "_")
+    n = n.lstrip(".").strip()
+    if not n:
+        n = f"drive-{file_id}"
+    if len(n) > 180:
+        stem, ext = os.path.splitext(n)
+        n = stem[: 180 - len(ext)] + ext
+    return n
+
+
+class DrivePrivateError(RuntimeError):
+    pass
+
+
+DRIVE_PRIVATE_MSG = (
+    "This Drive file is private (Google asked to sign in). Either use Drive for Desktop "
+    "(browse it above), or set the file's sharing to \"Anyone with the link\" and try again."
+)
+
+
+def _looks_like_signin(html, final_url):
+    low = (html or "").lower()
+    fu = (final_url or "").lower()
+    if "accounts.google.com" in fu or "servicelogin" in fu:
+        return True
+    return any(
+        k in low
+        for k in (
+            "accounts.google.com/servicelogin",
+            "accounts.google.com/v3/signin",
+            "<title>sign in",
+            "sign in - google accounts",
+            "you need access",
+            "request access",
+        )
+    )
+
+
+def _drive_confirm_url_from_html(html, file_id):
+    """Parse the virus-scan warning form (download-form) or a confirm= token."""
+    m = _re_drive.search(r'<form[^>]+id="download-form"[^>]*action="([^"]+)"', html or "", _re_drive.I)
+    if not m:
+        m = _re_drive.search(r'<form[^>]+action="([^"]+)"[^>]*id="download-form"', html or "", _re_drive.I)
+    if m:
+        action = m.group(1).replace("&amp;", "&")
+        params = {}
+        for im in _re_drive.finditer(r"<input[^>]+>", html, _re_drive.I):
+            tag = im.group(0)
+            nm = _re_drive.search(r'name="([^"]+)"', tag)
+            vm = _re_drive.search(r'value="([^"]*)"', tag)
+            if nm and 'type="hidden"' in tag.lower():
+                params[nm.group(1)] = (vm.group(1) if vm else "").replace("&amp;", "&")
+        params.setdefault("id", file_id)
+        params.setdefault("export", "download")
+        params.setdefault("confirm", "t")
+        if action.startswith("/"):
+            action = "https://drive.usercontent.google.com" + action
+        return action + ("&" if "?" in action else "?") + urllib.parse.urlencode(params)
+    m = _re_drive.search(r"confirm=([0-9A-Za-z_-]+)", html or "")
+    if m:
+        u = (
+            "https://drive.usercontent.google.com/download?"
+            + urllib.parse.urlencode({"id": file_id, "export": "download", "confirm": m.group(1)})
+        )
+        um = _re_drive.search(r'name="uuid"\s+value="([^"]+)"', html or "")
+        if um:
+            u += "&uuid=" + urllib.parse.quote(um.group(1))
+        return u
+    return None
+
+
+def drive_open_download(file_id, timeout=60):
+    """Open a streaming response for a public Drive file. Raises DrivePrivateError / RuntimeError."""
+    base = os.environ.get("TWITCH_RECORDER_DRIVE_DL_BASE") or "https://drive.usercontent.google.com/download"
+    url = base + "?" + urllib.parse.urlencode({"id": file_id, "export": "download", "confirm": "t"})
+    tried = set()
+    for _attempt in range(3):
+        tried.add(url)
+        req = urllib.request.Request(url, headers={"User-Agent": DRIVE_USER_AGENT})
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read(200000).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            if e.code in (401, 403) or _looks_like_signin(body, getattr(e, "url", "")):
+                raise DrivePrivateError(DRIVE_PRIVATE_MSG)
+            if e.code == 404:
+                raise RuntimeError(
+                    "Google Drive says the file was not found — check the link "
+                    "(or it is private: use Drive for Desktop or \"Anyone with the link\")"
+                )
+            if e.code == 429:
+                raise RuntimeError("Google Drive download quota exceeded for this file — try later or use Drive for Desktop")
+            raise RuntimeError(f"Google Drive HTTP {e.code}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"could not reach Google Drive: {getattr(e, 'reason', e)}")
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        final = resp.geturl() or ""
+        if "accounts.google.com" in final.lower():
+            resp.close()
+            raise DrivePrivateError(DRIVE_PRIVATE_MSG)
+        if not ctype.startswith("text/html"):
+            return resp
+        html = resp.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
+        resp.close()
+        if _looks_like_signin(html, final):
+            raise DrivePrivateError(DRIVE_PRIVATE_MSG)
+        low = html.lower()
+        if "quota exceeded" in low or "too many users have viewed or downloaded" in low:
+            raise RuntimeError("Google Drive download quota exceeded for this file — try later or use Drive for Desktop")
+        nxt = _drive_confirm_url_from_html(html, file_id)
+        if not nxt or nxt in tried:
+            t = _re_drive.search(r"<title>([^<]{0,120})</title>", html, _re_drive.I)
+            title = (t.group(1).strip() if t else "").replace("\n", " ")
+            raise RuntimeError(
+                "Google returned a web page instead of the file"
+                + (f" ({title})" if title else "")
+                + " — it may be private; use Drive for Desktop or \"Anyone with the link\""
+            )
+        url = nxt
+    raise RuntimeError("Google Drive kept returning a confirmation page")
+
+
+# ── job plumbing ─────────────────────────────────────────────────────────────
+
+def _job_get(job_id, key, default=None):
+    with MUSIC_JOBS_LOCK:
+        job = MUSIC_JOBS.get(job_id) or {}
+        return job.get(key, default)
+
+
+def _check_cancel(job_id):
+    if _music_job_is_cancelled(job_id):
+        raise _JobCancelled()
+
+
+def _job_run_proc(job_id, cmd, line_cb=None, env=None, timeout=6 * 3600):
+    """Run a subprocess that Cancel can stop. Returns (rc, tail_text)."""
+    _check_cancel(job_id)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        bufsize=0,
+        env=env,
+    )
+    with MUSIC_JOBS_LOCK:
+        DRIVE_JOB_PROCS[job_id] = proc
+    tail = []
+
+    def reader():
+        buf = ""
+        try:
+            while True:
+                chunk = proc.stdout.read(512)
+                if not chunk:
+                    break
+                buf += chunk.decode("utf-8", errors="replace")
+                while True:
+                    idx = [i for i in (buf.find("\n"), buf.find("\r")) if i >= 0]
+                    if not idx:
+                        break
+                    i = min(idx)
+                    line, buf = buf[:i], buf[i + 1:]
+                    if line.strip():
+                        tail.append(line)
+                        if len(tail) > 120:
+                            del tail[:-60]
+                        if line_cb:
+                            try:
+                                line_cb(line)
+                            except Exception:
+                                pass
+            if buf.strip():
+                tail.append(buf)
+                if line_cb:
+                    try:
+                        line_cb(buf)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    rt = threading.Thread(target=reader, daemon=True, name=f"drive-proc-{job_id}")
+    rt.start()
+    started = time.time()
+    try:
+        while proc.poll() is None:
+            if _music_job_is_cancelled(job_id):
+                terminate_proc(proc)
+                rt.join(timeout=2)
+                raise _JobCancelled()
+            if time.time() - started > timeout:
+                terminate_proc(proc)
+                raise RuntimeError(f"{Path(cmd[0]).name} timed out")
+            time.sleep(0.3)
+        rt.join(timeout=5)
+    finally:
+        with MUSIC_JOBS_LOCK:
+            if DRIVE_JOB_PROCS.get(job_id) is proc:
+                DRIVE_JOB_PROCS.pop(job_id, None)
+    if proc.returncode != 0 and _music_job_is_cancelled(job_id):
+        raise _JobCancelled()  # Cancel killed the process — not an error
+    text = "\n".join(tail[-40:])
+    return proc.returncode, text
+
+
+def _which_ffprobe():
+    ff = which_ffmpeg()
+    if ff:
+        cand = Path(ff).with_name("ffprobe" + (".exe" if ff.lower().endswith(".exe") else ""))
+        if cand.is_file():
+            return str(cand)
+    return shutil.which("ffprobe") or shutil.which("ffprobe.exe")
+
+
+def probe_media(path):
+    """ffprobe by content (never trusts the extension). Returns dict or raises."""
+    fp = _which_ffprobe()
+    if not fp:
+        raise RuntimeError("ffprobe not found (install ffmpeg)")
+    r = subprocess.run(
+        [fp, "-v", "error", "-show_entries",
+         "format=duration,format_name:stream=codec_type,codec_name",
+         "-of", "json", str(path)],
+        capture_output=True, text=True, timeout=180,
+    )
+    try:
+        data = json.loads(r.stdout or "{}")
+    except ValueError:
+        data = {}
+    fmt = data.get("format") or {}
+    audio = [s for s in (data.get("streams") or []) if s.get("codec_type") == "audio"]
+    if r.returncode != 0 or not audio:
+        err = (r.stderr or "").strip()[-300:]
+        raise RuntimeError(
+            "ffmpeg found no audio stream in this file" + (f" ({err})" if err else "")
+        )
+    try:
+        dur = float(fmt.get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    return {
+        "duration": dur,
+        "container": fmt.get("format_name") or "?",
+        "audioCodec": audio[0].get("codec_name") or "?",
+    }
+
+
+def detect_leading_silence(path, max_scan=900):
+    """Seconds of leading silence (info only), or 0."""
+    ff = which_ffmpeg()
+    if not ff:
+        return 0.0
+    try:
+        r = subprocess.run(
+            [ff, "-nostdin", "-hide_banner", "-t", str(max_scan), "-i", str(path),
+             "-vn", "-af", "silencedetect=noise=-50dB:d=2", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=600,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0.0
+    txt = r.stderr or ""
+    m_start = _re_drive.search(r"silence_start:\s*(-?[\d.]+)", txt)
+    if not m_start or float(m_start.group(1)) > 0.05:
+        return 0.0
+    m_end = _re_drive.search(r"silence_end:\s*([\d.]+)", txt)
+    if m_end:
+        return float(m_end.group(1))
+    return float(max_scan)  # silent for the whole scanned window
+
+
+def _demucs_base_cmd():
+    d = which_demucs()
+    if not d:
+        raise RuntimeError("demucs not installed — pip install demucs (first run downloads models)")
+    return [sys.executable, "-m", "demucs"] if d == "python -m demucs" else [d]
+
+
+def _demucs_devices():
+    forced = (os.environ.get("TWITCH_RECORDER_DEMUCS_DEVICE") or "").strip()
+    if forced:
+        return [forced]
+    if sys.platform == "darwin" and not _DEMUCS_DEVICE_STATE["mps_failed"]:
+        return ["mps", "cpu"]
+    return ["cpu"]
+
+
+def _wait_disk_ok(job_id, progress):
+    """Disk-low pause between chunks (cancellable). Never deletes anything."""
+    paused = False
+    while disk_block_error():
+        if not paused:
+            log(f"drive-music job={job_id}: paused — disk almost full")
+            paused = True
+        progress("Paused — disk almost full; free space to continue", None)
+        _check_cancel(job_id)
+        time.sleep(5)
+    if paused:
+        log(f"drive-music job={job_id}: disk recovered — resuming")
+
+
+def chunked_demucs_no_vocals(job_id, src, work, duration, progress, pct_lo=20.0, pct_hi=90.0):
+    """Split src into ~DEMUCS_CHUNK_SECS FLAC chunks, demucs each, return ordered no_vocals list."""
+    ff = which_ffmpeg()
+    if not ff:
+        raise RuntimeError("ffmpeg not found")
+    chunks_dir = Path(work) / "chunks"
+    stems_dir = Path(work) / "stems"
+    sep_dir = Path(work) / "sep"
+    for d in (chunks_dir, stems_dir, sep_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    est = max(1, int((duration or 0) // DEMUCS_CHUNK_SECS) + (1 if (duration or 0) % DEMUCS_CHUNK_SECS else 0))
+    progress(f"Splitting into {DEMUCS_CHUNK_SECS // 60 or 1}-min chunks (~{est})…", pct_lo - 2)
+    rc, tail = _job_run_proc(
+        job_id,
+        [ff, "-nostdin", "-v", "error", "-y", "-i", str(src), "-vn", "-map", "0:a:0",
+         "-ac", "2", "-ar", "44100", "-c:a", "flac", "-f", "segment",
+         "-segment_time", str(DEMUCS_CHUNK_SECS), "-reset_timestamps", "1",
+         str(chunks_dir / "c%04d.flac")],
+        timeout=3 * 3600,
+    )
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg split failed: {tail[-400:]}")
+    chunks = sorted(chunks_dir.glob("c*.flac"))
+    if not chunks:
+        raise RuntimeError("ffmpeg split produced no chunks")
+    n = len(chunks)
+    base_cmd = _demucs_base_cmd()
+    span = pct_hi - pct_lo
+    outs = []
+    for i, chunk in enumerate(chunks):
+        _check_cancel(job_id)
+        _wait_disk_ok(job_id, progress)
+        label = f"Demucs chunk {i + 1}/{n}"
+        progress(f"{label}…", round(pct_lo + span * i / n, 1))
+        out_dir = sep_dir / chunk.stem
+        state = {"pct": 0.0}
+
+        def on_line(line, i=i, label=label, state=state):
+            _msg, p = _parse_demucs_progress_line(line)
+            if p is not None and p >= state["pct"]:
+                state["pct"] = p
+                progress(f"{label} · {p:.0f}%", round(pct_lo + span * (i + p / 100.0) / n, 1))
+
+        last_err = ""
+        stem_wav = None
+        for dev in _demucs_devices():
+            shutil.rmtree(out_dir, ignore_errors=True)
+            env = dict(os.environ)
+            env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+            cmd = base_cmd + [
+                "-n", "htdemucs", "--two-stems=vocals", "--segment", DEMUCS_SEGMENT,
+                "-j", "1", "-d", dev, "--clip-mode", "clamp",
+                "--filename", "{stem}.{ext}", "-o", str(out_dir), str(chunk),
+            ]
+            state["pct"] = 0.0
+            rc, tail = _job_run_proc(job_id, cmd, line_cb=on_line, env=env)
+            cand = out_dir / "htdemucs" / "no_vocals.wav"
+            if rc == 0 and cand.is_file():
+                stem_wav = cand
+                break
+            last_err = tail[-500:]
+            if dev == "mps":
+                _DEMUCS_DEVICE_STATE["mps_failed"] = True
+                log(f"drive-music job={job_id}: demucs on mps failed — falling back to cpu")
+                progress(f"{label}: MPS failed, retrying on CPU…", None)
+        if stem_wav is None:
+            raise RuntimeError(f"demucs failed on chunk {i + 1}/{n}: {last_err or 'unknown'}")
+        # Keep only no_vocals, as FLAC (saves ~45% disk on 4 h files).
+        flac = stems_dir / f"{chunk.stem}.flac"
+        rc, tail = _job_run_proc(
+            job_id, [ff, "-nostdin", "-v", "error", "-y", "-i", str(stem_wav), "-c:a", "flac", str(flac)],
+            timeout=1800,
+        )
+        if rc != 0 or not flac.is_file():
+            raise RuntimeError(f"ffmpeg stem convert failed: {tail[-300:]}")
+        shutil.rmtree(out_dir, ignore_errors=True)
+        try:
+            chunk.unlink()
+        except OSError:
+            pass
+        outs.append(flac)
+    return outs
+
+
+def encode_joined_ogg(job_id, parts, out_path, duration, progress, pct_lo=90.0, pct_hi=99.0):
+    """Concat no_vocals parts in order → OGG (libvorbis q5, fallback libopus)."""
+    ff = which_ffmpeg()
+    lst = Path(out_path).with_suffix(".txt")
+    with open(lst, "w", encoding="utf-8") as fh:
+        for p in parts:
+            fh.write("file '" + str(p).replace("'", "'\\''") + "'\n")
+    dur_us = max(1.0, float(duration or 0)) * 1_000_000
+
+    def on_line(line):
+        if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+            try:
+                v = float(line.split("=", 1)[1])
+            except ValueError:
+                return
+            frac = max(0.0, min(1.0, v / dur_us))
+            progress(f"Encoding OGG · {frac * 100:.0f}%", round(pct_lo + (pct_hi - pct_lo) * frac, 1))
+
+    last = ""
+    for args in (["-c:a", "libvorbis", "-q:a", "5"], ["-c:a", "libopus", "-b:a", "128k"]):
+        progress("Encoding OGG…", pct_lo)
+        rc, tail = _job_run_proc(
+            job_id,
+            [ff, "-nostdin", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+             "-vn", *args, "-progress", "pipe:1", "-nostats", str(out_path)],
+            line_cb=on_line, timeout=3 * 3600,
+        )
+        if rc == 0 and Path(out_path).is_file() and Path(out_path).stat().st_size > 0:
+            return Path(out_path)
+        last = tail[-400:]
+    raise RuntimeError(f"ffmpeg encode failed: {last}")
+
+
+def atomic_publish(tmp_file, dest):
+    """Write dest atomically (temp in dest folder, then rename) so Drive syncs one clean file."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.parent / f".{dest.name}.partial-{uuid.uuid4().hex[:6]}"
+    try:
+        same_dev = os.stat(tmp_file).st_dev == os.stat(dest.parent).st_dev
+    except OSError:
+        same_dev = False
+    try:
+        if same_dev:
+            os.replace(tmp_file, part)
+        else:
+            with open(tmp_file, "rb") as src, open(part, "wb") as out:
+                shutil.copyfileobj(src, out, length=4 * 1024 * 1024)
+                out.flush()
+                os.fsync(out.fileno())
+        os.replace(part, dest)
+    finally:
+        try:
+            if part.exists():
+                part.unlink()
+        except OSError:
+            pass
+    return dest
+
+
+def _stage_copy(job_id, src, dest, progress, pct_lo=0.0, pct_hi=15.0):
+    """Copy a Drive for Desktop file to local temp (reading triggers download of online-only files)."""
+    try:
+        total = os.stat(src).st_size
+    except OSError as e:
+        raise RuntimeError(f"cannot read source: {e}")
+    progress("Reading from Drive (online-only files download first)…", pct_lo)
+    done = 0
+    last_emit = 0.0
+    with open(src, "rb") as fin, open(dest, "wb") as fout:
+        while True:
+            _check_cancel(job_id)
+            buf = fin.read(4 * 1024 * 1024)
+            if not buf:
+                break
+            fout.write(buf)
+            done += len(buf)
+            now = time.time()
+            if now - last_emit > 0.5:
+                last_emit = now
+                frac = (done / total) if total else 0
+                progress(
+                    f"Copying from Drive · {frac * 100:.0f}% ({done // 1048576} / {total // 1048576} MB)",
+                    round(pct_lo + (pct_hi - pct_lo) * min(1.0, frac), 1),
+                )
+    if total and done != total:
+        raise RuntimeError(
+            f"Drive sync hiccup: read {done} of {total} bytes — try again (Drive for Desktop may still be downloading)"
+        )
+    return done
+
+
+def _drive_download(job_id, file_id, progress, redo, pct_lo=0.0, pct_hi=15.0):
+    """Stream a public Drive file to REC_DIR/.drive-tmp. Returns (path, filename)."""
+    DRIVE_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    progress("Contacting Google Drive…", pct_lo)
+    resp = drive_open_download(file_id)
+    try:
+        fname = _safe_download_name(
+            _content_disposition_filename(resp.headers.get("Content-Disposition")), file_id
+        )
+        _set_music_job(job_id, displayName=fname)
+        out_final = REC_DIR / music_output_name(fname, ".ogg")
+        _set_music_job(job_id, outputPath=str(out_final), outputName=None)
+        if out_final.exists() and not redo:
+            raise FileExistsError(str(out_final))
+        try:
+            total = int(resp.headers.get("Content-Length") or 0)
+        except ValueError:
+            total = 0
+        part = DRIVE_TMP_DIR / f"{job_id}-{file_id}.part"
+        _register_work_path(part)
+        try:
+            _stream_to_part(job_id, resp, part, total, progress, pct_lo, pct_hi)
+        except BaseException:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+            _unregister_work_path(part)
+            raise
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    final = DRIVE_TMP_DIR / f"{job_id}-{fname}"
+    os.replace(part, final)
+    _unregister_work_path(part)
+    _register_work_path(final)
+    return final, fname
+
+
+def _stream_to_part(job_id, resp, part, total, progress, pct_lo, pct_hi):
+    done = 0
+    last_emit = 0.0
+    with open(part, "wb") as fh:
+        while True:
+            _check_cancel(job_id)
+            buf = resp.read(1024 * 1024)
+            if not buf:
+                break
+            fh.write(buf)
+            done += len(buf)
+            now = time.time()
+            if now - last_emit > 0.5:
+                last_emit = now
+                if disk_block_error():
+                    raise RuntimeError("disk almost full — download stopped")
+                if total:
+                    frac = done / total
+                    progress(
+                        f"Downloading · {frac * 100:.0f}% ({done // 1048576} / {total // 1048576} MB)",
+                        round(pct_lo + (pct_hi - pct_lo) * min(1.0, frac), 1),
+                    )
+                else:
+                    progress(f"Downloading · {done // 1048576} MB", None)
+    if total and done != total:
+        raise RuntimeError(f"download incomplete ({done} of {total} bytes) — try again")
+    if done == 0:
+        raise RuntimeError("Google Drive returned an empty file")
+
+
+def _unique_rec_path(fname):
+    """REC_DIR/<fname> (spaces kept), adding -2, -3… before the extension on collision."""
+    base = _safe_download_name(fname, "file")
+    dest = REC_DIR / base
+    if not dest.exists():
+        return dest
+    stem, suf = os.path.splitext(base)
+    for n in range(2, 1000):
+        dest = REC_DIR / f"{stem}-{n}{suf}"
+        if not dest.exists():
+            return dest
+    return REC_DIR / f"{stem}-{int(time.time())}{suf}"
+
+
+def _record_drive_history(entry):
+    with DRIVE_HISTORY_LOCK:
+        items = _read_drive_history_locked()
+        items = [e for e in items if e.get("outputPath") != entry.get("outputPath")]
+        items.insert(0, entry)
+        items = items[:DRIVE_HISTORY_MAX]
+        try:
+            REC_DIR.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(DRIVE_HISTORY_FILE, json.dumps(items, indent=1).encode("utf-8"))
+        except Exception as e:
+            log(f"drive history write failed: {e}")
+
+
+def _read_drive_history_locked():
+    try:
+        data = json.loads(DRIVE_HISTORY_FILE.read_text(encoding="utf-8"))
+        return [e for e in data if isinstance(e, dict)] if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def drive_history_payload():
+    with DRIVE_HISTORY_LOCK:
+        items = _read_drive_history_locked()
+    out = []
+    rec_real = os.path.realpath(str(REC_DIR))
+    for e in items:
+        p = e.get("outputPath") or ""
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        in_rec = os.path.dirname(os.path.realpath(p)) == rec_real
+        out.append(dict(e, size=int(st.st_size), mtime=int(st.st_mtime), inRecordings=in_rec,
+                        outputName=os.path.basename(p)))
+    return {"ok": True, "items": out}
+
+
+def drive_music_worker(job_id):
+    work = None
+    slot_held = False
+    dl_path = None
+    source = _job_get(job_id, "source")
+    redo = bool(_job_get(job_id, "redo"))
+    keep_source = bool(_job_get(job_id, "keepSource"))
+
+    def progress(msg, pct=None):
+        if pct is not None:
+            _set_music_job(job_id, progress=msg, progressPct=pct)
+        else:
+            _set_music_job(job_id, progress=msg)
+
+    try:
+        _check_cancel(job_id)
+        REC_DIR.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="music-only-", dir=str(REC_DIR)))
+        _register_work_path(work)
+        _set_music_job(job_id, status="running", phase="fetch")
+        if source == "link":
+            try:
+                dl_path, fname = _drive_download(job_id, _job_get(job_id, "fileId"), progress, redo)
+            except FileExistsError as fe:
+                out = Path(str(fe))
+                _set_music_job(
+                    job_id, status="done", progress="Already done (check Redo to re-run)",
+                    progressPct=100, outputPath=str(out), outputName=out.name, already=True,
+                    finishedAt=time.time(),
+                )
+                return
+            staged = dl_path
+        else:
+            src = Path(_job_get(job_id, "srcPath"))
+            staged = work / "source.media"  # no extension: ffmpeg probes the content
+            _stage_copy(job_id, src, staged, progress)
+        _check_cancel(job_id)
+        progress("Probing audio…", 16)
+        info = probe_media(staged)
+        lead = detect_leading_silence(staged)
+        note = f"{info['container']} / {info['audioCodec']}, {info['duration'] / 60:.1f} min"
+        if lead >= 1.0:
+            note += f" · leading silence {lead:.0f}s (info only)"
+        _set_music_job(job_id, info=note, leadingSilence=round(lead, 1), duration=info["duration"])
+        log(f"drive-music job={job_id}: {note}")
+        # One demucs at a time (shared with History / Auto Music).
+        _set_music_job(job_id, status="queued", phase="wait",
+                       progress="Waiting for demucs (1 at a time)…")
+        while True:
+            _check_cancel(job_id)
+            if DEMUCS_SLOTS.acquire(timeout=0.5):
+                slot_held = True
+                break
+        _check_cancel(job_id)
+        _set_music_job(job_id, status="running", phase="demucs")
+        parts = chunked_demucs_no_vocals(job_id, staged, work, info["duration"], progress)
+        _check_cancel(job_id)
+        _set_music_job(job_id, phase="encode")
+        tmp_out = encode_joined_ogg(job_id, parts, work / "out.ogg", info["duration"], progress)
+        _check_cancel(job_id)
+        dest = Path(_job_get(job_id, "outputPath"))
+        if dest.exists() and not redo:
+            # Something else wrote the same -music name meanwhile — never clobber it.
+            stem = dest.stem
+            for n in range(2, 1000):
+                cand = dest.with_name(f"{stem}-{n}{dest.suffix}")
+                if not cand.exists():
+                    dest = cand
+                    break
+        progress("Saving…", 99)
+        atomic_publish(tmp_out, dest)
+        kept = None
+        if source == "link" and dl_path is not None:
+            if keep_source:
+                keep_dest = _unique_rec_path(dl_path.name.split("-", 1)[1])
+                os.replace(dl_path, keep_dest)
+                kept = keep_dest.name
+            else:
+                try:
+                    dl_path.unlink()
+                except OSError:
+                    pass
+        _record_drive_history({
+            "outputPath": str(dest),
+            "source": source,
+            "srcName": _job_get(job_id, "displayName"),
+            "srcPath": _job_get(job_id, "srcPath"),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "info": _job_get(job_id, "info"),
+            "keptSource": kept,
+        })
+        in_rec = os.path.dirname(os.path.realpath(str(dest))) == os.path.realpath(str(REC_DIR))
+        _set_music_job(
+            job_id, status="done", phase="done", progress="Done", progressPct=100,
+            outputPath=str(dest), outputName=dest.name,
+            outputUrl=("/api/download/" + urllib.parse.quote(dest.name)) if in_rec else None,
+            keptSourceName=kept, error=None, finishedAt=time.time(),
+        )
+        log(f"drive-music done job={job_id} out={dest}")
+    except _JobCancelled:
+        _finalize_cancelled_music_job(job_id)
+        log(f"drive-music cancelled job={job_id}")
+    except Exception as e:
+        msg = str(e) or type(e).__name__
+        log(f"drive-music error job={job_id}: {msg}")
+        _set_music_job(job_id, status="error", progress="Error", error=msg, finishedAt=time.time())
+    finally:
+        if slot_held:
+            try:
+                DEMUCS_SLOTS.release()
+            except Exception:
+                pass
+        if work is not None:
+            shutil.rmtree(work, ignore_errors=True)
+            _unregister_work_path(work)
+        if dl_path is not None:
+            _unregister_work_path(dl_path)
+            st = _job_get(job_id, "status")
+            # Downloaded source: delete unless Keep is on (then move it next to recordings).
+            try:
+                if dl_path.exists():
+                    if keep_source and st != "cancelled":
+                        os.replace(dl_path, _unique_rec_path(dl_path.name.split("-", 1)[1]))
+                    else:
+                        dl_path.unlink()
+            except OSError:
+                pass
+
+
+def _new_drive_job(name, display, source, **extra):
+    job_id = uuid.uuid4().hex[:12]
+    job = {
+        "jobId": job_id, "status": "queued", "progress": "Queued…", "progressPct": 0,
+        "error": None, "name": name, "displayName": display, "source": source,
+        "outputName": None, "outputUrl": None, "vocalsName": None, "vocalsUrl": None,
+        "startedAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    job.update(extra)
+    with MUSIC_JOBS_LOCK:
+        MUSIC_JOBS[job_id] = job
+    threading.Thread(target=drive_music_worker, args=(job_id,), daemon=True,
+                     name=f"drive-music-{job_id}").start()
+    return job_id
+
+
+def _drive_preflight():
+    if not which_ffmpeg():
+        return {"ok": False, "error": "ffmpeg not found — install ffmpeg"}, 400
+    if not demucs_available():
+        return {"ok": False, "error": "demucs not installed — pip install demucs (first run downloads models)",
+                "demucs": False}, 400
+    if disk_block_error():
+        free, _t = disk_usage_for_rec_dir()
+        return {"ok": False, "diskBlock": True,
+                "error": f"disk almost full ({(free or 0) / 1048576:.0f} MB free) — free space before Music only / Demucs"}, 507
+    return None
+
+
+def _inflight_job_for(name):
+    with MUSIC_JOBS_LOCK:
+        for jid, job in MUSIC_JOBS.items():
+            if job.get("name") == name and (job.get("status") or "") in ("queued", "running"):
+                return jid
+    return None
+
+
+def start_drive_music(body):
+    """POST /api/drive/music {paths:[...], redo, outMode} — Drive for Desktop files."""
+    body = body if isinstance(body, dict) else {}
+    paths = body.get("paths")
+    if isinstance(body.get("path"), str):
+        paths = [body.get("path")]
+    if not isinstance(paths, list) or not paths:
+        return {"ok": False, "error": "no files selected"}, 400
+    if len(paths) > 100:
+        return {"ok": False, "error": "too many files (max 100 per request)"}, 400
+    pre = _drive_preflight()
+    if pre:
+        return pre
+    redo = bool(body.get("redo"))
+    mode = _norm_out_mode(body.get("outMode"))
+    roots = detect_drive_roots()
+    if not roots:
+        return {"ok": False, "found": False, "error": "Google Drive for Desktop not found",
+                "installUrl": DRIVE_INSTALL_URL}, 404
+    started, skipped = [], []
+    for raw in paths:
+        real, _root, err = validate_drive_path(raw, roots)
+        if err:
+            skipped.append({"path": raw, "reason": err})
+            continue
+        name = os.path.basename(real)
+        if not os.path.isfile(real):
+            skipped.append({"path": real, "reason": "not a file"})
+            continue
+        if Path(name).suffix.lower() not in DRIVE_MEDIA_EXTS:
+            skipped.append({"path": real, "reason": "not an audio/video file"})
+            continue
+        if is_music_export_name(name):
+            skipped.append({"path": real, "reason": "already a -music / -vocals export"})
+            continue
+        dest = _drive_output_path(real, mode)
+        if mode != "recordings":
+            # Output folder must also stay inside Drive (e.g. a "Music only" symlink).
+            parent_real = os.path.realpath(str(dest.parent)) if dest.parent.exists() else os.path.realpath(os.path.dirname(real))
+            if not any(_path_within(parent_real, r["path"]) for r in roots):
+                skipped.append({"path": real, "reason": "output folder escapes Google Drive"})
+                continue
+        if dest.exists() and not redo:
+            skipped.append({"path": real, "reason": "already", "outputPath": str(dest)})
+            continue
+        key = "drive:" + real
+        jid = _inflight_job_for(key)
+        if jid:
+            skipped.append({"path": real, "reason": "already running", "jobId": jid})
+            continue
+        jid = _new_drive_job(key, name, "drive", srcPath=real, outputPath=str(dest),
+                             outMode=mode, redo=redo)
+        started.append({"path": real, "jobId": jid, "outputPath": str(dest)})
+        log(f"drive-music queued job={jid} src={real} out={dest} redo={redo}")
+    return {"ok": True, "started": started, "skipped": skipped}, 200
+
+
+def start_drive_fetch(body):
+    """POST /api/drive/fetch {url, keepSource, redo} — public Drive link."""
+    body = body if isinstance(body, dict) else {}
+    file_id, err = parse_drive_file_id(body.get("url"))
+    if err:
+        return {"ok": False, "error": err}, 400
+    pre = _drive_preflight()
+    if pre:
+        return pre
+    key = "link:" + file_id
+    jid = _inflight_job_for(key)
+    if jid:
+        return {"ok": True, "jobId": jid, "alreadyRunning": True, "fileId": file_id}, 200
+    jid = _new_drive_job(key, f"Drive file {file_id[:10]}…", "link", fileId=file_id,
+                         keepSource=bool(body.get("keepSource")), redo=bool(body.get("redo")),
+                         outMode="recordings")
+    log(f"drive-fetch queued job={jid} id={file_id}")
+    return {"ok": True, "jobId": jid, "fileId": file_id}, 200
+
+
+def cancel_drive_job(job_id):
+    """Cancel a Drive/link job in any phase (download, copy, demucs chunk, encode)."""
+    with MUSIC_JOBS_LOCK:
+        job = MUSIC_JOBS.get(job_id)
+        if not job or job.get("source") not in ("drive", "link"):
+            return False
+        if (job.get("status") or "") not in ("queued", "running"):
+            return False
+        job["cancelRequested"] = True
+        job["progress"] = "Cancelling…"
+        if (job.get("status") or "") == "queued" and job.get("phase") != "fetch":
+            job["status"] = "cancelled"
+            job["progress"] = "Cancelled"
+            job["finishedAt"] = time.time()
+        proc = DRIVE_JOB_PROCS.get(job_id)
+    if proc is not None:
+        try:
+            terminate_proc(proc)
+        except Exception:
+            pass
+    log(f"drive-music cancel requested job={job_id}")
+    return True
+
+
+def api_reveal(body):
+    """POST /api/reveal {name | path, mode: reveal|open} — Finder reveal / open with default app."""
+    body = body if isinstance(body, dict) else {}
+    mode = "open" if body.get("mode") == "open" else "reveal"
+    target = None
+    if body.get("name"):
+        target = resolve_download_path(body.get("name"))
+    elif body.get("path"):
+        raw = str(body.get("path"))
+        real, _root, err = validate_drive_path(raw)
+        if real is None and "\x00" not in raw and ".." not in Path(raw).parts:
+            # Also allow files directly under ~/TwitchRecordings by absolute path.
+            rp = os.path.realpath(raw)
+            if os.path.dirname(rp) == os.path.realpath(str(REC_DIR)):
+                real = rp
+        target = Path(real) if real else None
+    if target is None or not target.is_file():
+        return {"ok": False, "error": "file not found"}, 404
+    if mode == "open" and target.suffix.lower() not in DRIVE_MEDIA_EXTS:
+        return {"ok": False, "error": "only audio/video files can be opened"}, 400
+    if sys.platform == "darwin":
+        cmd = ["open", "-R", str(target)] if mode == "reveal" else ["open", str(target)]
+    elif os.name == "nt":
+        cmd = ["explorer", "/select," + str(target)] if mode == "reveal" else ["explorer", str(target)]
+    else:
+        opener = shutil.which("xdg-open")
+        if not opener:
+            return {"ok": False, "error": "no file opener on this system"}, 501
+        cmd = [opener, str(target.parent if mode == "reveal" else target)]
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        return {"ok": False, "error": f"could not open: {e}"}, 500
+    return {"ok": True, "mode": mode, "path": str(target)}, 200
+
+
+def cleanup_drive_temps(reason="startup"):
+    """Remove leftover .drive-tmp downloads and stale .*.partial-* files (never live ones)."""
+    removed = 0
+    freed = 0
+    try:
+        if DRIVE_TMP_DIR.is_dir():
+            for p in DRIVE_TMP_DIR.iterdir():
+                if _is_active_work_path(p):
+                    continue
+                try:
+                    sz = p.stat().st_size if p.is_file() else _dir_byte_size(p)
+                    if p.is_dir():
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        p.unlink()
+                    removed += 1
+                    freed += sz
+                except OSError:
+                    continue
+        now = time.time()
+        for p in REC_DIR.glob(".*.partial-*"):
+            try:
+                if now - p.stat().st_mtime > 3600:
+                    freed += p.stat().st_size
+                    p.unlink()
+                    removed += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+    if removed:
+        log(f"drive temp cleanup ({reason}): {removed} items, {freed} bytes")
+    return removed, freed
+
+
+
 def files_payload():
     REC_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK:
@@ -3377,6 +4743,9 @@ def files_payload():
     except OSError as e:
         return {"ok": False, "error": str(e), "files": []}
     for p in names:
+        # v6.35: hide dotfiles (.drive-history.json, .partial temps, .DS_Store)
+        if p.name.startswith("."):
+            continue
         try:
             if not p.is_file():
                 continue
@@ -3505,6 +4874,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/files":
             self.send_json(files_payload())
             return
+        if path.startswith("/api/drive/"):
+            # v6.35: Drive endpoints expose private file names — local pages only.
+            if not origin_allowed(self.headers.get("Origin")):
+                self.send_json({"ok": False, "error": "origin not allowed"}, status=403)
+                return
+            qs = urllib.parse.parse_qs(parsed.query)
+            if path == "/api/drive/status":
+                self.send_json(drive_status_payload())
+                return
+            if path == "/api/drive/list":
+                payload, status = drive_list_payload(
+                    (qs.get("path") or [""])[0], (qs.get("outMode") or ["subfolder"])[0]
+                )
+                self.send_json(payload, status=status)
+                return
+            if path == "/api/drive/history":
+                self.send_json(drive_history_payload())
+                return
         if path.startswith("/api/music-only/"):
             job_id = path[len("/api/music-only/") :]
             job_id = urllib.parse.unquote(job_id)
@@ -3603,6 +4990,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/delete":
             body = self.read_json()
             payload, status = api_delete_recordings(body if isinstance(body, dict) else {})
+            self.send_json(payload, status=status)
+            return
+        if path in ("/api/drive/music", "/api/drive/fetch", "/api/reveal"):
+            if not origin_allowed(self.headers.get("Origin")):
+                self.send_json({"ok": False, "error": "origin not allowed"}, status=403)
+                return
+            body = self.read_json()
+            if path == "/api/drive/music":
+                payload, status = start_drive_music(body)
+            elif path == "/api/drive/fetch":
+                payload, status = start_drive_fetch(body)
+            else:
+                payload, status = api_reveal(body)
             self.send_json(payload, status=status)
             return
         if path == "/api/music-only/cancel":
@@ -3707,6 +5107,11 @@ def main():
     log(f"seamless: {'ready' if ff else 'unavailable (install ffmpeg)'}")
     dm = which_demucs()
     log(f"demucs: {dm or 'NOT FOUND — pip install demucs (Music only)'}")
+    try:
+        _droots = detect_drive_roots()
+        log("google drive: " + (", ".join(r["path"] for r in _droots) if _droots else "Drive for Desktop not found (paste-a-link still works)"))
+    except Exception as e:
+        log(f"google drive detect failed: {e}")
     log(f"html: {html_path if html_path.is_file() else 'MISSING — ' + HTML_NAME + ' not next to this script'}")
     try:
         httpd.serve_forever()

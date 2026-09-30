@@ -63,6 +63,30 @@
   .music-progress-pct{font-size:.7rem;color:#c4b5fd;font-weight:700;min-width:2.5rem;text-align:right;font-variant-numeric:tabular-nums;}
   .music-progress-msg{font-size:.7rem;color:#a78bfa;max-width:14rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .hist-item .music-progress{margin-top:.3rem;max-width:100%;}
+  /* v6.35: Google Drive card */
+  .drive-badge{font-size:.68rem;padding:.12rem .5rem;border-radius:999px;border:1px solid #3a3a48;color:#9ca3af;}
+  .drive-badge.on{color:#86efac;border-color:#14532d;background:#052e16;}
+  .drive-crumbs{display:flex;align-items:center;gap:.3rem;flex-wrap:wrap;font-size:.78rem;margin:.55rem 0 .35rem;}
+  .drive-crumb{color:#c4b5fd;text-decoration:none;} .drive-crumb:hover{text-decoration:underline;} .drive-crumb.cur{color:#e5e7eb;font-weight:600;}
+  .drive-sep{color:#6b7280;}
+  .drive-list{max-height:18rem;overflow:auto;border:1px solid #31313a;border-radius:.6rem;background:#1b1b22;}
+  .drive-row{display:flex;align-items:center;gap:.5rem;padding:.4rem .6rem;border-bottom:1px solid #26262e;font-size:.8rem;cursor:pointer;margin:0;text-transform:none;letter-spacing:normal;font-weight:400;color:#e5e7eb;}
+  #driveCard label{text-transform:none;letter-spacing:normal;font-weight:400;}
+  .drive-row:last-child{border-bottom:none;} .drive-row:hover{background:#24242d;}
+  .drive-row input{accent-color:#a855f7;width:1rem;height:1rem;flex-shrink:0;}
+  .drive-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .drive-meta{color:#9ca3af;font-size:.7rem;white-space:nowrap;}
+  .drive-tag{font-size:.64rem;padding:.05rem .4rem;border-radius:999px;border:1px solid #3a3a48;color:#9ca3af;white-space:nowrap;}
+  .drive-tag.ok{color:#86efac;border-color:#14532d;} .drive-tag.run{color:#c4b5fd;border-color:#4c1d95;}
+  .drive-actions{display:flex;gap:.45rem;align-items:center;flex-wrap:wrap;margin-top:.5rem;}
+  .drive-link-row{display:flex;gap:.45rem;align-items:center;flex-wrap:wrap;margin-top:.4rem;}
+  .drive-link-row input[type=text]{flex:1;min-width:14rem;margin:0;}
+  .drive-jobs-head{display:flex;justify-content:space-between;align-items:center;margin:.75rem 0 .35rem;}
+  .drive-job{background:#1b1b22;border:1px solid #31313a;border-radius:.6rem;padding:.5rem .65rem;margin-bottom:.4rem;font-size:.78rem;}
+  .drive-job-top{display:flex;justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap;}
+  .drive-job-btns{display:flex;gap:.35rem;flex-wrap:wrap;}
+  .drive-job-sub{font-size:.7rem;color:#9ca3af;margin-top:.25rem;word-break:break-all;} .drive-job-sub.ok{color:#86efac;} .drive-job-sub.err{color:#fca5a5;word-break:normal;}
+  .drive-job .music-progress{max-width:100%;}
   .hist-actions{display:flex;flex-wrap:wrap;gap:.35rem;align-items:center;justify-content:flex-end;}
 
   a.btn{text-decoration:none;display:inline-flex;align-items:center;}
@@ -188,7 +212,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.34</span>
+    <span class="badge">v6.35</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -385,6 +409,38 @@
       <div id="demucsConvertHint" class="hint" style="display:none;color:#fca5a5;margin-top:.35rem">demucs not installed — <code>pip install demucs</code> (first run downloads models), then restart the helper.</div>
       <div id="musicUploadMeter" class="hidden" style="margin-top:.55rem"></div>
     </div>
+    <!-- v6.35: Google Drive → remove voice -->
+    <div class="upload-music-box" id="driveCard">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap;">
+        <strong style="font-size:.88rem">☁️ Google Drive → remove voice</strong>
+        <div style="display:flex;gap:.45rem;align-items:center;flex-wrap:wrap;">
+          <span id="driveBadge" class="drive-badge off">…</span>
+          <label style="font-size:.75rem;color:#9ca3af;display:flex;align-items:center;gap:.3rem;margin:0">Save to
+            <select id="driveOutMode" onchange="saveDriveOutMode()" style="font-size:.75rem;padding:.2rem .4rem;width:auto;margin:0">
+              <option value="subfolder">"Music only" subfolder</option>
+              <option value="sibling">Next to the source</option>
+              <option value="recordings">~/TwitchRecordings</option>
+            </select></label>
+          <button class="btn btn-gray btn-sm" onclick="driveRefresh()" title="Re-check Drive for Desktop">↻</button>
+        </div>
+      </div>
+      <div id="driveNotFound" class="hint hidden" style="color:#fbbf24">Google Drive for Desktop isn&#39;t installed (or signed in) on the helper&#39;s Mac, so there&#39;s no Drive folder to browse. <a href="https://www.google.com/drive/download/" target="_blank" rel="noopener" style="color:#bf94ff">Install Drive for Desktop</a>, sign in, then press ↻. Meanwhile you can paste a share link below.</div>
+      <div id="driveDesktopBody"></div>
+      <div class="hint">Pick files and press <strong>Remove voice</strong>: the helper copies each one locally, runs Demucs in 10-minute chunks (1 job at a time), and writes <code>&lt;name&gt;-music.ogg</code> back into Drive, where Drive for Desktop syncs it. Files that already have a <code>-music</code> file are skipped unless you tick Redo. The originals are never changed.</div>
+      <div style="border-top:1px solid #31313a;margin-top:.7rem;padding-top:.6rem">
+        <strong style="font-size:.8rem">🔗 Or paste a Drive link</strong>
+        <div class="drive-link-row">
+          <input type="text" id="driveLinkInput" placeholder="https://drive.google.com/file/d/…/view" onkeydown="if(event.key==='Enter')driveFetchLink()">
+          <button class="btn btn-purple btn-sm" onclick="driveFetchLink()">Download &amp; remove voice</button>
+        </div>
+        <div class="drive-link-row" style="font-size:.75rem;color:#9ca3af">
+          <label style="display:flex;align-items:center;gap:.3rem;margin:0"><input type="checkbox" id="driveKeepSource" onchange="saveDriveKeepSource()"> Keep the downloaded original in ~/TwitchRecordings</label>
+          <label style="display:flex;align-items:center;gap:.3rem;margin:0"><input type="checkbox" id="driveLinkRedo"> Redo</label>
+        </div>
+        <div class="hint">Works for files shared as &quot;Anyone with the link&quot;. Private files need Drive for Desktop. Output: <code>~/TwitchRecordings/&lt;name&gt;-music.ogg</code> (shows in History).</div>
+      </div>
+      <div id="driveJobs"></div>
+    </div>
     <div class="alert alert-info" style="margin-top:.35rem"><strong>Auto Music only</strong> (Recorder Settings toggle) builds <code>-music</code> / <code>-vocals</code> siblings during/after capture on finished segments. This tab&#39;s upload remains for arbitrary files. History rows still have <strong>Music only</strong> / <strong>Redo</strong> for disk files.</div>
   </div>
 
@@ -445,9 +501,9 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.34'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.35'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
-let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, homeStreamer:'', returnHomeAfterSet:true };
+let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false };
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
 let musicJobsNotified = new Set(); // jobIds already fireNotify'd for done/error (health spam safe)
@@ -572,7 +628,11 @@ function persist(){
       seamlessRecordings: cfg.seamlessRecordings!==false,
       autoMusicOnly: cfg.autoMusicOnly!==false,
       homeStreamer: String(cfg.homeStreamer||'').toLowerCase(),
-      returnHomeAfterSet: cfg.returnHomeAfterSet!==false
+      returnHomeAfterSet: cfg.returnHomeAfterSet!==false,
+      // v6.35: Google Drive card (same persist key)
+      driveLastPath: String(cfg.driveLastPath||''),
+      driveOutMode: cfg.driveOutMode||'subfolder',
+      driveKeepSource: !!cfg.driveKeepSource
     }));
   }catch(e){ console.warn('persist failed', e); }
 }
@@ -610,6 +670,10 @@ function restoreSettings(){
     cfg.homeStreamer=data.homeStreamer?String(data.homeStreamer).toLowerCase():'';
     if(typeof data.returnHomeAfterSet==='boolean') cfg.returnHomeAfterSet=data.returnHomeAfterSet;
     else cfg.returnHomeAfterSet=true;
+    // v6.35: Google Drive card
+    cfg.driveLastPath=typeof data.driveLastPath==='string'?data.driveLastPath:'';
+    cfg.driveOutMode=['subfolder','sibling','recordings'].indexOf(data.driveOutMode)>=0?data.driveOutMode:'subfolder';
+    cfg.driveKeepSource=data.driveKeepSource===true;
     if(Array.isArray(data.streamers)){
       restoredStreamerList=true; // even an empty list is user data — don't overwrite
       streamers=data.streamers.filter(s=>s&&s.username).map((s,i)=>makeStreamer(
@@ -715,6 +779,7 @@ function markHelperDown(wasOk){
   const pendingBan=document.getElementById('pendingRestartBanner');
   if(pendingBan){ pendingBan.classList.add('hidden'); pendingBan.innerHTML=''; }
   noticeHelperDropped(wasOk);
+  try{ driveState.status=null; driveState.loaded=false; renderDriveCard(); }catch(e){}
   updateHelperBar();
   updateDemucsUi();
   updateStatusUI();
@@ -808,6 +873,10 @@ function refreshMusicUploadMeterFromJobs(){
 // v6.19: merge helper.musicJobs from /api/health (Worker ticks survive background throttle + refresh).
 function applyMusicJobsFromHealth(jobs){
   if(!Array.isArray(jobs)) return;
+  // v6.35: Drive / link jobs render in the Convert → Google Drive card, not History rows.
+  const dj=jobs.filter(isDriveJob);
+  if(dj.length) applyDriveJobsFromHealth(dj);
+  jobs=jobs.filter(function(j){ return !isDriveJob(j); });
   let needRender=false;
   const finishNotify=[];
   for(let i=0;i<jobs.length;i++){
@@ -1316,6 +1385,7 @@ function pingHelperAndStatus(){
   renderStreamers();
   // Fresh connect / reconnect: merge disk files and immediately kick live Auto-Rec
   if(helper.ok && !wasOk){
+    driveRefresh().catch(function(){}); // v6.35
     const hadDrop=helperDropNotified;
     helperDropNotified=false;
     helperActiveOnDrop=[];
@@ -1535,6 +1605,7 @@ async function fetchHelperFiles(){
     if(!d || !d.ok || !Array.isArray(d.files)) return;
     mergeDiskFilesIntoHistory(d.files);
   }catch(e){}
+  await fetchDriveHistory(); // v6.35: Drive outputs (Open / Reveal in Finder)
 }
 function helperDownloadUrl(fOrName){
   if(!fOrName) return '';
@@ -3821,7 +3892,7 @@ function renderHist(){
         : '');
     const blobBtn=h.url
       ? `<button class="btn btn-purple btn-sm" onclick="reDl(${i})">💾</button>`
-      : ((!dl && !stillRec) ? `<button class="btn btn-gray btn-sm" onclick="reDl(${i})">💾</button>` : '');
+      : ((!dl && !stillRec && !h.drivePath) ? `<button class="btn btn-gray btn-sm" onclick="reDl(${i})">💾</button>` : '');
     let musicBtns='';
     let seamlessBtns='';
     if(diskish && !stillRec && h.name && !isMusicExportName(h.name)){
@@ -3899,12 +3970,20 @@ function renderHist(){
       // Drop stale selection for rows that are no longer eligible
       try{ histSelected.delete(h.name); }catch(e){}
     }
-    const mainInner=`<div><strong>${h.name}</strong><small>${h.dur} · ${h.size}${h.recovered?' · Recovered':''}${h.fromDisk?' · disk/helper':(h.helperFile?' · disk':'')}${rowNote}</small>${meterHtml}</div>`;
+    // v6.35: Open / Reveal in Finder for helper/disk files and Google Drive outputs
+    let revealBtns='';
+    if(helper.ok && !stillRec && (h.drivePath || (diskish && h.name))){
+      revealBtns=`<button class="btn btn-gray btn-sm" onclick="histReveal(${i},'open')" title="Open with the default app">Open</button>`
+        +`<button class="btn btn-gray btn-sm" onclick="histReveal(${i},'reveal')" title="Show the file in Finder">Reveal in Finder</button>`;
+    }
+    const shownName=String(h.displayName||h.name).replace(/&/g,'&amp;').replace(/</g,'&lt;');
+    const driveNote=h.drivePath?(' · <span style="color:#93c5fd" title="'+String(h.drivePath).replace(/"/g,'&quot;').replace(/</g,'&lt;')+'">'+(h.fromDisk?'from Drive link':'in Google Drive')+(h.driveSrc?(' (from '+String(h.driveSrc).replace(/</g,'&lt;')+')'):'')+'</span>'):'';
+    const mainInner=`<div><strong>${shownName}</strong><small>${h.dur} · ${h.size}${h.recovered?' · Recovered':''}${h.fromDisk?' · disk/helper':(h.helperFile?' · disk':'')}${rowNote}${driveNote}</small>${meterHtml}</div>`;
     const left=selBox?(`<div class="hist-sel-wrap">${selBox}${mainInner}</div>`):mainInner;
     return `
     <div class="hist-item">
       ${left}
-      <div class="hist-actions">${dlBtn}${seamlessBtns}${musicBtns}${blobBtn}${delBtn}</div>
+      <div class="hist-actions">${dlBtn}${seamlessBtns}${musicBtns}${revealBtns}${blobBtn}${delBtn}</div>
     </div>`;
   }).join('');
   try{ updateHistDeleteSelectedBtn(); }catch(e){}
@@ -4333,6 +4412,311 @@ async function deleteSelectedFromHist(){
 
 function clearHist(){recordings.forEach(h=>{try{if(h.url) URL.revokeObjectURL(h.url);}catch(e){}});recordings=[];musicJobs={};musicJobsNotified=new Set();autoMusicQueued=new Set();seamlessJobs={};seamlessJobsNotified=new Set();seamlessAutoStarted=new Set();diskFileIndex={};histSelected=new Set();renderHist();}
 
+// ─── v6.35: GOOGLE DRIVE → REMOVE VOICE ─────────────
+// Drive for Desktop browser (helper lists ~/Library/CloudStorage/GoogleDrive-*) + paste-a-link.
+// Jobs ride the same helper Music-only queue (1 demucs at a time); they arrive via /api/health
+// musicJobs with source 'drive' | 'link' and render in the Drive card instead of History rows.
+let driveState={status:null, loaded:false, loading:false, path:'', crumbs:[], dirs:[], files:[], selected:new Set(), err:''};
+let driveJobs={}; // jobId -> job snapshot (source drive|link)
+let driveJobsNotified=new Set();
+function driveEsc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+function driveMB(n){ return (typeof n==='number' && isFinite(n)) ? ((n/1048576)>=1024 ? (n/1073741824).toFixed(2)+' GB' : (n/1048576).toFixed(1)+' MB') : '—'; }
+function driveDate(t){ if(!t) return ''; try{ const d=new Date(t*1000); return d.toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'})+' '+d.toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'}); }catch(e){ return ''; } }
+function isDriveJob(j){ return !!(j && (j.source==='drive' || j.source==='link')); }
+function initDriveCard(){
+  const sel=document.getElementById('driveOutMode');
+  if(sel) sel.value=cfg.driveOutMode||'subfolder';
+  const keep=document.getElementById('driveKeepSource');
+  if(keep) keep.checked=!!cfg.driveKeepSource;
+  renderDriveCard();
+}
+function saveDriveOutMode(){
+  const sel=document.getElementById('driveOutMode');
+  cfg.driveOutMode=(sel && ['subfolder','sibling','recordings'].indexOf(sel.value)>=0)?sel.value:'subfolder';
+  persist();
+  if(driveState.status && driveState.status.found) driveOpen(driveState.path, true);
+}
+function saveDriveKeepSource(){
+  const keep=document.getElementById('driveKeepSource');
+  cfg.driveKeepSource=!!(keep && keep.checked);
+  persist();
+}
+async function driveRefresh(){
+  if(!helper.ok){ driveState.status=null; driveState.loaded=false; renderDriveCard(); return; }
+  try{
+    const d=await helperFetch('/api/drive/status', undefined, 4000);
+    if(!d || !d.ok){ driveState.status=null; driveState.err=(d&&d.error)||'Drive status unavailable (update the helper to v6.35)'; renderDriveCard(); return; }
+    driveState.status=d; driveState.err='';
+    if(d.found) await driveOpen(driveState.loaded?driveState.path:(cfg.driveLastPath||''), true);
+    else renderDriveCard();
+  }catch(e){
+    driveState.status=null; driveState.err='Drive status unavailable — is the helper v6.35+?';
+    renderDriveCard();
+  }
+}
+async function driveOpen(path, quiet){
+  if(!helper.ok) return;
+  driveState.loading=true; renderDriveCard();
+  try{
+    const q='/api/drive/list?path='+encodeURIComponent(path||'')+'&outMode='+encodeURIComponent(cfg.driveOutMode||'subfolder');
+    let d=await helperFetch(q, undefined, 15000);
+    if((!d || !d.ok) && path){
+      // Remembered folder gone / renamed — fall back to the Drive top level.
+      if(!quiet) flashErr('Drive: '+((d&&d.error)||'folder unavailable')+' — showing top level');
+      d=await helperFetch('/api/drive/list?path=&outMode='+encodeURIComponent(cfg.driveOutMode||'subfolder'), undefined, 15000);
+    }
+    if(!d || !d.ok){ driveState.err=(d&&d.error)||'Could not list Drive'; driveState.loading=false; renderDriveCard(); return; }
+    const changedFolder=driveState.path!==(d.path||'');
+    driveState.path=d.path||''; driveState.crumbs=d.crumbs||[]; driveState.dirs=d.dirs||[]; driveState.files=d.files||[];
+    driveState.loaded=true; driveState.err='';
+    if(changedFolder) driveState.selected=new Set();
+    else { const have=new Set(driveState.files.map(function(f){return f.path;})); Array.from(driveState.selected).forEach(function(p){ if(!have.has(p)) driveState.selected.delete(p); }); }
+    if(cfg.driveLastPath!==driveState.path){ cfg.driveLastPath=driveState.path; persist(); }
+  }catch(e){
+    driveState.err='Drive list failed: '+(e.message||e);
+  }
+  driveState.loading=false;
+  renderDriveCard();
+}
+function driveOpenIdx(kind, i){
+  const list=kind==='crumb'?driveState.crumbs:driveState.dirs;
+  const it=list[i]; if(!it) return;
+  driveOpen(it.path||'');
+}
+function driveToggle(i, el){
+  const f=driveState.files[i]; if(!f) return;
+  if(el.checked) driveState.selected.add(f.path); else driveState.selected.delete(f.path);
+  renderDriveActions();
+}
+function driveSelectAll(on){
+  driveState.selected=new Set();
+  if(on) driveState.files.forEach(function(f){ if(!f.isMusicExport && (!f.musicPath || driveRedoChecked())) driveState.selected.add(f.path); });
+  renderDriveCard();
+}
+function driveRedoChecked(){ const r=document.getElementById('driveRedo'); return !!(r && r.checked); }
+function driveOutLabel(){
+  const m=cfg.driveOutMode||'subfolder';
+  return m==='sibling'?'next to the source':(m==='recordings'?'~/TwitchRecordings':'a "Music only" subfolder');
+}
+function renderDriveActions(){
+  const btn=document.getElementById('driveRemoveBtn');
+  if(!btn) return;
+  const n=driveState.selected.size;
+  btn.disabled=!n || !helper.ok || !helper.demucs;
+  btn.textContent=n?('Remove voice ('+n+')'):'Remove voice';
+  btn.title=!helper.demucs?'demucs not installed on the helper':('Queue Music only for the selected files → '+driveOutLabel());
+}
+function renderDriveCard(){
+  const body=document.getElementById('driveDesktopBody');
+  const nf=document.getElementById('driveNotFound');
+  const badge=document.getElementById('driveBadge');
+  if(!body || !nf) return;
+  const st=driveState.status;
+  if(!helper.ok){
+    if(badge){ badge.textContent='helper offline'; badge.className='drive-badge off'; }
+    nf.classList.add('hidden');
+    body.innerHTML='<div class="hint">Start the local helper (127.0.0.1:8765) to browse Google Drive.</div>';
+    renderDriveJobs();
+    return;
+  }
+  if(!st){
+    if(badge){ badge.textContent='…'; badge.className='drive-badge off'; }
+    nf.classList.add('hidden');
+    body.innerHTML='<div class="hint">'+driveEsc(driveState.err||'Checking for Google Drive for Desktop…')+'</div>';
+    renderDriveJobs();
+    return;
+  }
+  if(!st.found){
+    if(badge){ badge.textContent='Drive for Desktop not found'; badge.className='drive-badge off'; }
+    nf.classList.remove('hidden');
+    body.innerHTML='';
+    renderDriveJobs();
+    return;
+  }
+  nf.classList.add('hidden');
+  if(badge){ badge.textContent='Drive for Desktop ✓'; badge.className='drive-badge on'; }
+  let html='<div class="drive-crumbs">';
+  html+=driveState.crumbs.map(function(c,i){
+    const last=i===driveState.crumbs.length-1;
+    return last?('<span class="drive-crumb cur">'+driveEsc(c.name)+'</span>'):('<a href="#" class="drive-crumb" onclick="driveOpenIdx(\'crumb\','+i+');return false;">'+driveEsc(c.name)+'</a><span class="drive-sep">›</span>');
+  }).join('');
+  html+='<button class="btn btn-gray btn-sm" style="margin-left:auto" onclick="driveOpen(driveState.path)" title="Refresh this folder">↻</button></div>';
+  html+='<div class="drive-list">';
+  if(driveState.loading && !driveState.loaded) html+='<div class="hint" style="padding:.5rem">Loading…</div>';
+  driveState.dirs.forEach(function(d,i){
+    html+='<div class="drive-row dir" onclick="driveOpenIdx(\'dir\','+i+')"><span class="drive-ico">📁</span><span class="drive-name">'+driveEsc(d.name)+'</span></div>';
+  });
+  driveState.files.forEach(function(f,i){
+    const checked=driveState.selected.has(f.path)?' checked':'';
+    const dis=f.isMusicExport?' disabled title="Already a -music / -vocals export"':'';
+    let tag='';
+    if(f.isMusicExport) tag='<span class="drive-tag">export</span>';
+    else if(f.musicPath) tag='<span class="drive-tag ok" title="'+driveEsc(f.musicPath)+'">✓ music</span>';
+    const running=Object.values(driveJobs).some(function(j){ return j.srcPath===f.path && (j.status==='queued'||j.status==='running'); });
+    if(running) tag+='<span class="drive-tag run">in queue</span>';
+    html+='<label class="drive-row file"><input type="checkbox" onchange="driveToggle('+i+',this)"'+checked+dis+'>'
+      +'<span class="drive-ico">🎧</span><span class="drive-name">'+driveEsc(f.name)+'</span>'+tag
+      +'<span class="drive-meta">'+driveMB(f.size)+' · '+driveEsc(driveDate(f.mtime))+'</span></label>';
+  });
+  if(driveState.loaded && !driveState.dirs.length && !driveState.files.length) html+='<div class="hint" style="padding:.5rem">No folders or audio/video files here.</div>';
+  html+='</div>';
+  if(driveState.err) html+='<div class="hint" style="color:#fca5a5">'+driveEsc(driveState.err)+'</div>';
+  html+='<div class="drive-actions">'
+    +'<button class="btn btn-gray btn-sm" onclick="driveSelectAll(true)">Select all</button>'
+    +'<button class="btn btn-gray btn-sm" onclick="driveSelectAll(false)">None</button>'
+    +'<label class="music-redo" title="Re-run even when a -music output already exists (replaced when the new one is ready)"><input type="checkbox" id="driveRedo"> Redo</label>'
+    +'<button class="btn btn-purple btn-sm" id="driveRemoveBtn" onclick="driveRemoveVoice()">Remove voice</button>'
+    +'</div>';
+  const redoWas=driveRedoChecked();
+  body.innerHTML=html;
+  const r=document.getElementById('driveRedo'); if(r) r.checked=redoWas;
+  renderDriveActions();
+  renderDriveJobs();
+}
+async function driveRemoveVoice(){
+  const paths=Array.from(driveState.selected);
+  if(!paths.length){ flashErr('Select one or more Drive files first.'); return; }
+  if(!helper.ok){ flashErr('Local helper not running.'); return; }
+  if(!helper.demucs){ flashErr('demucs not installed — '+demucsInstallMsg()); return; }
+  const redo=driveRedoChecked();
+  try{
+    const d=await helperFetch('/api/drive/music', {paths:paths, redo:redo, outMode:cfg.driveOutMode||'subfolder'}, 15000);
+    if(!d || !d.ok){ flashErr('Remove voice: '+((d&&d.error)||'failed to start')); return; }
+    const started=(d.started||[]).length;
+    const skipped=d.skipped||[];
+    const already=skipped.filter(function(s){return s.reason==='already';}).length;
+    const other=skipped.filter(function(s){return s.reason!=='already';});
+    let msg=started?('Remove voice queued for '+started+' file'+(started===1?'':'s')+' → '+driveOutLabel()+' (1 demucs at a time)'):'Nothing new queued';
+    if(already) msg+=' · '+already+' already have -music (check Redo to re-run)';
+    if(other.length) msg+=' · skipped '+other.length+': '+other.map(function(s){ return (String(s.path||'').split('/').pop())+' ('+s.reason+')'; }).join(', ');
+    (started?flashOk:flashErr)(driveEsc(msg));
+    (d.started||[]).forEach(function(s){ driveJobs[s.jobId]={jobId:s.jobId, source:'drive', srcPath:s.path, displayName:String(s.path).split('/').pop(), outputPath:s.outputPath, status:'queued', progress:'Queued…', progressPct:0}; });
+    driveState.selected=new Set();
+    renderDriveCard();
+  }catch(e){ flashErr('Remove voice failed: '+(e.message||e)); }
+}
+async function driveFetchLink(){
+  const inp=document.getElementById('driveLinkInput');
+  const url=(inp&&inp.value||'').trim();
+  if(!url){ flashErr('Paste a Google Drive file link first.'); return; }
+  if(!helper.ok){ flashErr('Local helper not running.'); return; }
+  if(!helper.demucs){ flashErr('demucs not installed — '+demucsInstallMsg()); return; }
+  const keep=!!(document.getElementById('driveKeepSource')||{}).checked;
+  const redo=!!(document.getElementById('driveLinkRedo')||{}).checked;
+  try{
+    const d=await helperFetch('/api/drive/fetch', {url:url, keepSource:keep, redo:redo}, 15000);
+    if(!d || !d.ok){ flashErr('Drive link: '+driveEsc((d&&d.error)||'failed')); return; }
+    driveJobs[d.jobId]=Object.assign(driveJobs[d.jobId]||{}, {jobId:d.jobId, source:'link', fileId:d.fileId, displayName:'Drive file '+String(d.fileId||'').slice(0,10)+'…', status:'running', progress:d.alreadyRunning?'Already running…':'Contacting Google Drive…', progressPct:0});
+    flashOk(d.alreadyRunning?'That Drive file is already in the queue.':'Downloading from Drive, then removing voice → ~/TwitchRecordings');
+    if(inp) inp.value='';
+    renderDriveJobs();
+  }catch(e){ flashErr('Drive link failed: '+(e.message||e)); }
+}
+async function driveCancel(jobId){
+  if(!jobId || !helper.ok) return;
+  try{
+    const d=await helperFetch('/api/music-only/cancel', {jobId:String(jobId)}, 8000);
+    if(d && d.ok && (d.cancelled||[]).length){
+      if(driveJobs[jobId]) driveJobs[jobId]=Object.assign({}, driveJobs[jobId], {progress:'Cancelling…'});
+      flashOk('Cancelling…');
+    }else flashErr('Nothing cancelled — '+((d&&d.skipped&&d.skipped[0]&&d.skipped[0].reason)||(d&&d.error)||'not active'));
+    renderDriveJobs();
+  }catch(e){ flashErr('Cancel failed: '+(e.message||e)); }
+}
+async function helperReveal(body, mode){
+  if(!helper.ok){ flashErr('Local helper not running.'); return; }
+  try{
+    const d=await helperFetch('/api/reveal', Object.assign({}, body, {mode:mode==='open'?'open':'reveal'}), 6000);
+    if(!d || !d.ok) flashErr((mode==='open'?'Open':'Reveal')+' failed: '+driveEsc((d&&d.error)||'unknown'));
+  }catch(e){ flashErr('Reveal failed: '+(e.message||e)); }
+}
+function driveRevealJob(jobId, mode){
+  const j=driveJobs[jobId]; if(!j || !j.outputPath) return;
+  helperReveal({path:j.outputPath}, mode);
+}
+function histReveal(i, mode){
+  const r=recordings[i]; if(!r) return;
+  if(r.drivePath) helperReveal({path:r.drivePath}, mode);
+  else if(r.name) helperReveal({name:r.name}, mode);
+}
+function driveClearFinished(){
+  Object.keys(driveJobs).forEach(function(id){ const s=driveJobs[id].status; if(s==='done'||s==='error'||s==='cancelled'){ driveJobs[id].hidden=true; } });
+  renderDriveJobs();
+}
+function renderDriveJobs(){
+  const el=document.getElementById('driveJobs');
+  if(!el) return;
+  const jobs=Object.values(driveJobs).filter(function(j){ return !j.hidden; });
+  if(!jobs.length){ el.innerHTML=''; return; }
+  jobs.sort(function(a,b){ return String(b.startedAt||'').localeCompare(String(a.startedAt||'')); });
+  let html='<div class="drive-jobs-head"><strong style="font-size:.8rem">Drive jobs</strong><button class="btn btn-gray btn-sm" onclick="driveClearFinished()">Clear finished</button></div>';
+  html+=jobs.map(function(j){
+    const st=j.status||'';
+    const id=String(j.jobId).replace(/[^a-zA-Z0-9_-]/g,'');
+    const active=st==='queued'||st==='running';
+    const src=j.source==='link'?'🔗':'☁️';
+    let line='<div class="drive-job"><div class="drive-job-top"><span>'+src+' <strong>'+driveEsc(j.displayName||j.name||j.jobId)+'</strong></span><span class="drive-job-btns">';
+    if(active) line+='<button class="btn btn-gray btn-sm" onclick="driveCancel(\''+id+'\')">Cancel</button>';
+    if(st==='done' && j.outputPath) line+='<button class="btn btn-purple btn-sm" onclick="driveRevealJob(\''+id+'\',\'open\')">Open</button><button class="btn btn-gray btn-sm" onclick="driveRevealJob(\''+id+'\',\'reveal\')">Reveal in Finder</button>';
+    line+='</span></div>';
+    if(active) line+=musicProgressHtml(j, {fallback:'Working…'});
+    else if(st==='done') line+='<div class="drive-job-sub ok">✓ '+driveEsc(j.already?'Already had music: ':'Saved: ')+driveEsc(j.outputPath||j.outputName||'')+(j.keptSourceName?' · source kept as '+driveEsc(j.keptSourceName):'')+'</div>';
+    else if(st==='error') line+='<div class="drive-job-sub err">✗ '+driveEsc(j.error||'error')+'</div>';
+    else if(st==='cancelled') line+='<div class="drive-job-sub">Cancelled</div>';
+    if(j.info) line+='<div class="drive-job-sub">'+driveEsc(j.info)+'</div>';
+    return line+'</div>';
+  }).join('');
+  el.innerHTML=html;
+}
+function applyDriveJobsFromHealth(jobs){
+  let changed=false, anyDone=false;
+  jobs.forEach(function(j){
+    const prev=driveJobs[j.jobId];
+    const next=Object.assign({}, prev||{}, j);
+    if(!prev || prev.status!==j.status || prev.progress!==j.progress || String(prev.progressPct)!==String(j.progressPct) || prev.info!==j.info || prev.displayName!==j.displayName){ changed=true; }
+    driveJobs[j.jobId]=next;
+    const st=j.status;
+    if((st==='done'||st==='error') && !driveJobsNotified.has(j.jobId)){
+      driveJobsNotified.add(j.jobId);
+      if(prev && (prev.status==='done'||prev.status==='error')) return; // seen before page refresh? stay quiet
+      if(st==='done'){
+        anyDone=true;
+        flashOk('Voice removed: '+driveEsc(j.outputName||j.displayName||'done'));
+        fireNotify('tar-drive-'+j.jobId, 'Voice removed', j.outputPath||j.outputName||'');
+      }else{
+        flashErr('Remove voice failed ('+driveEsc(j.displayName||'')+'): '+driveEsc(j.error||'unknown'));
+        fireNotify('tar-drive-'+j.jobId, 'Remove voice failed', j.error||'');
+      }
+    }else if(st==='cancelled') driveJobsNotified.add(j.jobId);
+  });
+  if(changed) renderDriveJobs();
+  if(anyDone){
+    fetchHelperFiles().catch(function(){});
+    if(driveState.loaded && document.getElementById('convert').classList.contains('active')) driveOpen(driveState.path, true);
+  }
+}
+function mergeDriveHistory(items){
+  (items||[]).forEach(function(it){
+    if(!it || !it.outputPath) return;
+    const inRec=!!it.inRecordings;
+    const key=inRec?it.outputName:('drive:'+it.outputPath);
+    const size=((it.size||0)/1048576).toFixed(2)+' MB';
+    const label=(it.source==='link'?'Drive link':'Google Drive')+' · voice removed';
+    const r=recordings.find(function(x){ return x && (x.name===key || (x.drivePath && x.drivePath===it.outputPath)); });
+    if(r){ r.size=size; r.drivePath=it.outputPath; r.driveSrc=it.srcName||''; r.dur=label; return; }
+    recordings.push({name:key, displayName:it.outputName, dur:label, size:size, url:null,
+      downloadUrl:inRec?helperDownloadUrl(it.outputName):null, helperFile:inRec?it.outputPath:null,
+      fromDisk:inRec, drivePath:it.outputPath, driveSrc:it.srcName||'', mtime:it.mtime||0});
+  });
+}
+async function fetchDriveHistory(){
+  if(!helper.ok) return;
+  try{
+    const d=await helperFetch('/api/drive/history', undefined, 4000);
+    if(d && d.ok && Array.isArray(d.items)){ mergeDriveHistory(d.items); renderHist(); }
+  }catch(e){}
+}
+
 // ─── UI HELPERS ──────────────────────────────────────
 function switchTab(el,id){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -4340,6 +4724,7 @@ function switchTab(el,id){
   el.classList.add('active');document.getElementById(id).classList.add('active');
   if(id==='hist'){ renderHist(); if(helper.ok) fetchHelperFiles().catch(function(){}); }
   if(id==='sched'&&connected)loadSchedule();
+  if(id==='convert' && helper.ok) driveRefresh().catch(function(){}); // v6.35
   if(id==='streamers')renderStreamers();
 }
 function setApiDot(state,msg){
@@ -4472,6 +4857,7 @@ initFormats();
 initHelperQuality();
 initSeamlessToggle();
 initAutoMusicOnlyToggle();
+initDriveCard();
 updateHomeStreamerUI();
 renderStreamers();
 renderHist();

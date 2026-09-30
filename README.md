@@ -2,7 +2,7 @@
 
 Local multi-streamer Twitch recorder (**HTML UI** + **Python streamlink helper**) with seamless segment joins, Music only (Demucs), Auto Music only, and Convert upload.
 
-**Current version:** 6.31 — Arm can auto-unmute the streamer's Twitch tab via the optional **Unmute add-on** (`extension/`). Helper recordings and Music only exports are **OGG** (not MP4/MP3). See badge in `twitch-auto-recorder.html` / `HELPER_VERSION` in `twitch-recorder-server.py` (also `VERSION`).
+**Current version:** 6.35 — Convert tab can remove the voiceover from Google Drive recordings (browse Drive for Desktop, or paste a public Drive link) and write `<name>-music.ogg` back to Drive. v6.31 added the optional **Unmute add-on** (`extension/`). Helper recordings and Music only exports are **OGG** (not MP4/MP3). See badge in `twitch-auto-recorder.html` / `HELPER_VERSION` in `twitch-recorder-server.py` (also `VERSION`).
 
 ## Open the app (any browser)
 
