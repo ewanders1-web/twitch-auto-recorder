@@ -17,7 +17,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.35"
+HELPER_VERSION = "6.36"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -177,6 +177,11 @@ def remember_session_segments(username, segments):
     if not segs:
         return
     RECENT_SESSIONS[username] = {"segments": list(segs), "at": time.time()}
+    # v6.36: recording finalized → remove voice → split → send to Drive (if enabled)
+    try:
+        _on_session_finalized(username, segs)
+    except Exception as e:
+        log(f"pipeline trigger failed for {username}: {e}")
 
 
 def prune_recent_sessions():
@@ -612,7 +617,7 @@ def maybe_cleanup_orphan_temps_on_diskwarn(disk):
         return None
     _ORPHAN_DISKWARN_DONE = True
     try:
-        payload, _status = cancel_music_only({"waiting": True})
+        payload, _status = cancel_music_only({"waiting": True, "keepPipeline": True})
         cancelled = (payload or {}).get("cancelled") or []
         if cancelled:
             log(
@@ -1692,9 +1697,15 @@ def music_job_snapshot(job):
 
 
 def _drive_job_extra(job):
-    if job.get("source") not in ("drive", "link"):
+    if job.get("source") not in ("drive", "link", "pipeline", "split"):
         return {}
     return {
+        "segments": job.get("segments"),
+        "base": job.get("base"),
+        "partsCount": job.get("partsCount"),
+        "partSecs": job.get("partSecs"),
+        "deliveryStatus": job.get("deliveryStatus"),
+        "musicName": job.get("musicName"),
         "source": job.get("source"),
         "displayName": job.get("displayName"),
         "srcPath": job.get("srcPath"),
@@ -1783,6 +1794,8 @@ def pending_restart_needed():
 def music_jobs_busy():
     """True if any demucs Music only job is queued or running."""
     info = music_demucs_queue_info()
+    if DELIVERY_STATE.get("busy"):  # v6.36: mid-copy into Drive
+        return True
     return (int(info.get("running") or 0) > 0) or (int(info.get("waiting") or 0) > 0)
 
 
@@ -2047,6 +2060,19 @@ def apply_update():
 
 
 
+def _pipeline_health_summary():
+    with PIPELINE_LOCK:
+        dels = list(PIPELINE["deliveries"].values())
+        enabled = bool(PIPELINE["enabled"])
+    return {
+        "enabled": enabled,
+        "waiting": sum(1 for d in dels if d.get("status") == "waiting"),
+        "errors": sum(1 for d in dels if d.get("status") == "error"),
+        "sending": bool(DELIVERY_STATE.get("busy")),
+        "driveFound": bool(detect_drive_roots()),
+    }
+
+
 def health_payload():
     with LOCK:
         reap_locked()
@@ -2085,6 +2111,9 @@ def health_payload():
         "diskWarn": disk["diskWarn"],
         "diskBlock": disk["diskBlock"],
         "musicJobs": music_jobs_for_health(),
+        # v6.36: after-stream → Drive delivery state
+        "drivePipeline": _pipeline_health_summary(),
+        "driveDeliveries": deliveries_snapshot(40),
         "musicDemucsQueue": music_demucs_queue_info(),
         "seamlessJobs": seamless_jobs_for_health(),
         "updateRepo": f"https://github.com/{UPDATE_REPO}",
@@ -2714,7 +2743,10 @@ def start_music_only(raw_name, redo=False):
     # Reuse in-flight job for the same native file (refresh / double-click).
     with MUSIC_JOBS_LOCK:
         for jid, job in MUSIC_JOBS.items():
-            if (job.get("name") or "") == target.name and (job.get("status") or "") in (
+            if (
+                (job.get("name") or "") == target.name
+                or target.name in (job.get("segments") or [])  # v6.36 stream pipeline covers it
+            ) and (job.get("status") or "") in (
                 "queued",
                 "running",
             ):
@@ -2864,10 +2896,12 @@ def cancel_music_only(body):
 
     with MUSIC_JOBS_LOCK:
         if waiting_all:
+            keep_pipe = bool(body.get("keepPipeline"))  # v6.36: auto pipeline pauses instead
             targets = [
                 jid
                 for jid, job in MUSIC_JOBS.items()
                 if (job.get("status") or "") == "queued"
+                and not (keep_pipe and job.get("source") == "pipeline")
             ]
         else:
             job_id = str(job_id).strip()
@@ -4090,7 +4124,9 @@ def _wait_disk_ok(job_id, progress):
 
 
 def chunked_demucs_no_vocals(job_id, src, work, duration, progress, pct_lo=20.0, pct_hi=90.0):
-    """Split src into ~DEMUCS_CHUNK_SECS FLAC chunks, demucs each, return ordered no_vocals list."""
+    """Split src (a path or list of paths, in order) into ~DEMUCS_CHUNK_SECS FLAC chunks,
+    demucs each, return ordered no_vocals list."""
+    srcs = list(src) if isinstance(src, (list, tuple)) else [src]
     ff = which_ffmpeg()
     if not ff:
         raise RuntimeError("ffmpeg not found")
@@ -4101,17 +4137,18 @@ def chunked_demucs_no_vocals(job_id, src, work, duration, progress, pct_lo=20.0,
         d.mkdir(parents=True, exist_ok=True)
     est = max(1, int((duration or 0) // DEMUCS_CHUNK_SECS) + (1 if (duration or 0) % DEMUCS_CHUNK_SECS else 0))
     progress(f"Splitting into {DEMUCS_CHUNK_SECS // 60 or 1}-min chunks (~{est})…", pct_lo - 2)
-    rc, tail = _job_run_proc(
-        job_id,
-        [ff, "-nostdin", "-v", "error", "-y", "-i", str(src), "-vn", "-map", "0:a:0",
-         "-ac", "2", "-ar", "44100", "-c:a", "flac", "-f", "segment",
-         "-segment_time", str(DEMUCS_CHUNK_SECS), "-reset_timestamps", "1",
-         str(chunks_dir / "c%04d.flac")],
-        timeout=3 * 3600,
-    )
-    if rc != 0:
-        raise RuntimeError(f"ffmpeg split failed: {tail[-400:]}")
-    chunks = sorted(chunks_dir.glob("c*.flac"))
+    for si, one in enumerate(srcs):
+        rc, tail = _job_run_proc(
+            job_id,
+            [ff, "-nostdin", "-v", "error", "-y", "-i", str(one), "-vn", "-map", "0:a:0",
+             "-ac", "2", "-ar", "44100", "-c:a", "flac", "-f", "segment",
+             "-segment_time", str(DEMUCS_CHUNK_SECS), "-reset_timestamps", "1",
+             str(chunks_dir / f"s{si:03d}c%04d.flac")],
+            timeout=3 * 3600,
+        )
+        if rc != 0:
+            raise RuntimeError(f"ffmpeg split failed: {tail[-400:]}")
+    chunks = sorted(chunks_dir.glob("s*c*.flac"))
     if not chunks:
         raise RuntimeError("ffmpeg split produced no chunks")
     n = len(chunks)
@@ -4173,7 +4210,7 @@ def chunked_demucs_no_vocals(job_id, src, work, duration, progress, pct_lo=20.0,
     return outs
 
 
-def encode_joined_ogg(job_id, parts, out_path, duration, progress, pct_lo=90.0, pct_hi=99.0):
+def encode_joined_ogg(job_id, parts, out_path, duration, progress, pct_lo=90.0, pct_hi=99.0, codec_args=None):
     """Concat no_vocals parts in order → OGG (libvorbis q5, fallback libopus)."""
     ff = which_ffmpeg()
     lst = Path(out_path).with_suffix(".txt")
@@ -4192,7 +4229,9 @@ def encode_joined_ogg(job_id, parts, out_path, duration, progress, pct_lo=90.0, 
             progress(f"Encoding OGG · {frac * 100:.0f}%", round(pct_lo + (pct_hi - pct_lo) * frac, 1))
 
     last = ""
-    for args in (["-c:a", "libvorbis", "-q:a", "5"], ["-c:a", "libopus", "-b:a", "128k"]):
+    choices = [list(codec_args)] if codec_args else []
+    choices += [["-c:a", "libvorbis", "-q:a", "5"], ["-c:a", "libopus", "-b:a", "128k"]]
+    for args in choices:
         progress("Encoding OGG…", pct_lo)
         rc, tail = _job_run_proc(
             job_id,
@@ -4670,6 +4709,8 @@ def api_reveal(body):
             rp = os.path.realpath(raw)
             if os.path.dirname(rp) == os.path.realpath(str(REC_DIR)):
                 real = rp
+            elif _path_within(rp, os.path.realpath(str(DRIVE_PARTS_DIR))):
+                real = rp  # v6.36: split parts
         target = Path(real) if real else None
     if target is None or not target.is_file():
         return {"ok": False, "error": "file not found"}, 404
@@ -4725,6 +4766,638 @@ def cleanup_drive_temps(reason="startup"):
     if removed:
         log(f"drive temp cleanup ({reason}): {removed} items, {freed} bytes")
     return removed, freed
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v6.36: After stream ends → remove voice → split (<50 MB parts) → send to Drive
+#   * Triggered server-side when a recording session finalizes (stop / give-up /
+#     supervisor exit), so it works even if the recorder page is closed.
+#   * Same Music-only queue + chunked Demucs as v6.35 (one demucs at a time).
+#   * Parts: ~/TwitchRecordings/Drive parts/<base>/<base>-music-partNofM.ogg
+#   * Delivery: atomic copy into a Drive for Desktop folder; "Waiting for Drive"
+#     until Drive appears (checked periodically), then sent automatically.
+# ─────────────────────────────────────────────────────────────────────────────
+import math as _math_pipe
+
+PART_TARGET_BYTES = int(os.environ.get("TWITCH_RECORDER_PART_TARGET_BYTES") or 45 * 1000 * 1000)
+PART_MAX_BYTES = int(os.environ.get("TWITCH_RECORDER_PART_MAX_BYTES") or 50 * 1000 * 1000)
+PART_MIN_SECS = float(os.environ.get("TWITCH_RECORDER_PART_MIN_SECS") or 600)
+DELIVERY_POLL_SECS = max(2, int(os.environ.get("TWITCH_RECORDER_DELIVERY_SECS") or 60))
+DELIVERY_ERROR_RETRY_SECS = 300
+PIPELINE_START_DELAY_SECS = float(os.environ.get("TWITCH_RECORDER_PIPELINE_DELAY") or 3)
+DRIVE_PARTS_DIR = REC_DIR / "Drive parts"
+PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
+PIPELINE_LOCK = threading.RLock()
+PIPELINE = {"enabled": True, "users": {}, "target": "", "deliveries": {}}
+DELIVERY_WAKE = threading.Event()
+DELIVERY_STATE = {"busy": False, "force": set()}
+PIPELINE_SEEN = set()  # first-segment basenames already queued by this process
+MUSIC_OGG_ARGS = ["-c:a", "libvorbis", "-q:a", "6", "-ar", "44100", "-ac", "2"]
+AUTO_TARGET_NAMES = ("twitch", "twitchrecordings", "twitch recordings", "twitch-recordings")
+DEFAULT_TARGET_REL = ("Twitch Recordings", "Music only")
+
+
+def _pipeline_load():
+    try:
+        data = json.loads(PIPELINE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    with PIPELINE_LOCK:
+        PIPELINE["enabled"] = data.get("enabled") is not False
+        users = data.get("users") if isinstance(data.get("users"), dict) else {}
+        PIPELINE["users"] = {str(k).lower(): bool(v) for k, v in users.items()}
+        PIPELINE["target"] = data.get("target") if isinstance(data.get("target"), str) else ""
+        dels = data.get("deliveries") if isinstance(data.get("deliveries"), dict) else {}
+        for d in dels.values():
+            if isinstance(d, dict) and d.get("status") == "sending":
+                d["status"] = "waiting"  # helper stopped mid-copy — retry
+        PIPELINE["deliveries"] = {k: v for k, v in dels.items() if isinstance(v, dict)}
+
+
+def _pipeline_save():
+    with PIPELINE_LOCK:
+        blob = json.dumps(PIPELINE, indent=1).encode("utf-8")
+    try:
+        REC_DIR.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(PIPELINE_FILE, blob)
+    except Exception as e:
+        log(f"pipeline state write failed: {e}")
+
+
+def pipeline_enabled_for(username):
+    u = (username or "").lower()
+    with PIPELINE_LOCK:
+        return bool(PIPELINE["enabled"]) and bool(PIPELINE["users"].get(u, True))
+
+
+def set_pipeline_user_pref(username, on):
+    u = safe_username(username) if username else None
+    if not u:
+        return
+    with PIPELINE_LOCK:
+        if PIPELINE["users"].get(u) == bool(on):
+            return
+        PIPELINE["users"][u] = bool(on)
+    _pipeline_save()
+
+
+def plan_split(size_bytes, duration):
+    """Equal parts: count = ceil(size / 45 MB), capped so parts stay >= PART_MIN_SECS
+    unless that would push a part over PART_MAX_BYTES (50 MB is the hard limit)."""
+    try:
+        size_bytes = float(size_bytes or 0)
+        duration = float(duration or 0)
+    except (TypeError, ValueError):
+        return 1
+    if size_bytes <= 0:
+        return 1
+    m = max(1, int(_math_pipe.ceil(size_bytes / PART_TARGET_BYTES)))
+    if duration > 0 and PART_MIN_SECS > 0:
+        cap = max(1, int(duration // PART_MIN_SECS))
+        if m > cap and (size_bytes / cap) < PART_MAX_BYTES:
+            m = cap
+    return m
+
+
+def _part_name(base, i, n):
+    return f"{base}-music-part{i}of{n}.ogg"
+
+
+def split_music_for_drive(job_id, src, progress=None):
+    """Cut a -music file into equal-length parts (<50 MB). Returns (parts_dir, [names], part_secs)."""
+    src = Path(src)
+    ff = which_ffmpeg()
+    if not ff:
+        raise RuntimeError("ffmpeg not found")
+    info = probe_media(src)
+    dur = float(info["duration"] or 0)
+    size = os.stat(src).st_size
+    base = music_base_stem(src.name)
+    copy_ok = info["audioCodec"] == "vorbis" and "ogg" in (info["container"] or "")
+    codec_args = ["-c", "copy"] if copy_ok else MUSIC_OGG_ARGS
+    DRIVE_PARTS_DIR.mkdir(parents=True, exist_ok=True)
+    m = plan_split(size, dur)
+    for attempt in range(6):
+        if progress:
+            progress(f"Splitting into {m} part{'s' if m != 1 else ''} (~{dur / max(1, m) / 60:.0f} min each)…", None)
+        tmp = DRIVE_PARTS_DIR / f".{base}.splitting-{uuid.uuid4().hex[:6]}"
+        tmp.mkdir(parents=True)
+        _register_work_path(tmp)
+        try:
+            cmd = [ff, "-nostdin", "-v", "error", "-y", "-i", str(src), "-map", "0:a:0", "-vn", *codec_args]
+            if m > 1:
+                times = ",".join(f"{dur * i / m:.3f}" for i in range(1, m))
+                cmd += ["-f", "segment", "-segment_format", "ogg", "-segment_times", times,
+                        "-reset_timestamps", "1", "-segment_start_number", "1", str(tmp / "p%03d.ogg")]
+            else:
+                cmd += ["-f", "ogg", str(tmp / "p001.ogg")]
+            if job_id:
+                rc, tail = _job_run_proc(job_id, cmd, timeout=3 * 3600)
+            else:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=3 * 3600)
+                rc, tail = r.returncode, (r.stderr or "")
+            if rc != 0:
+                raise RuntimeError(f"ffmpeg split failed: {tail[-400:]}")
+            parts = sorted(p for p in tmp.glob("p*.ogg") if p.stat().st_size > 0)
+            if not parts:
+                raise RuntimeError("ffmpeg split produced no parts")
+            biggest = max(p.stat().st_size for p in parts)
+            if biggest >= PART_MAX_BYTES and attempt < 5:
+                m += 1
+                shutil.rmtree(tmp, ignore_errors=True)
+                continue
+            n = len(parts)
+            names = []
+            for i, p in enumerate(parts, 1):
+                nm = _part_name(base, i, n)
+                os.replace(p, tmp / nm)
+                names.append(nm)
+            out_dir = DRIVE_PARTS_DIR / base
+            if out_dir.exists():
+                shutil.rmtree(out_dir, ignore_errors=True)
+            os.replace(tmp, out_dir)
+            return out_dir, names, (dur / n if n else dur)
+        finally:
+            _unregister_work_path(tmp)
+            if tmp.exists():
+                shutil.rmtree(tmp, ignore_errors=True)
+    raise RuntimeError("could not split under the size limit")
+
+
+def atomic_copy(src, dest):
+    """Copy src → dest via a temp file in dest's folder + rename (source is kept)."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.parent / f".{dest.name}.partial-{uuid.uuid4().hex[:6]}"
+    try:
+        with open(src, "rb") as fin, open(part, "wb") as fout:
+            shutil.copyfileobj(fin, fout, length=4 * 1024 * 1024)
+            fout.flush()
+            os.fsync(fout.fileno())
+        os.replace(part, dest)
+    finally:
+        try:
+            if part.exists():
+                part.unlink()
+        except OSError:
+            pass
+    return dest
+
+
+def _my_drive_dir(root):
+    for sc in root.get("shortcuts") or []:
+        if sc.get("label") == "My Drive":
+            return sc["path"]
+    return root["path"]
+
+
+def resolve_delivery_target(roots=None, create=False):
+    """Configured target, else an existing My Drive folder named like the recordings
+    folder ("Twitch", "TwitchRecordings", …), else My Drive/Twitch Recordings/Music only."""
+    if roots is None:
+        roots = detect_drive_roots()
+    if not roots:
+        return None, "auto", "Google Drive for Desktop not found"
+    with PIPELINE_LOCK:
+        configured = PIPELINE.get("target") or ""
+    if configured:
+        real, _root, err = validate_drive_path(configured, roots)
+        if err:
+            return None, "configured", f"target folder: {err}"
+        if create:
+            os.makedirs(real, exist_ok=True)
+        return real, "configured", None
+    for r in roots:
+        md = _my_drive_dir(r)
+        try:
+            for entry in sorted(os.scandir(md), key=lambda e: e.name.lower()):
+                if entry.name.lower() in AUTO_TARGET_NAMES and entry.is_dir(follow_symlinks=True):
+                    real = os.path.realpath(entry.path)
+                    if any(_path_within(real, rr["path"]) for rr in roots):
+                        return real, "auto", None
+        except OSError:
+            continue
+    target = os.path.join(_my_drive_dir(roots[0]), *DEFAULT_TARGET_REL)
+    if create:
+        os.makedirs(target, exist_ok=True)
+        target = os.path.realpath(target)
+        if not any(_path_within(target, rr["path"]) for rr in roots):
+            return None, "auto", "default target escapes Google Drive"
+    return target, "auto-default", None
+
+
+def _delivery_update(base, **kw):
+    with PIPELINE_LOCK:
+        d = PIPELINE["deliveries"].get(base)
+        if d is None:
+            return None
+        d.update(kw)
+        d["updatedAt"] = time.time()
+        snap = dict(d)
+    _pipeline_save()
+    if "status" in kw:
+        _sync_jobs_with_delivery(base, snap)
+    return snap
+
+
+def _sync_jobs_with_delivery(base, snap):
+    """Keep finished pipeline/split job text in step with the delivery state (waiting → sent)."""
+    n = len(snap.get("parts") or [])
+    pl = "s" if n != 1 else ""
+    st = snap.get("status")
+    if st == "sent":
+        msg = f"Sent to Drive ({n} part{pl})"
+    elif st == "error":
+        msg = f"{n} parts ready — Drive send failed: {snap.get('error')}"
+    elif st == "waiting":
+        msg = f"Waiting for Drive ({n} part{pl} ready)"
+    else:
+        return
+    with MUSIC_JOBS_LOCK:
+        for job in MUSIC_JOBS.values():
+            if job.get("base") == base and job.get("status") == "done" and job.get("source") in ("pipeline", "split"):
+                job["progress"] = msg
+                job["deliveryStatus"] = st
+
+
+def register_delivery(base, music_name, parts_dir, names, part_secs, source):
+    sizes = []
+    for nm in names:
+        try:
+            sizes.append(os.stat(Path(parts_dir) / nm).st_size)
+        except OSError:
+            sizes.append(0)
+    now = time.time()
+    with PIPELINE_LOCK:
+        PIPELINE["deliveries"][base] = {
+            "base": base, "musicName": music_name, "partsDir": str(parts_dir),
+            "parts": list(names), "sizes": sizes, "partSecs": round(part_secs, 1),
+            "status": "waiting", "target": None, "sentAt": None, "error": None,
+            "source": source, "createdAt": now, "updatedAt": now, "lastAttempt": 0,
+        }
+        # keep the state file small
+        if len(PIPELINE["deliveries"]) > 300:
+            old = sorted(PIPELINE["deliveries"].values(), key=lambda d: d.get("updatedAt") or 0)
+            for d in old[: len(old) - 300]:
+                PIPELINE["deliveries"].pop(d.get("base"), None)
+    _pipeline_save()
+
+
+def deliver_one(base):
+    """Copy one base's parts into the Drive target. Returns the delivery snapshot."""
+    with PIPELINE_LOCK:
+        d = PIPELINE["deliveries"].get(base)
+        if not d:
+            return None
+        d = dict(d)
+    roots = detect_drive_roots()
+    if not roots:
+        return _delivery_update(base, status="waiting", error=None, lastAttempt=time.time(),
+                                note="Waiting for Drive (Drive for Desktop not found)")
+    try:
+        target, _kind, err = resolve_delivery_target(roots, create=True)
+    except OSError as e:
+        target, err = None, f"cannot create target folder: {e}"
+    if err or not target:
+        return _delivery_update(base, status="error", error=err or "no target", lastAttempt=time.time())
+    _delivery_update(base, status="sending", error=None, target=target, lastAttempt=time.time(), note=None)
+    DELIVERY_STATE["busy"] = True
+    try:
+        for nm in d.get("parts") or []:
+            src = Path(d["partsDir"]) / nm
+            if not src.is_file():
+                raise RuntimeError(f"local part missing ({nm}) — use Split for Drive again")
+            dest = Path(target) / nm
+            try:
+                if dest.is_file() and dest.stat().st_size == src.stat().st_size:
+                    continue  # already delivered (idempotent retry)
+            except OSError:
+                pass
+            atomic_copy(src, dest)
+        snap = _delivery_update(base, status="sent", sentAt=time.time(), target=target, error=None)
+        log(f"drive delivery sent base={base} parts={len(d.get('parts') or [])} → {target}")
+        return snap
+    except Exception as e:
+        log(f"drive delivery error base={base}: {e}")
+        return _delivery_update(base, status="error", error=str(e) or type(e).__name__)
+    finally:
+        DELIVERY_STATE["busy"] = False
+
+
+def delivery_loop():
+    """Deliver waiting parts whenever Drive for Desktop is (or becomes) available."""
+    while True:
+        DELIVERY_WAKE.wait(DELIVERY_POLL_SECS)
+        DELIVERY_WAKE.clear()
+        try:
+            forced = set(DELIVERY_STATE["force"])
+            DELIVERY_STATE["force"].clear()
+            now = time.time()
+            with PIPELINE_LOCK:
+                todo = []
+                for base, d in PIPELINE["deliveries"].items():
+                    st = d.get("status")
+                    if st == "waiting" or base in forced or "*" in forced and st in ("waiting", "error"):
+                        todo.append(base)
+                    elif st == "error" and now - float(d.get("lastAttempt") or 0) > DELIVERY_ERROR_RETRY_SECS:
+                        todo.append(base)
+            if not todo:
+                continue
+            if not detect_drive_roots():
+                for base in todo:
+                    if base in forced:
+                        _delivery_update(base, status="waiting", note="Waiting for Drive (Drive for Desktop not found)",
+                                         lastAttempt=now)
+                continue
+            for base in todo:
+                deliver_one(base)
+        except Exception as e:
+            log(f"delivery loop error: {e}")
+
+
+def request_delivery(base=None):
+    DELIVERY_STATE["force"].add(base or "*")
+    DELIVERY_WAKE.set()
+
+
+def deliveries_snapshot(limit=60):
+    with PIPELINE_LOCK:
+        items = sorted(PIPELINE["deliveries"].values(), key=lambda d: d.get("updatedAt") or 0, reverse=True)
+        out = []
+        for d in items[:limit]:
+            out.append({k: d.get(k) for k in (
+                "base", "musicName", "parts", "sizes", "partSecs", "status", "target",
+                "sentAt", "error", "note", "source", "createdAt", "updatedAt")})
+    return out
+
+
+def pipeline_status_payload():
+    roots = detect_drive_roots()
+    target, kind, err = resolve_delivery_target(roots, create=False) if roots else (None, "auto", "Google Drive for Desktop not found")
+    with PIPELINE_LOCK:
+        prefs = {"enabled": PIPELINE["enabled"], "users": dict(PIPELINE["users"]), "target": PIPELINE["target"]}
+    return {
+        "ok": True, "driveFound": bool(roots), "prefs": prefs,
+        "resolvedTarget": target, "targetKind": kind, "targetError": err,
+        "defaultTargetHint": 'a My Drive folder named "Twitch" (or TwitchRecordings) if present, else My Drive/Twitch Recordings/Music only',
+        "partTargetBytes": PART_TARGET_BYTES, "partMaxBytes": PART_MAX_BYTES, "partMinSecs": PART_MIN_SECS,
+        "deliveries": deliveries_snapshot(200),
+    }
+
+
+def api_pipeline_prefs(body):
+    body = body if isinstance(body, dict) else {}
+    changed = False
+    with PIPELINE_LOCK:
+        if "enabled" in body:
+            PIPELINE["enabled"] = bool(body.get("enabled"))
+            changed = True
+        users = body.get("users")
+        if isinstance(users, dict):
+            for k, v in users.items():
+                u = safe_username(k)
+                if u:
+                    PIPELINE["users"][u] = bool(v)
+                    changed = True
+    if "target" in body:
+        t = body.get("target") or ""
+        if t:
+            real, _root, err = validate_drive_path(str(t))
+            if err:
+                return {"ok": False, "error": f"target folder: {err}"}, 400
+            if not os.path.isdir(real):
+                return {"ok": False, "error": "target folder not found"}, 404
+            t = real
+        with PIPELINE_LOCK:
+            PIPELINE["target"] = t
+        changed = True
+        request_delivery(None)
+    if changed:
+        _pipeline_save()
+    return pipeline_status_payload(), 200
+
+
+def _pipeline_progress(job_id):
+    def progress(msg, pct=None):
+        if pct is not None:
+            _set_music_job(job_id, progress=msg, progressPct=pct)
+        else:
+            _set_music_job(job_id, progress=msg)
+    return progress
+
+
+def _split_and_deliver(job_id, music_path, source, progress, pct=95):
+    _set_music_job(job_id, phase="split")
+    progress("Splitting for Drive…", pct)
+    parts_dir, names, part_secs = split_music_for_drive(job_id, music_path, progress)
+    base = music_base_stem(Path(music_path).name)
+    register_delivery(base, Path(music_path).name, parts_dir, names, part_secs, source)
+    _set_music_job(job_id, phase="deliver", base=base, partsCount=len(names), partSecs=round(part_secs, 1),
+                   outputPath=str(Path(parts_dir) / names[0]))
+    progress(f"{len(names)} parts ready — sending to Drive…", 99)
+    snap = deliver_one(base) or {}
+    st = snap.get("status")
+    if st == "sent":
+        msg = f"Sent to Drive ({len(names)} part{'s' if len(names) != 1 else ''})"
+    elif st == "error":
+        msg = f"{len(names)} parts ready — Drive send failed: {snap.get('error')}"
+    else:
+        msg = f"Waiting for Drive ({len(names)} part{'s' if len(names) != 1 else ''} ready)"
+    return base, names, part_secs, st, msg
+
+
+def pipeline_worker(job_id):
+    work = None
+    slot_held = False
+    progress = _pipeline_progress(job_id)
+    segs = list(_job_get(job_id, "segments") or [])
+    redo = bool(_job_get(job_id, "redo"))
+    try:
+        _check_cancel(job_id)
+        paths = []
+        for s in segs:
+            p = REC_DIR / s
+            try:
+                if p.is_file() and p.stat().st_size > SCRUB_MAX_BYTES:
+                    paths.append(p)
+            except OSError:
+                continue
+        if not paths:
+            raise RuntimeError("no finished segments on disk")
+        existing = find_existing_sibling(paths[0].name, "music") if len(paths) == 1 else None
+        if existing and not redo:
+            music_path = existing
+            _set_music_job(job_id, status="running", info="reused existing -music file")
+        else:
+            infos = [probe_media(p) for p in paths]
+            total = sum(float(i["duration"] or 0) for i in infos)
+            lead = detect_leading_silence(paths[0])
+            note = f"{len(paths)} segment{'s' if len(paths) != 1 else ''}, {total / 60:.1f} min"
+            if lead >= 1.0:
+                note += f" · leading silence {lead:.0f}s (info only)"
+            _set_music_job(job_id, info=note, duration=total)
+            # Disk-low pause (Auto): wait while under diskWarn instead of starting demucs.
+            paused = False
+            while disk_status().get("diskWarn"):
+                if not paused:
+                    log(f"pipeline job={job_id}: paused — disk low")
+                    paused = True
+                _set_music_job(job_id, status="queued", progress="Paused — disk low (<2 GB free); waiting for space…")
+                _check_cancel(job_id)
+                time.sleep(5)
+            _set_music_job(job_id, status="queued", phase="wait", progress="Waiting for demucs (1 at a time)…")
+            while True:
+                _check_cancel(job_id)
+                if DEMUCS_SLOTS.acquire(timeout=0.5):
+                    slot_held = True
+                    break
+            _check_cancel(job_id)
+            _set_music_job(job_id, status="running", phase="demucs")
+            work = Path(tempfile.mkdtemp(prefix="music-only-", dir=str(REC_DIR)))
+            _register_work_path(work)
+            parts = chunked_demucs_no_vocals(job_id, paths, work, total, progress, pct_lo=5.0, pct_hi=85.0)
+            _set_music_job(job_id, phase="encode")
+            tmp_out = encode_joined_ogg(job_id, parts, work / "out.ogg", total, progress,
+                                        pct_lo=85.0, pct_hi=94.0, codec_args=MUSIC_OGG_ARGS)
+            if redo and len(paths) == 1:
+                delete_music_siblings(paths[0].name)
+            dest = _unique_music_dest(paths[0].name)
+            atomic_publish(tmp_out, dest)
+            music_path = dest
+            _set_music_job(job_id, outputName=dest.name,
+                           outputUrl="/api/download/" + urllib.parse.quote(dest.name))
+            # Free the demucs slot before split/delivery so the next job can start.
+            DEMUCS_SLOTS.release()
+            slot_held = False
+            shutil.rmtree(work, ignore_errors=True)
+            _unregister_work_path(work)
+            work = None
+        _set_music_job(job_id, outputName=Path(music_path).name,
+                       outputUrl="/api/download/" + urllib.parse.quote(Path(music_path).name))
+        base, names, part_secs, st, msg = _split_and_deliver(job_id, music_path, "stream", progress)
+        _set_music_job(job_id, status="done", phase="done", progress=msg, progressPct=100,
+                       deliveryStatus=st, error=None, finishedAt=time.time())
+        log(f"pipeline done job={job_id} music={Path(music_path).name} parts={len(names)} delivery={st}")
+    except _JobCancelled:
+        _finalize_cancelled_music_job(job_id)
+        log(f"pipeline cancelled job={job_id}")
+    except Exception as e:
+        msg = str(e) or type(e).__name__
+        log(f"pipeline error job={job_id}: {msg}")
+        _set_music_job(job_id, status="error", progress="Error", error=msg, finishedAt=time.time())
+    finally:
+        if slot_held:
+            try:
+                DEMUCS_SLOTS.release()
+            except Exception:
+                pass
+        if work is not None:
+            shutil.rmtree(work, ignore_errors=True)
+            _unregister_work_path(work)
+
+
+def split_worker(job_id):
+    progress = _pipeline_progress(job_id)
+    try:
+        _set_music_job(job_id, status="running")
+        src = REC_DIR / _job_get(job_id, "musicName")
+        base, names, part_secs, st, msg = _split_and_deliver(job_id, src, "manual", progress, pct=10)
+        _set_music_job(job_id, status="done", phase="done", progress=msg, progressPct=100,
+                       deliveryStatus=st, error=None, finishedAt=time.time())
+    except _JobCancelled:
+        _finalize_cancelled_music_job(job_id)
+    except Exception as e:
+        _set_music_job(job_id, status="error", progress="Error", error=str(e) or type(e).__name__,
+                       finishedAt=time.time())
+
+
+def _new_job(name, display, source, target, **extra):
+    job_id = uuid.uuid4().hex[:12]
+    job = {
+        "jobId": job_id, "status": "queued", "progress": "Queued…", "progressPct": 0,
+        "error": None, "name": name, "displayName": display, "source": source,
+        "outputName": None, "outputUrl": None, "vocalsName": None, "vocalsUrl": None,
+        "startedAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    job.update(extra)
+    with MUSIC_JOBS_LOCK:
+        MUSIC_JOBS[job_id] = job
+    threading.Thread(target=target, args=(job_id,), daemon=True, name=f"{source}-{job_id}").start()
+    return job_id
+
+
+def start_stream_pipeline(username, segments, redo=False, reason="stream-end"):
+    segs = [basename_of(s) for s in (segments or []) if s]
+    segs = [s for s in segs if s and not is_music_export_name(s) and not is_seamless_export_name(s)]
+    if not segs:
+        return None, "no segments"
+    first = segs[0]
+    with MUSIC_JOBS_LOCK:
+        for jid, job in MUSIC_JOBS.items():
+            if (job.get("status") or "") in ("queued", "running") and (
+                job.get("name") == first or first in (job.get("segments") or [])
+            ):
+                return jid, "already running"
+    if not demucs_available() or not which_ffmpeg():
+        return None, "demucs/ffmpeg not installed"
+    PIPELINE_SEEN.add(first)
+    # name = first segment so History / Auto Music see it as that recording's Music-only job
+    jid = _new_job(first, first, "pipeline", pipeline_worker, segments=segs, username=username,
+                   redo=bool(redo), reason=reason)
+    log(f"pipeline queued job={jid} user={username} segments={segs} ({reason})")
+    return jid, None
+
+
+def _on_session_finalized(username, segments):
+    """Called from remember_session_segments (maybe holding LOCK) — never blocks."""
+    segs = [s for s in (segments or []) if s]
+    if not segs or not pipeline_enabled_for(username):
+        return
+    if segs[0] in PIPELINE_SEEN:
+        return
+
+    def run():
+        time.sleep(PIPELINE_START_DELAY_SECS)  # let streamlink finish flushing
+        if not pipeline_enabled_for(username):
+            return
+        jid, err = start_stream_pipeline(username, segs)
+        if err and not jid:
+            log(f"pipeline not started for {username}: {err}")
+
+    threading.Thread(target=run, daemon=True, name=f"pipeline-trigger-{username}").start()
+
+
+def api_pipeline_split(body):
+    body = body if isinstance(body, dict) else {}
+    target = resolve_download_path(body.get("name"))
+    if not target:
+        return {"ok": False, "error": "not found in ~/TwitchRecordings"}, 404
+    if not is_music_export_name(target.name) or "-vocals" in target.stem:
+        return {"ok": False, "error": "pick a -music file"}, 400
+    if not which_ffmpeg():
+        return {"ok": False, "error": "ffmpeg not found"}, 400
+    key = "split:" + target.name
+    jid = _inflight_job_for(key)
+    if jid:
+        return {"ok": True, "jobId": jid, "alreadyRunning": True}, 200
+    jid = _new_job(key, target.name, "split", split_worker, musicName=target.name)
+    return {"ok": True, "jobId": jid}, 200
+
+
+def api_pipeline_deliver(body):
+    body = body if isinstance(body, dict) else {}
+    base = body.get("base")
+    if base:
+        with PIPELINE_LOCK:
+            if base not in PIPELINE["deliveries"]:
+                return {"ok": False, "error": "no parts for that recording — use Split for Drive"}, 404
+    found = bool(detect_drive_roots())
+    request_delivery(base or None)
+    return {"ok": True, "driveFound": found,
+            "message": "sending…" if found else "Waiting for Drive — Drive for Desktop not found"}, 200
 
 
 
@@ -4874,6 +5547,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/files":
             self.send_json(files_payload())
             return
+        if path == "/api/pipeline/status":
+            if not origin_allowed(self.headers.get("Origin")):
+                self.send_json({"ok": False, "error": "origin not allowed"}, status=403)
+                return
+            self.send_json(pipeline_status_payload())
+            return
         if path.startswith("/api/drive/"):
             # v6.35: Drive endpoints expose private file names — local pages only.
             if not origin_allowed(self.headers.get("Origin")):
@@ -4953,6 +5632,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "invalid username"}, status=400)
                 return
             quality = body.get("quality") or "audio_only"
+            if "afterStream" in body:  # v6.36: per-streamer "remove voice → Drive" pref
+                set_pipeline_user_pref(username, bool(body.get("afterStream")))
             result = start_record(username, quality)
             self.send_json(result, status=200 if result.get("ok") else 400)
             return
@@ -4990,6 +5671,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/delete":
             body = self.read_json()
             payload, status = api_delete_recordings(body if isinstance(body, dict) else {})
+            self.send_json(payload, status=status)
+            return
+        if path in ("/api/pipeline/prefs", "/api/pipeline/split", "/api/pipeline/deliver"):
+            if not origin_allowed(self.headers.get("Origin")):
+                self.send_json({"ok": False, "error": "origin not allowed"}, status=403)
+                return
+            body = self.read_json()
+            if path == "/api/pipeline/prefs":
+                payload, status = api_pipeline_prefs(body)
+            elif path == "/api/pipeline/split":
+                payload, status = api_pipeline_split(body)
+            else:
+                payload, status = api_pipeline_deliver(body)
             self.send_json(payload, status=status)
             return
         if path in ("/api/drive/music", "/api/drive/fetch", "/api/reveal"):
@@ -5095,6 +5789,10 @@ def main():
     except Exception as e:
         log(f"orphan cleanup startup failed: {e}")
     threading.Thread(target=reaper_loop, daemon=True).start()
+    # v6.36: after-stream Drive delivery state + periodic "Waiting for Drive" retry
+    _pipeline_load()
+    threading.Thread(target=delivery_loop, daemon=True, name="drive-delivery").start()
+    request_delivery(None)
     threading.Thread(target=meter_loop, daemon=True, name="meter").start()
     httpd = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
     sl = which_streamlink()

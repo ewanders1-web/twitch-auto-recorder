@@ -63,6 +63,13 @@
   .music-progress-pct{font-size:.7rem;color:#c4b5fd;font-weight:700;min-width:2.5rem;text-align:right;font-variant-numeric:tabular-nums;}
   .music-progress-msg{font-size:.7rem;color:#a78bfa;max-width:14rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .hist-item .music-progress{margin-top:.3rem;max-width:100%;}
+  /* v6.36: auto-send to Drive */
+  .drive-pipe-box{margin-top:.6rem;padding:.55rem .65rem;border:1px solid rgba(147,197,253,.25);border-radius:8px;background:rgba(59,130,246,.06);font-size:.78rem;}
+  .drive-pipe-box .dp-row{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin:.2rem 0;}
+  .dp-badge{display:inline-block;font-size:.68rem;padding:.05rem .4rem;border-radius:999px;margin-left:.3rem;white-space:nowrap;}
+  .dp-badge.sent{background:rgba(16,185,129,.18);color:#6ee7b7;}
+  .dp-badge.waiting,.dp-badge.sending{background:rgba(251,191,36,.15);color:#fcd34d;}
+  .dp-badge.error{background:rgba(239,68,68,.18);color:#fca5a5;}
   /* v6.35: Google Drive card */
   .drive-badge{font-size:.68rem;padding:.12rem .5rem;border-radius:999px;border:1px solid #3a3a48;color:#9ca3af;}
   .drive-badge.on{color:#86efac;border-color:#14532d;background:#052e16;}
@@ -212,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.35</span>
+    <span class="badge">v6.36</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -287,6 +294,9 @@
           </label>
           <label title="When on, each finished helper segment auto-queues Demucs Music only (-music / -vocals siblings) while the next segment may still record. Native files never overwritten." style="margin-left:1rem">
             <input type="checkbox" id="autoMusicOnlyToggle" checked onchange="saveAutoMusicOnlyToggle()"> Auto Music only
+          </label>
+          <label title="v6.36: when a recording finishes (stop, stream ended, or mid-resume give-up) the helper removes the voice from the whole session, splits the -music file into equal parts under 50 MB (partNofM.ogg) and copies them to Google Drive. Per-streamer switch on the Streamers tab." style="margin-left:1rem">
+            <input type="checkbox" id="drivePipeToggle" checked onchange="saveDrivePipeToggle()"> After stream ends: remove voice → split → send to Drive
           </label>
         </div>
       </div>
@@ -439,6 +449,7 @@
         </div>
         <div class="hint">Works for files shared as &quot;Anyone with the link&quot;. Private files need Drive for Desktop. Output: <code>~/TwitchRecordings/&lt;name&gt;-music.ogg</code> (shows in History).</div>
       </div>
+      <div id="drivePipeBox" class="drive-pipe-box"></div>
       <div id="driveJobs"></div>
     </div>
     <div class="alert alert-info" style="margin-top:.35rem"><strong>Auto Music only</strong> (Recorder Settings toggle) builds <code>-music</code> / <code>-vocals</code> siblings during/after capture on finished segments. This tab&#39;s upload remains for arbitrary files. History rows still have <strong>Music only</strong> / <strong>Redo</strong> for disk files.</div>
@@ -501,9 +512,9 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.35'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.36'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
-let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false };
+let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false };
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
 let musicJobsNotified = new Set(); // jobIds already fireNotify'd for done/error (health spam safe)
@@ -556,6 +567,7 @@ function makeStreamer(username, color, autoRec){
     broadcasterId:null,
     color:color||COLORS[0],
     autoRec:autoRec!==false, // in-memory name; persist key remains `armed`
+    drivePipe:true, // v6.36: after stream ends → remove voice → split → Drive
     isLive:false,
     liveData:null,
     captureStream:null,
@@ -622,11 +634,12 @@ function persist(){
       clientSecret: cfg.clientSecret||'',
       interval: cfg.interval||30,
       fmtMime: chosenFmt ? chosenFmt.mime : (restoredFmtMime||null),
-      streamers: streamers.map(s=>({username:s.username, armed:!!s.autoRec, color:s.color})),
+      streamers: streamers.map(s=>({username:s.username, armed:!!s.autoRec, color:s.color, drivePipe:s.drivePipe!==false})),
       notifyOptIn: !!cfg.notifyOptIn,
       helperQuality: cfg.helperQuality==='audio_only'?'audio_only':'best',
       seamlessRecordings: cfg.seamlessRecordings!==false,
       autoMusicOnly: cfg.autoMusicOnly!==false,
+      drivePipeline: cfg.drivePipeline!==false, // v6.36
       homeStreamer: String(cfg.homeStreamer||'').toLowerCase(),
       returnHomeAfterSet: cfg.returnHomeAfterSet!==false,
       // v6.35: Google Drive card (same persist key)
@@ -666,6 +679,8 @@ function restoreSettings(){
     // v6.23: Auto Music only default on when missing
     if(typeof data.autoMusicOnly==='boolean') cfg.autoMusicOnly=data.autoMusicOnly;
     else cfg.autoMusicOnly=true;
+    // v6.36: after-stream Drive pipeline default on
+    cfg.drivePipeline=data.drivePipeline!==false;
     // v6.25: home streamer + return after guest/DJ set
     cfg.homeStreamer=data.homeStreamer?String(data.homeStreamer).toLowerCase():'';
     if(typeof data.returnHomeAfterSet==='boolean') cfg.returnHomeAfterSet=data.returnHomeAfterSet;
@@ -676,11 +691,15 @@ function restoreSettings(){
     cfg.driveKeepSource=data.driveKeepSource===true;
     if(Array.isArray(data.streamers)){
       restoredStreamerList=true; // even an empty list is user data — don't overwrite
-      streamers=data.streamers.filter(s=>s&&s.username).map((s,i)=>makeStreamer(
-        String(s.username).toLowerCase(),
-        s.color||COLORS[i%COLORS.length],
-        s.armed!==false // missing/true → Auto-Rec on (persist key `armed`)
-      ));
+      streamers=data.streamers.filter(s=>s&&s.username).map((s,i)=>{
+        const st=makeStreamer(
+          String(s.username).toLowerCase(),
+          s.color||COLORS[i%COLORS.length],
+          s.armed!==false // missing/true → Auto-Rec on (persist key `armed`)
+        );
+        st.drivePipe=s.drivePipe!==false; // v6.36 default on
+        return st;
+      });
     }
     needsRearmNotice=true; // capture stream cannot survive reload
   }catch(e){ console.warn('restore failed', e); }
@@ -1273,6 +1292,8 @@ async function queueAutoMusicOnly(name, opts){
   if(!name) return null;
   if(isMusicExportName(name) || isSeamlessExportName(name)) return null;
   if(!helper.ok) return null;
+  // v6.36: the helper's after-stream pipeline handles this streamer's whole session (music + split + Drive)
+  if(helperHasPipeline() && drivePipeActiveFor(String(name).split('-')[0])) return null;
   // Deduplicate: already auto-queued, musicJobs in flight, or helper alreadyRunning / -music exists
   if(autoMusicQueued.has(name)) return null;
   const existing=musicJobs[name];
@@ -1365,6 +1386,7 @@ function pingHelperAndStatus(){
       updateDemucsUi();
       if(Array.isArray(d.musicJobs)) applyMusicJobsFromHealth(d.musicJobs);
       if(Array.isArray(d.seamlessJobs)) applySeamlessJobsFromHealth(d.seamlessJobs);
+      applyPipelineFromHealth(d); // v6.36
     }else{
       markHelperDown(wasOk);
       return;
@@ -1386,6 +1408,7 @@ function pingHelperAndStatus(){
   // Fresh connect / reconnect: merge disk files and immediately kick live Auto-Rec
   if(helper.ok && !wasOk){
     driveRefresh().catch(function(){}); // v6.35
+    syncPipelinePrefs(true); // v6.36
     const hadDrop=helperDropNotified;
     helperDropNotified=false;
     helperActiveOnDrop=[];
@@ -2032,7 +2055,7 @@ async function startHelperRec(s, isAuto){
   if(isHelperRecording(s)) return;
   s.helperStarting=true;
   try{
-    const d=await helperFetch('/api/record', {username:s.username, quality:cfg.helperQuality||'audio_only'}, 8000);
+    const d=await helperFetch('/api/record', {username:s.username, quality:cfg.helperQuality||'audio_only', afterStream:drivePipeActiveFor(s.username)}, 8000);
     if(!d || !d.ok) throw new Error((d && d.error) || 'helper record failed');
     if(!d.already){
       if(d.retrying){
@@ -2509,6 +2532,13 @@ function renderStreamers(){
           Auto-Rec
           <label class="switch">
             <input type="checkbox" ${s.autoRec?'checked':''} onchange="toggleAutoRec('${s.username}')">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="s-arm" title="After this streamer's recording ends: remove voice → split into parts under 50 MB → send to Google Drive${cfg.drivePipeline===false?' (global toggle is off in Settings)':''}" style="${cfg.drivePipeline===false?'opacity:.5':''}">
+          → Drive
+          <label class="switch">
+            <input type="checkbox" ${s.drivePipe!==false?'checked':''} onchange="toggleDrivePipe('${s.username}')">
             <span class="slider"></span>
           </label>
         </div>
@@ -3946,6 +3976,24 @@ function renderHist(){
         seamlessBtns+=`<button class="btn ${seamlessName?'btn-gray':'btn-purple'} btn-sm" onclick="startSeamlessFromHist(${i})" title="${title.replace(/"/g,'&quot;')}">Join seamless</button>`;
       }
     }
+    // v6.36: Drive delivery badge + Send to Drive now / Split for Drive
+    let drivePipeBtns='';
+    let dpBadge='';
+    if(diskish && !stillRec && h.name && helper.ok && helperHasPipeline() && !isSeamlessExportName(h.name)){
+      const base=musicNativeStem(h.name);
+      const isMusicRow=/-music(?:-\d+)?\.[^.]+$/i.test(h.name);
+      const musicFile=isMusicRow?h.name:findSiblingExport(h.name,'music');
+      const dv=pipelineDeliveries[base];
+      if(dv) dpBadge=pipelineBadgeHtml(dv);
+      const sj=musicJobs['split:'+(musicFile||'')] || Object.values(driveJobs).find(function(j){ return j.source==='split' && j.base===base && (j.status==='queued'||j.status==='running'); });
+      if(sj && (sj.status==='queued'||sj.status==='running')){
+        drivePipeBtns+='<span class="btn btn-gray btn-sm">Splitting…</span>';
+      }else if(musicFile && (isMusicRow || !findSiblingExportRow(musicFile))){
+        const bEsc=driveEsc(base).replace(/&#39;/g,"\\'");
+        if(dv && dv.status!=='sent') drivePipeBtns+='<button class="btn btn-purple btn-sm" onclick="pipelineSendNow(\''+bEsc+'\')" title="Copy the parts into Google Drive now">Send to Drive now</button>';
+        drivePipeBtns+='<button class="btn btn-gray btn-sm" onclick="pipelineSplitName(\''+driveEsc(musicFile).replace(/&#39;/g,"\\'")+'\')" title="Cut '+driveEsc(musicFile)+' into equal parts under 50 MB (partNofM.ogg) and send them to Drive">'+(dv?'Re-split for Drive':'Split for Drive')+'</button>';
+      }
+    }
     const notes=[];
     let meterHtml='';
     if(musicJobs[h.name] && (musicJobs[h.name].status==='queued'||musicJobs[h.name].status==='running')){
@@ -3978,12 +4026,12 @@ function renderHist(){
     }
     const shownName=String(h.displayName||h.name).replace(/&/g,'&amp;').replace(/</g,'&lt;');
     const driveNote=h.drivePath?(' · <span style="color:#93c5fd" title="'+String(h.drivePath).replace(/"/g,'&quot;').replace(/</g,'&lt;')+'">'+(h.fromDisk?'from Drive link':'in Google Drive')+(h.driveSrc?(' (from '+String(h.driveSrc).replace(/</g,'&lt;')+')'):'')+'</span>'):'';
-    const mainInner=`<div><strong>${shownName}</strong><small>${h.dur} · ${h.size}${h.recovered?' · Recovered':''}${h.fromDisk?' · disk/helper':(h.helperFile?' · disk':'')}${rowNote}${driveNote}</small>${meterHtml}</div>`;
+    const mainInner=`<div><strong>${shownName}</strong><small>${h.dur} · ${h.size}${h.recovered?' · Recovered':''}${h.fromDisk?' · disk/helper':(h.helperFile?' · disk':'')}${rowNote}${driveNote}${dpBadge}</small>${meterHtml}</div>`;
     const left=selBox?(`<div class="hist-sel-wrap">${selBox}${mainInner}</div>`):mainInner;
     return `
     <div class="hist-item">
       ${left}
-      <div class="hist-actions">${dlBtn}${seamlessBtns}${musicBtns}${revealBtns}${blobBtn}${delBtn}</div>
+      <div class="hist-actions">${dlBtn}${seamlessBtns}${musicBtns}${drivePipeBtns}${revealBtns}${blobBtn}${delBtn}</div>
     </div>`;
   }).join('');
   try{ updateHistDeleteSelectedBtn(); }catch(e){}
@@ -4422,7 +4470,7 @@ let driveJobsNotified=new Set();
 function driveEsc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 function driveMB(n){ return (typeof n==='number' && isFinite(n)) ? ((n/1048576)>=1024 ? (n/1073741824).toFixed(2)+' GB' : (n/1048576).toFixed(1)+' MB') : '—'; }
 function driveDate(t){ if(!t) return ''; try{ const d=new Date(t*1000); return d.toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'})+' '+d.toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'}); }catch(e){ return ''; } }
-function isDriveJob(j){ return !!(j && (j.source==='drive' || j.source==='link')); }
+function isDriveJob(j){ return !!(j && (j.source==='drive' || j.source==='link' || j.source==='split')); }
 function initDriveCard(){
   const sel=document.getElementById('driveOutMode');
   if(sel) sel.value=cfg.driveOutMode||'subfolder';
@@ -4447,6 +4495,7 @@ async function driveRefresh(){
     const d=await helperFetch('/api/drive/status', undefined, 4000);
     if(!d || !d.ok){ driveState.status=null; driveState.err=(d&&d.error)||'Drive status unavailable (update the helper to v6.35)'; renderDriveCard(); return; }
     driveState.status=d; driveState.err='';
+    fetchPipelineStatus(); // v6.36
     if(d.found) await driveOpen(driveState.loaded?driveState.path:(cfg.driveLastPath||''), true);
     else renderDriveCard();
   }catch(e){
@@ -4644,6 +4693,7 @@ function driveClearFinished(){
   renderDriveJobs();
 }
 function renderDriveJobs(){
+  try{ renderPipelineBox(); }catch(e){}
   const el=document.getElementById('driveJobs');
   if(!el) return;
   const jobs=Object.values(driveJobs).filter(function(j){ return !j.hidden; });
@@ -4654,12 +4704,13 @@ function renderDriveJobs(){
     const st=j.status||'';
     const id=String(j.jobId).replace(/[^a-zA-Z0-9_-]/g,'');
     const active=st==='queued'||st==='running';
-    const src=j.source==='link'?'🔗':'☁️';
+    const src=j.source==='link'?'🔗':(j.source==='split'?'✂️':'☁️');
     let line='<div class="drive-job"><div class="drive-job-top"><span>'+src+' <strong>'+driveEsc(j.displayName||j.name||j.jobId)+'</strong></span><span class="drive-job-btns">';
     if(active) line+='<button class="btn btn-gray btn-sm" onclick="driveCancel(\''+id+'\')">Cancel</button>';
     if(st==='done' && j.outputPath) line+='<button class="btn btn-purple btn-sm" onclick="driveRevealJob(\''+id+'\',\'open\')">Open</button><button class="btn btn-gray btn-sm" onclick="driveRevealJob(\''+id+'\',\'reveal\')">Reveal in Finder</button>';
     line+='</span></div>';
     if(active) line+=musicProgressHtml(j, {fallback:'Working…'});
+    else if(st==='done' && j.source==='split') line+='<div class="drive-job-sub ok">✓ '+driveEsc(j.progress||'Split done')+'</div>';
     else if(st==='done') line+='<div class="drive-job-sub ok">✓ '+driveEsc(j.already?'Already had music: ':'Saved: ')+driveEsc(j.outputPath||j.outputName||'')+(j.keptSourceName?' · source kept as '+driveEsc(j.keptSourceName):'')+'</div>';
     else if(st==='error') line+='<div class="drive-job-sub err">✗ '+driveEsc(j.error||'error')+'</div>';
     else if(st==='cancelled') line+='<div class="drive-job-sub">Cancelled</div>';
@@ -4679,7 +4730,10 @@ function applyDriveJobsFromHealth(jobs){
     if((st==='done'||st==='error') && !driveJobsNotified.has(j.jobId)){
       driveJobsNotified.add(j.jobId);
       if(prev && (prev.status==='done'||prev.status==='error')) return; // seen before page refresh? stay quiet
-      if(st==='done'){
+      if(st==='done' && j.source==='split'){
+        anyDone=true;
+        flashOk('Split for Drive: '+driveEsc(j.progress||'done'));
+      }else if(st==='done'){
         anyDone=true;
         flashOk('Voice removed: '+driveEsc(j.outputName||j.displayName||'done'));
         fireNotify('tar-drive-'+j.jobId, 'Voice removed', j.outputPath||j.outputName||'');
@@ -4716,6 +4770,173 @@ async function fetchDriveHistory(){
     if(d && d.ok && Array.isArray(d.items)){ mergeDriveHistory(d.items); renderHist(); }
   }catch(e){}
 }
+
+// ─── v6.36: AFTER STREAM ENDS → REMOVE VOICE → SPLIT → SEND TO DRIVE ─────
+// The helper does the work (so it runs with this page closed): when a recording finalizes it
+// queues Music only for the whole session (1 demucs at a time), splits the -music file into
+// equal parts under 50 MB (<base>-music-partNofM.ogg in ~/TwitchRecordings/Drive parts/<base>/)
+// and copies them into Google Drive for Desktop — or waits until Drive appears.
+let pipelineDeliveries={};   // base -> delivery snapshot (from /api/health driveDeliveries)
+let pipelineStatus=null;     // /api/pipeline/status payload
+let pipelineSeenOnce=false;
+let pipelinePrefsSig='';
+function helperHasPipeline(){ return !!helper.pipeline; }
+function drivePipeActiveFor(username){
+  if(cfg.drivePipeline===false) return false;
+  const u=String(username||'').toLowerCase();
+  const s=findStreamer(u);
+  return s ? s.drivePipe!==false : true;
+}
+function findSiblingExportRow(name){ return recordings.some(function(r){ return r && r.name===name; }); }
+function pipelinePrefsBody(){
+  const users={};
+  streamers.forEach(function(s){ users[s.username]=s.drivePipe!==false; });
+  return {enabled:cfg.drivePipeline!==false, users:users};
+}
+async function syncPipelinePrefs(force){
+  if(!helper.ok || !helperHasPipeline()) return;
+  const body=pipelinePrefsBody();
+  const sig=JSON.stringify(body);
+  if(!force && sig===pipelinePrefsSig) return;
+  try{
+    const d=await helperFetch('/api/pipeline/prefs', body, 6000);
+    if(d && d.ok){ pipelinePrefsSig=sig; pipelineStatus=d; renderPipelineBox(); }
+  }catch(e){}
+}
+function initDrivePipeToggle(){
+  const el=document.getElementById('drivePipeToggle');
+  if(el) el.checked=cfg.drivePipeline!==false;
+}
+function saveDrivePipeToggle(){
+  const el=document.getElementById('drivePipeToggle');
+  cfg.drivePipeline=el?!!el.checked:true;
+  persist();
+  syncPipelinePrefs(true);
+  renderStreamers();
+  flashOk(cfg.drivePipeline
+    ? 'After a stream ends: remove voice → split into parts under 50 MB → send to Google Drive (per-streamer switch on the Streamers tab).'
+    : 'After-stream Drive pipeline off — Auto Music only / manual Split for Drive still work.');
+}
+function toggleDrivePipe(username){
+  const s=findStreamer(username);
+  if(!s) return;
+  s.drivePipe=(s.drivePipe===false);
+  persist();
+  syncPipelinePrefs(true);
+  renderStreamers();
+  flashOk(s.username+': after stream ends → '+(s.drivePipe?'remove voice, split and send to Drive':'no automatic Drive send'));
+}
+function pipelineBadgeHtml(dv){
+  const n=(dv.parts||[]).length;
+  const pl=n===1?'':'s';
+  const st=dv.status||'';
+  let txt, tip;
+  if(st==='sent'){ txt='☁ Sent to Drive ('+n+' part'+pl+')'; tip='In '+(dv.target||'Google Drive')+(dv.sentAt?(' · '+driveDate(dv.sentAt)):''); }
+  else if(st==='sending'){ txt='⇪ Sending to Drive…'; tip=dv.target||''; }
+  else if(st==='error'){ txt='⚠ Drive send failed'; tip=dv.error||'error'; }
+  else { txt='⏳ Waiting for Drive ('+n+' part'+pl+' ready)'; tip=(dv.note||'Waiting for Google Drive for Desktop')+' — parts are in ~/TwitchRecordings/Drive parts/'+(dv.base||''); }
+  if(dv.partSecs) tip+=' · ~'+Math.round(dv.partSecs/60)+' min each';
+  return ' <span class="dp-badge '+driveEsc(st||'waiting')+'" title="'+driveEsc(tip)+'">'+driveEsc(txt)+'</span>';
+}
+function applyPipelineFromHealth(d){
+  helper.pipeline=(d && d.drivePipeline && typeof d.drivePipeline==='object')?d.drivePipeline:null;
+  if(!helper.pipeline) return;
+  const list=Array.isArray(d.driveDeliveries)?d.driveDeliveries:[];
+  const next={};
+  let changed=false;
+  list.forEach(function(dv){
+    if(!dv || !dv.base) return;
+    next[dv.base]=dv;
+    const prev=pipelineDeliveries[dv.base];
+    if(!prev || prev.status!==dv.status || prev.updatedAt!==dv.updatedAt) changed=true;
+    if(!pipelineSeenOnce) return; // no notifications for state that existed before this page load
+    const n=(dv.parts||[]).length;
+    if(dv.status==='sent' && (!prev || prev.status!=='sent')){
+      flashOk('☁ Sent to Drive: '+driveEsc(dv.base)+' ('+n+' parts)');
+      fireNotify('tar-dp-'+dv.base, 'Sent to Drive', dv.base+' — '+n+' parts'+(dv.target?(' → '+dv.target):''));
+    }else if(dv.status==='waiting' && !prev){
+      flashOk('⏳ '+driveEsc(dv.base)+': '+n+' parts ready — waiting for Google Drive for Desktop');
+      fireNotify('tar-dp-'+dv.base, 'Parts ready (waiting for Drive)', dv.base+' — '+n+' parts in ~/TwitchRecordings/Drive parts');
+    }else if(dv.status==='error' && (!prev || prev.status!=='error')){
+      flashErr('Drive send failed ('+driveEsc(dv.base)+'): '+driveEsc(dv.error||'unknown'));
+      fireNotify('tar-dp-'+dv.base, 'Drive send failed', dv.error||'');
+    }
+  });
+  if(Object.keys(next).length!==Object.keys(pipelineDeliveries).length) changed=true;
+  pipelineDeliveries=next;
+  if(!pipelineSeenOnce){ pipelineSeenOnce=true; syncPipelinePrefs(true); }
+  if(changed){
+    if(pipelineStatus) pipelineStatus.deliveries=list;
+    renderPipelineBox();
+    const hist=document.getElementById('hist');
+    if(hist && hist.classList.contains('active')) renderHist();
+  }
+}
+async function fetchPipelineStatus(){
+  if(!helper.ok) return;
+  try{
+    const d=await helperFetch('/api/pipeline/status', undefined, 4000);
+    if(d && d.ok){ pipelineStatus=d; renderPipelineBox(); }
+  }catch(e){}
+}
+function renderPipelineBox(){
+  const el=document.getElementById('drivePipeBox');
+  if(!el) return;
+  if(!helper.ok || !helperHasPipeline()){ el.innerHTML=helper.ok?'<div class="hint">Auto-send to Drive needs helper v6.36+.</div>':''; return; }
+  const ps=pipelineStatus||{};
+  const on=cfg.drivePipeline!==false;
+  let html='<div class="dp-row"><strong>Auto-send to Drive</strong>'
+    +'<label style="display:flex;align-items:center;gap:.3rem;margin:0 0 0 .4rem"><input type="checkbox" '+(on?'checked':'')+' onchange="document.getElementById(\'drivePipeToggle\').checked=this.checked;saveDrivePipeToggle()"> after stream ends: remove voice → split (&lt;50 MB parts) → send</label></div>';
+  let tgt;
+  if(ps.resolvedTarget) tgt='→ <code>'+driveEsc(ps.resolvedTarget)+'</code>'+(ps.targetKind==='configured'?' (your folder)':' (auto)');
+  else if(ps.driveFound===false) tgt='<span style="color:#fbbf24">Google Drive for Desktop not found on the helper&#39;s Mac — finished parts wait in ~/TwitchRecordings/Drive parts and are sent automatically once Drive appears.</span>';
+  else tgt='<span style="color:#fca5a5">'+driveEsc(ps.targetError||'target unavailable')+'</span>';
+  html+='<div class="dp-row">Target '+tgt+'</div>';
+  const canUse=!!(driveState.status && driveState.status.found && driveState.path);
+  html+='<div class="dp-row">'
+    +'<button class="btn btn-gray btn-sm" '+(canUse?'':'disabled ')+'onclick="pipelineUseFolder()" title="'+driveEsc(canUse?('Send parts to '+driveState.path):'Open a Drive folder above first')+'">Use this folder</button>'
+    +'<button class="btn btn-gray btn-sm" '+(ps.prefs&&ps.prefs.target?'':'disabled ')+'onclick="pipelineResetTarget()" title="'+driveEsc(ps.defaultTargetHint||'')+'">Reset to auto</button>'
+    +'<button class="btn btn-purple btn-sm" onclick="pipelineSendNow(\'\')" title="Retry every waiting / failed delivery now">Send to Drive now</button>'
+    +'</div>';
+  const dl=(ps.deliveries||[]).slice(0,8);
+  if(dl.length){
+    html+='<div style="margin-top:.3rem">'+dl.map(function(dv){
+      const b=driveEsc(dv.base).replace(/&#39;/g,"\\'");
+      return '<div class="dp-row"><span>'+driveEsc(dv.base)+'</span>'+pipelineBadgeHtml(dv)
+        +(dv.status!=='sent'?'<button class="btn btn-gray btn-sm" onclick="pipelineSendNow(\''+b+'\')">Send now</button>':'')
+        +'</div>';
+    }).join('')+'</div>';
+  }
+  el.innerHTML=html;
+}
+async function pipelineSendNow(base){
+  if(!helper.ok){ flashErr('Local helper not running.'); return; }
+  try{
+    const d=await helperFetch('/api/pipeline/deliver', base?{base:base}:{}, 8000);
+    if(!d || !d.ok){ flashErr('Send to Drive: '+driveEsc((d&&d.error)||'failed')); return; }
+    (d.driveFound?flashOk:flashErr)(driveEsc(d.driveFound?'Sending to Google Drive…':'Google Drive for Desktop not found — parts stay "Waiting for Drive" and go automatically once it appears.'));
+  }catch(e){ flashErr('Send to Drive failed: '+(e.message||e)); }
+}
+async function pipelineSplitName(name){
+  if(!helper.ok){ flashErr('Local helper not running.'); return; }
+  try{
+    const d=await helperFetch('/api/pipeline/split', {name:name}, 8000);
+    if(!d || !d.ok){ flashErr('Split for Drive: '+driveEsc((d&&d.error)||'failed')); return; }
+    driveJobs[d.jobId]=Object.assign(driveJobs[d.jobId]||{}, {jobId:d.jobId, source:'split', displayName:'Split '+name, base:musicNativeStem(name), status:'queued', progress:'Queued…', progressPct:0});
+    flashOk('Splitting '+driveEsc(name)+' into parts under 50 MB → Drive (progress in Convert → Google Drive).');
+    renderDriveJobs(); renderHist();
+  }catch(e){ flashErr('Split for Drive failed: '+(e.message||e)); }
+}
+async function pipelineSetTarget(target){
+  try{
+    const d=await helperFetch('/api/pipeline/prefs', {target:target}, 8000);
+    if(!d || !d.ok){ flashErr('Drive target: '+driveEsc((d&&d.error)||'failed')); return; }
+    pipelineStatus=d; renderPipelineBox();
+    flashOk(target?('Parts will be sent to '+driveEsc(d.resolvedTarget||target)):'Drive target back to auto');
+  }catch(e){ flashErr('Drive target failed: '+(e.message||e)); }
+}
+function pipelineUseFolder(){ if(driveState.path) pipelineSetTarget(driveState.path); }
+function pipelineResetTarget(){ pipelineSetTarget(''); }
 
 // ─── UI HELPERS ──────────────────────────────────────
 function switchTab(el,id){
@@ -4857,6 +5078,7 @@ initFormats();
 initHelperQuality();
 initSeamlessToggle();
 initAutoMusicOnlyToggle();
+initDrivePipeToggle();
 initDriveCard();
 updateHomeStreamerUI();
 renderStreamers();
