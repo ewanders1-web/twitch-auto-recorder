@@ -145,6 +145,8 @@
 
   /* history */
   .hist-item{background:#22222a;padding:.9rem 1rem;border-radius:.85rem;margin-bottom:.55rem;display:flex;justify-content:space-between;align-items:center;gap:.9rem;flex-wrap:wrap;border:1px solid #31313a;}
+  .hist-item .hist-sel-wrap{display:flex;align-items:flex-start;gap:.55rem;min-width:0;flex:1;}
+  .hist-item .hist-sel{margin-top:.2rem;accent-color:#a855f7;width:1rem;height:1rem;flex-shrink:0;cursor:pointer;}
   .hist-item strong{font-size:.86rem;display:block;} .hist-item small{color:#9ca3af;font-size:.72rem;}
 
   /* setup */
@@ -186,7 +188,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.33</span>
+    <span class="badge">v6.34</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -348,12 +350,17 @@
       <div class="summary-card"><div class="label">Last capture</div><div class="value" id="histLast">None yet</div></div>
       <div class="summary-card"><div class="label">Latest format</div><div class="value" id="histFmt">—</div></div>
     </div>
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.8rem;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.8rem;gap:.5rem;flex-wrap:wrap;">
       <h2 style="font-size:1.05rem">Session Recordings</h2>
-      <button class="btn btn-gray btn-sm" onclick="clearHist()">🗑 Clear</button>
+      <div style="display:flex;gap:.45rem;align-items:center;flex-wrap:wrap;">
+        <button class="btn btn-gray btn-sm" id="histSelectAllBtn" onclick="histSelectAllEligible()" title="Select all finished helper/disk rows currently listed">Select all finished</button>
+        <button class="btn btn-gray btn-sm" id="histClearSelBtn" onclick="histClearSelection()" title="Clear History multi-select">Clear selection</button>
+        <button class="btn btn-red btn-sm" id="histDeleteSelectedBtn" onclick="deleteSelectedFromHist()" disabled title="Delete checked finished helper/disk files from ~/TwitchRecordings">Delete selected</button>
+        <button class="btn btn-gray btn-sm" onclick="clearHist()">🗑 Clear</button>
+      </div>
     </div>
     <div style="font-size:.75rem;color:#9ca3af;margin-bottom:.7rem">Tab-capture is crash-safe via IndexedDB (Recovered entries auto-download once). Helper files write to ~/TwitchRecordings. Seamless joins write a sibling <code>-seamless</code> file (segments kept). For Demucs Music only on any file, use the <strong>Convert</strong> tab.</div>
-    <div id="histDeleteDiskHint" class="hint hidden" style="font-size:.75rem;color:#fbbf24;margin:-.35rem 0 .7rem">Disk space is low — use <strong>Delete</strong> on finished History rows to free space under ~/TwitchRecordings.</div>
+    <div id="histDeleteDiskHint" class="hint hidden" style="font-size:.75rem;color:#fbbf24;margin:-.35rem 0 .7rem">Disk space is low — use <strong>Delete</strong> or <strong>Delete selected</strong> on finished History rows to free space under ~/TwitchRecordings.</div>
     <div id="histList"></div>
   </div>
 
@@ -438,7 +445,8 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.33'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.34'; // keep in sync with badge + HELPER_VERSION
+let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, homeStreamer:'', returnHomeAfterSet:true };
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
@@ -1647,7 +1655,7 @@ function updateHistDeleteDiskHint(){
 function noticeHelperDisk(){
   // One notify/flash per warn episode; reset when free space recovers above warn.
   // v6.30: sticky Auto Music pause banner + coherent one-shot that mentions Auto Music paused.
-  // v6.33: History Delete frees space hint when diskWarn/diskBlock.
+  // v6.33/v6.34: History Delete / Delete selected frees space hint when diskWarn/diskBlock.
   if(!helper.ok){ updateHistDeleteDiskHint(); return; }
   updateHistDeleteDiskHint();
   const ban=document.getElementById('diskLowMusicBanner');
@@ -3878,17 +3886,28 @@ function renderHist(){
     }
     if(isSeamlessExportName(h.name)) notes.push('<span style="color:#86efac">seamless</span>');
     const rowNote=notes.length?(' · '+notes.join(' · ')):'';
-    // v6.33: Delete finished helper/disk files (not tab-capture blob-only, not while recording)
+    // v6.33/v6.34: Delete finished helper/disk files (not tab-capture blob-only, not while recording)
     let delBtn='';
-    if(diskish && !stillRec && h.name && helper.ok){
+    let selBox='';
+    const canDelete=!!(diskish && !stillRec && h.name && helper.ok);
+    if(canDelete){
       delBtn=`<button class="btn btn-red btn-sm" onclick="deleteRecordingFromHist(${i})" title="Delete from ~/TwitchRecordings (frees disk; natives remove music/vocals/seamless too)">Delete</button>`;
+      const checked=histSelected.has(h.name)?' checked':'';
+      const escName=String(h.name).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+      selBox=`<input type="checkbox" class="hist-sel" data-hist-name="${escName}"${checked} onchange="histToggleSelect(this)" title="Select for Delete selected">`;
+    }else if(h.name && histSelected.has(h.name)){
+      // Drop stale selection for rows that are no longer eligible
+      try{ histSelected.delete(h.name); }catch(e){}
     }
+    const mainInner=`<div><strong>${h.name}</strong><small>${h.dur} · ${h.size}${h.recovered?' · Recovered':''}${h.fromDisk?' · disk/helper':(h.helperFile?' · disk':'')}${rowNote}</small>${meterHtml}</div>`;
+    const left=selBox?(`<div class="hist-sel-wrap">${selBox}${mainInner}</div>`):mainInner;
     return `
     <div class="hist-item">
-      <div><strong>${h.name}</strong><small>${h.dur} · ${h.size}${h.recovered?' · Recovered':''}${h.fromDisk?' · disk/helper':(h.helperFile?' · disk':'')}${rowNote}</small>${meterHtml}</div>
+      ${left}
       <div class="hist-actions">${dlBtn}${seamlessBtns}${musicBtns}${blobBtn}${delBtn}</div>
     </div>`;
   }).join('');
+  try{ updateHistDeleteSelectedBtn(); }catch(e){}
 }
 function reDl(i){
   const r=recordings[i];
@@ -4190,21 +4209,7 @@ async function deleteRecordingFromHist(i){
     }
     const deleted=Array.isArray(d.deleted)?d.deleted:[];
     const freed=(typeof d.bytesFreed==='number' && d.bytesFreed>0)?(' · '+fmtDiskBytes(d.bytesFreed)+' freed'):'';
-    const drop=new Set(deleted);
-    drop.add(r.name);
-    // Revoke blob URLs only for rows we remove that had them
-    recordings=recordings.filter(function(h){
-      if(!h || !h.name) return true;
-      if(!drop.has(h.name)) return true;
-      try{ if(h.url) URL.revokeObjectURL(h.url); }catch(e){}
-      return false;
-    });
-    deleted.forEach(function(n){
-      try{ delete diskFileIndex[n]; }catch(e){}
-      try{ delete musicJobs[n]; }catch(e){}
-      try{ delete seamlessJobs[n]; }catch(e){}
-      try{ autoMusicQueued.delete(n); }catch(e){}
-    });
+    _applyDeletedNamesToHist(deleted, [r.name]);
     renderHist();
     flashOk('Deleted '+deleted.length+' file'+(deleted.length===1?'':'s')+freed);
     try{ await fetchHelperFiles(); }catch(e){}
@@ -4212,7 +4217,121 @@ async function deleteRecordingFromHist(i){
     flashErr('Delete failed: '+(e.message||e));
   }
 }
-function clearHist(){recordings.forEach(h=>{try{if(h.url) URL.revokeObjectURL(h.url);}catch(e){}});recordings=[];musicJobs={};musicJobsNotified=new Set();autoMusicQueued=new Set();seamlessJobs={};seamlessJobsNotified=new Set();seamlessAutoStarted=new Set();diskFileIndex={};renderHist();}
+function histEligibleNames(){
+  // Currently listed finished helper/disk rows (same eligibility as Delete).
+  const out=[];
+  recordings.forEach(function(h){
+    if(!h || !h.name) return;
+    const diskish=!!(h.fromDisk || h.helperFile);
+    const stillRec=h.dur==='recording…' || !!h.recording;
+    if(diskish && !stillRec && helper.ok) out.push(h.name);
+  });
+  return out;
+}
+function updateHistDeleteSelectedBtn(){
+  const btn=document.getElementById('histDeleteSelectedBtn');
+  if(!btn) return;
+  // Prune selection to names still present + eligible
+  const eligible=new Set(histEligibleNames());
+  Array.from(histSelected).forEach(function(n){ if(!eligible.has(n)) histSelected.delete(n); });
+  const n=histSelected.size;
+  btn.disabled=n===0 || !helper.ok;
+  btn.textContent=n>0?('Delete selected ('+n+')'):'Delete selected';
+}
+function histToggleSelect(el){
+  if(!el) return;
+  const name=el.getAttribute('data-hist-name') || '';
+  if(!name) return;
+  if(el.checked) histSelected.add(name);
+  else histSelected.delete(name);
+  updateHistDeleteSelectedBtn();
+}
+function histSelectAllEligible(){
+  histEligibleNames().forEach(function(n){ histSelected.add(n); });
+  renderHist();
+  const n=histSelected.size;
+  if(n) flashOk('Selected '+n+' finished recording'+(n===1?'':'s'));
+  else flashErr(helper.ok?'No finished helper/disk rows to select.':'Local helper not running — start it to select disk files.');
+}
+function histClearSelection(){
+  histSelected=new Set();
+  renderHist();
+}
+function _applyDeletedNamesToHist(deleted, alsoNames){
+  const drop=new Set(Array.isArray(deleted)?deleted:[]);
+  (alsoNames||[]).forEach(function(n){ if(n) drop.add(n); });
+  recordings=recordings.filter(function(h){
+    if(!h || !h.name) return true;
+    if(!drop.has(h.name)) return true;
+    try{ if(h.url) URL.revokeObjectURL(h.url); }catch(e){}
+    return false;
+  });
+  drop.forEach(function(n){
+    try{ delete diskFileIndex[n]; }catch(e){}
+    try{ delete musicJobs[n]; }catch(e){}
+    try{ delete seamlessJobs[n]; }catch(e){}
+    try{ autoMusicQueued.delete(n); }catch(e){}
+    try{ histSelected.delete(n); }catch(e){}
+  });
+}
+async function deleteSelectedFromHist(){
+  const names=Array.from(histSelected);
+  if(!names.length){
+    flashErr('No recordings selected.');
+    return;
+  }
+  if(!helper.ok){
+    flashErr('Local helper not running — start twitch-recorder-server.py to delete from ~/TwitchRecordings.');
+    return;
+  }
+  // Re-validate eligibility (ACTIVE rows shouldn't stay checked, but be safe)
+  const eligible=new Set(histEligibleNames());
+  const toDelete=names.filter(function(n){ return eligible.has(n); });
+  if(!toDelete.length){
+    histSelected=new Set();
+    renderHist();
+    flashErr('Selection no longer eligible — still recording or not on disk.');
+    return;
+  }
+  const msg='Delete '+toDelete.length+' selected recording'+(toDelete.length===1?'':'s')
+    +' from ~/TwitchRecordings? Music/vocals/seamless siblings for natives are removed too.';
+  if(!confirm(msg)) return;
+  try{
+    const d=await helperFetch('/api/delete', {names:toDelete, withSiblings:true}, 60000);
+    if(!d){
+      flashErr('Delete selected failed');
+      return;
+    }
+    const deleted=Array.isArray(d.deleted)?d.deleted:[];
+    const failed=Array.isArray(d.failed)?d.failed:[];
+    const failedNames=new Set(failed.map(function(f){ return f && f.name; }).filter(Boolean));
+    const freedBytes=(typeof d.bytesFreed==='number')?d.bytesFreed:((typeof d.freedBytes==='number')?d.freedBytes:0);
+    const freed=(freedBytes>0)?(' · '+fmtDiskBytes(freedBytes)+' freed'):'';
+    // Drop successfully deleted files + requested primaries that did not fail (siblings may be in deleted[])
+    const okPrimaries=toDelete.filter(function(n){ return !failedNames.has(n); });
+    if(deleted.length || okPrimaries.length){
+      _applyDeletedNamesToHist(deleted, okPrimaries);
+    }
+    // Keep checkboxes only for failed names still listed
+    histSelected=new Set(Array.from(histSelected).filter(function(n){ return failedNames.has(n); }));
+    renderHist();
+    if(deleted.length && failed.length){
+      const failBits=failed.slice(0,4).map(function(f){ return (f.name||'?')+': '+(f.error||'failed'); }).join('; ');
+      flashErr('Deleted '+deleted.length+' file'+(deleted.length===1?'':'s')+freed+' — '+failed.length+' failed: '+failBits);
+    }else if(deleted.length){
+      flashOk('Deleted '+deleted.length+' file'+(deleted.length===1?'':'s')+freed);
+      histSelected=new Set();
+      updateHistDeleteSelectedBtn();
+    }else{
+      flashErr((d && d.error) || (failed[0] && failed[0].error) || 'Delete selected failed');
+    }
+    try{ await fetchHelperFiles(); }catch(e){}
+  }catch(e){
+    flashErr('Delete selected failed: '+(e.message||e));
+  }
+}
+
+function clearHist(){recordings.forEach(h=>{try{if(h.url) URL.revokeObjectURL(h.url);}catch(e){}});recordings=[];musicJobs={};musicJobsNotified=new Set();autoMusicQueued=new Set();seamlessJobs={};seamlessJobsNotified=new Set();seamlessAutoStarted=new Set();diskFileIndex={};histSelected=new Set();renderHist();}
 
 // ─── UI HELPERS ──────────────────────────────────────
 function switchTab(el,id){

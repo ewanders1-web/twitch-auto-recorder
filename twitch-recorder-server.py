@@ -17,7 +17,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8765
-HELPER_VERSION = "6.33"
+HELPER_VERSION = "6.34"
 REC_DIR = Path.home() / "TwitchRecordings"
 HTML_NAME = "twitch-auto-recorder.html"
 HERE = Path(__file__).resolve().parent
@@ -702,73 +702,22 @@ def collect_native_sibling_paths(native_name):
     return found
 
 
-def delete_recording_files(names, with_siblings=True):
-    """Delete finished recording file(s) under REC_DIR.
+def _delete_busy_for_candidates(candidates):
+    """Return (busy_users, busy_music_names) for ACTIVE / in-flight Music inputs.
 
-    Path-safe (basenames only). Never deletes ACTIVE/growing files or an in-flight
-    demucs/music-only input. When with_siblings and the request is a native, also
-    removes -music / -vocals / -seamless siblings. When the request is already a
-    sibling export, only that file is deleted.
-
-    Returns (payload, http_status).
+    candidates: list of Path under REC_DIR. Never mutates ACTIVE or MUSIC_JOBS.
     """
-    if isinstance(names, str):
-        names = [names]
-    if not isinstance(names, (list, tuple)):
-        return {"ok": False, "error": "name or names required"}, 400
-
-    # Unique safe basenames, preserve order
-    seen = set()
-    primaries = []
-    for raw in names:
-        bn = safe_rec_basename(raw)
-        if not bn or bn in seen:
-            continue
-        seen.add(bn)
-        primaries.append(bn)
-    if not primaries:
-        return {"ok": False, "error": "name or names required"}, 400
-
-    # Build candidate Paths (deduped)
-    candidates = []
     cand_names = set()
-
-    def _add(path):
-        if path is None:
-            return
+    abs_cands = {}
+    for p in candidates:
         try:
-            key = path.name
-            if key in cand_names:
-                return
-            if not path.is_file():
-                return
-            cand_names.add(key)
-            candidates.append(path)
+            cand_names.add(p.name)
+            abs_cands[os.path.abspath(str(p))] = p.name
         except OSError:
-            return
-
-    for bn in primaries:
-        primary = resolve_download_path(bn)
-        if primary:
-            _add(primary)
-        # Expand siblings only for natives (not already -music/-vocals/-seamless)
-        if with_siblings and not is_music_export_name(bn) and not is_seamless_export_name(bn):
-            for sib in collect_native_sibling_paths(bn):
-                _add(sib)
-
-    if not candidates:
-        return {"ok": False, "error": "not found"}, 404
-
-    # Refuse if any candidate is an ACTIVE (growing) recording file
+            continue
+    busy_users = []
     with LOCK:
         reap_locked()
-        busy_users = []
-        abs_cands = {}
-        for p in candidates:
-            try:
-                abs_cands[os.path.abspath(str(p))] = p.name
-            except OSError:
-                continue
         for user, rec in ACTIVE.items():
             f = rec.get("file") or ""
             if not f:
@@ -779,38 +728,83 @@ def delete_recording_files(names, with_siblings=True):
                 continue
             if af in abs_cands:
                 busy_users.append(user)
-        busy_users = sorted(set(busy_users))
-    if busy_users:
-        who = ", ".join(busy_users)
-        return {
-            "ok": False,
-            "error": (
-                f"still recording — cannot delete while active for {who}; "
-                f"stop first or wait for the segment to finish"
-            ),
-            "active": busy_users,
-        }, 409
-
-    # Refuse if any candidate is the input name of a queued/running demucs job
+    busy_users = sorted(set(busy_users))
     busy_music = []
     with MUSIC_JOBS_LOCK:
-        for jid, job in MUSIC_JOBS.items():
+        for _jid, job in MUSIC_JOBS.items():
             if (job.get("status") or "") not in ("queued", "running"):
                 continue
             jname = job.get("name") or ""
             if jname and jname in cand_names:
                 busy_music.append(jname)
     busy_music = sorted(set(busy_music))
+    return busy_users, busy_music
+
+
+def _delete_one_primary(bn, with_siblings=True, already_deleted=None):
+    """Delete one path-safe primary (+ optional siblings). Independent of other names.
+
+    Returns dict:
+      ok True  -> deleted:[...], bytesFreed:int
+      ok False -> error:str, status:int (409/404), optional active/musicJobs
+    already_deleted: set of basenames removed earlier in this multi request (mutated).
+    """
+    if already_deleted is None:
+        already_deleted = set()
+    # Already removed as a sibling of an earlier primary in this request
+    if bn in already_deleted:
+        return {"ok": True, "deleted": [], "bytesFreed": 0, "skippedAlreadyDeleted": True}
+
+    candidates = []
+    cand_names = set()
+
+    def _add(path):
+        if path is None:
+            return
+        try:
+            key = path.name
+            if key in cand_names or key in already_deleted:
+                return
+            if not path.is_file():
+                return
+            cand_names.add(key)
+            candidates.append(path)
+        except OSError:
+            return
+
+    primary = resolve_download_path(bn)
+    if primary:
+        _add(primary)
+    if with_siblings and not is_music_export_name(bn) and not is_seamless_export_name(bn):
+        for sib in collect_native_sibling_paths(bn):
+            _add(sib)
+
+    if not candidates:
+        return {"ok": False, "error": "not found", "status": 404}
+
+    busy_users, busy_music = _delete_busy_for_candidates(candidates)
+    if busy_users:
+        who = ", ".join(busy_users)
+        return {
+            "ok": False,
+            "status": 409,
+            "error": (
+                f"still recording — cannot delete while active for {who}; "
+                f"stop first or wait for the segment to finish"
+            ),
+            "active": busy_users,
+        }
     if busy_music:
         return {
             "ok": False,
+            "status": 409,
             "error": (
                 "Music only / Demucs in progress for "
                 + ", ".join(busy_music)
                 + " — cancel waiting or wait for it to finish before deleting"
             ),
             "musicJobs": busy_music,
-        }, 409
+        }
 
     deleted = []
     bytes_freed = 0
@@ -824,6 +818,7 @@ def delete_recording_files(names, with_siblings=True):
                 pass
             p.unlink()
             deleted.append(p.name)
+            already_deleted.add(p.name)
             bytes_freed += max(0, sz)
             log(f"delete removed {p.name} ({sz} bytes)")
         except OSError as e:
@@ -832,21 +827,138 @@ def delete_recording_files(names, with_siblings=True):
 
     if not deleted:
         err = "; ".join(errors) if errors else "not found"
-        return {"ok": False, "error": err}, 404
+        return {"ok": False, "error": err, "status": 404}
+
+    out = {"ok": True, "deleted": deleted, "bytesFreed": bytes_freed}
+    if errors:
+        out["errors"] = errors
+    return out
+
+
+def delete_recording_files(names, with_siblings=True):
+    """Delete finished recording file(s) under REC_DIR.
+
+    Path-safe (basenames only). Never deletes ACTIVE/growing files or an in-flight
+    demucs/music-only input. When with_siblings and the request is a native, also
+    removes -music / -vocals / -seamless siblings. When the request is already a
+    sibling export, only that file is deleted.
+
+    v6.34: multi-name requests process each primary independently (one ACTIVE /
+    Music conflict does not block deleting other finished names). Response always
+    includes deleted[] and failed:[{name,error}]; bytesFreed / freedBytes sum.
+
+    Returns (payload, http_status).
+    """
+    if isinstance(names, str):
+        names = [names]
+    if not isinstance(names, (list, tuple)):
+        return {"ok": False, "error": "name or names required"}, 400
+
+    # Unique safe basenames, preserve order
+    seen = set()
+    primaries = []
+    unsafe = []
+    for raw in names:
+        bn = safe_rec_basename(raw)
+        if not bn:
+            if raw is not None and str(raw).strip():
+                unsafe.append({"name": str(raw), "error": "unsafe name"})
+            continue
+        if bn in seen:
+            continue
+        seen.add(bn)
+        primaries.append(bn)
+    if not primaries and unsafe:
+        return {
+            "ok": False,
+            "error": "name or names required",
+            "deleted": [],
+            "failed": unsafe,
+            "bytesFreed": 0,
+            "freedBytes": 0,
+        }, 400
+    if not primaries:
+        return {"ok": False, "error": "name or names required"}, 400
+
+    already_deleted = set()
+    deleted = []
+    failed = list(unsafe)
+    bytes_freed = 0
+    single = len(primaries) == 1 and not unsafe
+
+    for bn in primaries:
+        one = _delete_one_primary(bn, with_siblings=with_siblings, already_deleted=already_deleted)
+        if one.get("ok"):
+            for n in one.get("deleted") or []:
+                if n not in deleted:
+                    deleted.append(n)
+            bytes_freed += int(one.get("bytesFreed") or 0)
+        else:
+            failed.append({
+                "name": bn,
+                "error": one.get("error") or "delete failed",
+            })
+            # Preserve single-name 409/404 shape for the existing History Delete button
+            if single:
+                status = int(one.get("status") or 404)
+                payload = {"ok": False, "error": one.get("error") or "delete failed", "deleted": [], "failed": failed}
+                if one.get("active") is not None:
+                    payload["active"] = one["active"]
+                if one.get("musicJobs") is not None:
+                    payload["musicJobs"] = one["musicJobs"]
+                payload["bytesFreed"] = 0
+                payload["freedBytes"] = 0
+                return payload, status
+
+    if not deleted and failed:
+        # Multi: none deleted — prefer 409 if any busy, else 404
+        statuses = []
+        for f in failed:
+            err = (f.get("error") or "").lower()
+            if "still recording" in err or "music only" in err or "demucs" in err:
+                statuses.append(409)
+            elif "unsafe" in err:
+                statuses.append(400)
+            else:
+                statuses.append(404)
+        status = 409 if 409 in statuses else (400 if all(s == 400 for s in statuses) else 404)
+        err = failed[0]["error"] if len(failed) == 1 else (
+            f"{len(failed)} failed — " + "; ".join(
+                f"{x['name']}: {x['error']}" for x in failed[:5]
+            )
+        )
+        return {
+            "ok": False,
+            "error": err,
+            "deleted": [],
+            "failed": failed,
+            "bytesFreed": 0,
+            "freedBytes": 0,
+            "dir": str(REC_DIR),
+        }, status
 
     payload = {
         "ok": True,
         "deleted": deleted,
+        "failed": failed,
         "bytesFreed": bytes_freed,
+        "freedBytes": bytes_freed,
         "dir": str(REC_DIR),
     }
-    if errors:
-        payload["errors"] = errors
+    if failed:
+        # Partial success — still ok:true so UI can drop deleted rows; surface failed
+        payload["error"] = (
+            f"Deleted {len(deleted)} file(s); {len(failed)} failed — "
+            + "; ".join(f"{x['name']}: {x['error']}" for x in failed[:5])
+        )
     return payload, 200
 
 
 def api_delete_recordings(body):
-    """POST /api/delete — {name} or {names}, optional withSiblings (default true)."""
+    """POST /api/delete — {name} or {names}, optional withSiblings (default true).
+
+    v6.34: multi-name deletes each primary independently (partial ok + failed[]).
+    """
     if not isinstance(body, dict):
         return {"ok": False, "error": "invalid body"}, 400
     names = body.get("names")

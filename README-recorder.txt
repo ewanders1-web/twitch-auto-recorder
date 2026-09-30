@@ -1,4 +1,4 @@
-Twitch Auto-Recorder v6.33
+Twitch Auto-Recorder v6.34
 
 pip install streamlink
 python twitch-recorder-server.py
@@ -43,6 +43,8 @@ Disk-low pause for Auto Music / Demucs (v6.30): when free space under ~/TwitchRe
 Safe deferred helper restart after update (v6.32): apply_update still never self-kills (ACTIVE recordings and running demucs stay up). /api/health now exposes diskVersion + pendingRestart when the on-disk VERSION differs from the running HELPER_VERSION. When idle (no ACTIVE, no queued/running Music jobs), the helper auto-schedules one graceful restart (~0.8s then os.execv). POST /api/restart (optional {force:false}) refuses with HTTP 409 while busy unless force:true (UI never auto-forces). Sticky banner + helper-bar "restart pending (disk vX)" + Restart helper button; after Install update the banner sticks until the new process is up.
 
 Delete finished recordings from History (v6.33): History rows for finished helper/disk files get a Delete button. POST /api/delete accepts { "name" } or { "names" } with optional { "withSiblings": true } (default). Path-safe basenames only under ~/TwitchRecordings. Refuses HTTP 409 while the file is an ACTIVE/growing recording or the input of a queued/running Music only / Demucs job. When deleting a native, withSiblings also removes matching -music / -vocals / -seamless siblings (numbered variants included); deleting a sibling export removes only that file. Natives are never silently removed by Music only / Demucs (unchanged). When diskWarn/diskBlock, History shows a one-line hint that Delete frees space.
+
+History multi-select + Delete selected (v6.34): Finished helper/disk History rows get a checkbox; toolbar has Select all finished, Clear selection, and Delete selected (disabled until something is checked). One confirm deletes all checked names via POST /api/delete { "names": [...] } with withSiblings (same as single Delete — natives also remove -music/-vocals/-seamless). Multi-name deletes process each primary independently: ACTIVE / in-flight Music inputs return per-file failures (409 semantics) without blocking other finished names; response includes deleted[], failed:[{name,error}], and bytesFreed/freedBytes. Partial success updates History for deleted rows only and surfaces failures. When diskWarn/diskBlock, the History disk hint mentions Delete selected.
 
 Unmute add-on — auto-unmute Twitch on Arm (v6.31)
 -------------------------------------------------
