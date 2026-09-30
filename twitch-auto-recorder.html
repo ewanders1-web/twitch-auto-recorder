@@ -4904,7 +4904,8 @@ function renderPipelineBox(){
       const b=driveEsc(dv.base).replace(/&#39;/g,"\\'");
       return '<div class="dp-row"><span>'+driveEsc(dv.base)+'</span>'+pipelineBadgeHtml(dv)
         +(dv.status!=='sent'?'<button class="btn btn-gray btn-sm" onclick="pipelineSendNow(\''+b+'\')">Send now</button>':'')
-        +'</div>';
+        +'</div>'
+        +(dv.status==='error'&&dv.error?'<div class="hint" style="color:#fca5a5;margin:.1rem 0 .3rem">'+driveEsc(dv.error)+'</div>':'');
     }).join('')+'</div>';
   }
   el.innerHTML=html;

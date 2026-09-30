@@ -4947,6 +4947,15 @@ def atomic_copy(src, dest):
     return dest
 
 
+def drive_permission_message():
+    """macOS privacy (TCC) blocks background apps from File Provider folders until allowed."""
+    exe = os.path.realpath(sys.executable or "python3")
+    return ("macOS is blocking the helper from Google Drive (Operation not permitted). "
+            "Open System Settings → Privacy & Security → Full Disk Access, press +, add "
+            f"{exe} (⌘⇧G to type the path) and turn it on — the helper retries every 5 min "
+            "and sends the waiting parts on its own.")
+
+
 def _my_drive_dir(root):
     for sc in root.get("shortcuts") or []:
         if sc.get("label") == "My Drive":
@@ -4978,6 +4987,8 @@ def resolve_delivery_target(roots=None, create=False):
                     real = os.path.realpath(entry.path)
                     if any(_path_within(real, rr["path"]) for rr in roots):
                         return real, "auto", None
+        except PermissionError:
+            return None, "auto", drive_permission_message()
         except OSError:
             continue
     target = os.path.join(_my_drive_dir(roots[0]), *DEFAULT_TARGET_REL)
@@ -5059,6 +5070,8 @@ def deliver_one(base):
                                 note="Waiting for Drive (Drive for Desktop not found)")
     try:
         target, _kind, err = resolve_delivery_target(roots, create=True)
+    except PermissionError:
+        target, err = None, drive_permission_message()
     except OSError as e:
         target, err = None, f"cannot create target folder: {e}"
     if err or not target:
@@ -5082,7 +5095,8 @@ def deliver_one(base):
         return snap
     except Exception as e:
         log(f"drive delivery error base={base}: {e}")
-        return _delivery_update(base, status="error", error=str(e) or type(e).__name__)
+        msg = drive_permission_message() if isinstance(e, PermissionError) else (str(e) or type(e).__name__)
+        return _delivery_update(base, status="error", error=msg)
     finally:
         DELIVERY_STATE["busy"] = False
 
