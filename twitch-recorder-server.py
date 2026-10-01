@@ -17,7 +17,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.36"
+HELPER_VERSION = "6.37"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -764,6 +764,10 @@ def _delete_one_primary(bn, with_siblings=True, already_deleted=None):
       ok True  -> deleted:[...], bytesFreed:int
       ok False -> error:str, status:int (409/404), optional active/musicJobs
     already_deleted: set of basenames removed earlier in this multi request (mutated).
+
+    v6.37: withSiblings on a native also removes Drive parts/<native_stem>/;
+    deleting a -music primary removes Drive parts/<music_base_stem>/. Refuses 409
+    while a Drive copy is mid-send for that exact base.
     """
     if already_deleted is None:
         already_deleted = set()
@@ -822,6 +826,22 @@ def _delete_one_primary(bn, with_siblings=True, already_deleted=None):
             "musicJobs": busy_music,
         }
 
+    # v6.37: which Drive parts/<base>/ folder (if any) should go with this delete
+    drive_base = None
+    if is_music_export_name(bn):
+        drive_base = music_base_stem(bn)
+    elif with_siblings and not is_seamless_export_name(bn):
+        drive_base = Path(bn).stem
+    if drive_base and DELIVERY_STATE.get("busy") and DELIVERY_STATE.get("base") == drive_base:
+        return {
+            "ok": False,
+            "status": 409,
+            "error": (
+                "Drive send in progress for this recording — "
+                "wait for it to finish before deleting"
+            ),
+        }
+
     deleted = []
     bytes_freed = 0
     errors = []
@@ -845,6 +865,17 @@ def _delete_one_primary(bn, with_siblings=True, already_deleted=None):
         err = "; ".join(errors) if errors else "not found"
         return {"ok": False, "error": err, "status": 404}
 
+    # v6.37: remove matching Drive parts folder; count bytes; drop waiting deliveries
+    if drive_base:
+        try:
+            parts_freed = remove_drive_parts_for_delete(drive_base)
+            bytes_freed += max(0, int(parts_freed or 0))
+            if parts_freed:
+                deleted.append(f"Drive parts/{drive_base}/")
+        except Exception as e:
+            errors.append(f"Drive parts/{drive_base}: {e}")
+            log(f"delete Drive parts failed base={drive_base}: {e}")
+
     out = {"ok": True, "deleted": deleted, "bytesFreed": bytes_freed}
     if errors:
         out["errors"] = errors
@@ -856,8 +887,10 @@ def delete_recording_files(names, with_siblings=True):
 
     Path-safe (basenames only). Never deletes ACTIVE/growing files or an in-flight
     demucs/music-only input. When with_siblings and the request is a native, also
-    removes -music / -vocals / -seamless siblings. When the request is already a
-    sibling export, only that file is deleted.
+    removes -music / -vocals / -seamless siblings and Drive parts/<stem>/. When the
+    request is a -music export, also removes Drive parts/<music_base_stem>/. Other
+    sibling exports delete only that file. Refuses 409 while Drive copy is mid-send
+    for that base.
 
     v6.34: multi-name requests process each primary independently (one ACTIVE /
     Music conflict does not block deleting other finished names). Response always
@@ -4791,7 +4824,7 @@ PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
 PIPELINE_LOCK = threading.RLock()
 PIPELINE = {"enabled": True, "users": {}, "target": "", "deliveries": {}}
 DELIVERY_WAKE = threading.Event()
-DELIVERY_STATE = {"busy": False, "force": set()}
+DELIVERY_STATE = {"busy": False, "force": set(), "base": None}  # v6.37: base while mid-copy
 PIPELINE_SEEN = set()  # first-segment basenames already queued by this process
 MUSIC_OGG_ARGS = ["-c:a", "libvorbis", "-q:a", "6", "-ar", "44100", "-ac", "2"]
 AUTO_TARGET_NAMES = ("twitch", "twitchrecordings", "twitch recordings", "twitch-recordings")
@@ -5021,6 +5054,8 @@ def _sync_jobs_with_delivery(base, snap):
     st = snap.get("status")
     if st == "sent":
         msg = f"Sent to Drive ({n} part{pl})"
+        if snap.get("localPartsCleared"):
+            msg += " · local parts cleared"
     elif st == "error":
         msg = f"{n} parts ready — Drive send failed: {snap.get('error')}"
     elif st == "waiting":
@@ -5032,6 +5067,105 @@ def _sync_jobs_with_delivery(base, snap):
             if job.get("base") == base and job.get("status") == "done" and job.get("source") in ("pipeline", "split"):
                 job["progress"] = msg
                 job["deliveryStatus"] = st
+
+
+def _safe_drive_parts_base(base):
+    """Return a single path-safe folder name under DRIVE_PARTS_DIR, or None."""
+    if not base or not isinstance(base, str):
+        return None
+    b = base.strip()
+    if not b or b in (".", "..") or chr(0) in b:
+        return None
+    if "/" in b or "\\" in b:
+        return None
+    if os.path.basename(b) != b:
+        return None
+    return b
+
+
+def clear_local_drive_parts(base):
+    """Remove ~/TwitchRecordings/Drive parts/<base>/ after a successful send (or on delete).
+
+    Path-safe: only under DRIVE_PARTS_DIR, no traversal. Tolerates missing files.
+    Never touches the full -music.ogg in REC_DIR. Returns bytes freed.
+    """
+    b = _safe_drive_parts_base(base)
+    if not b:
+        return 0
+    try:
+        parts_root = DRIVE_PARTS_DIR.resolve()
+        target = (DRIVE_PARTS_DIR / b).resolve()
+    except OSError:
+        return 0
+    try:
+        target.relative_to(parts_root)
+    except ValueError:
+        log(f"drive parts clear refused (escape): base={b!r}")
+        return 0
+    if target == parts_root:
+        return 0
+    try:
+        if not target.exists() or not target.is_dir():
+            return 0
+    except OSError:
+        return 0
+    bytes_freed = 0
+    try:
+        for dirpath, _dirnames, filenames in os.walk(str(target)):
+            for fn in filenames:
+                fp = Path(dirpath) / fn
+                try:
+                    bytes_freed += max(0, int(fp.stat().st_size))
+                except OSError:
+                    pass
+        shutil.rmtree(str(target), ignore_errors=True)
+        log(f"drive parts cleared base={b} freed={bytes_freed} bytes")
+    except Exception as e:
+        log(f"drive parts clear failed base={b}: {e}")
+    return max(0, int(bytes_freed))
+
+
+def clear_sent_local_drive_parts_backfill():
+    """v6.37 startup: drop leftover Drive parts/<base>/ for deliveries already status=sent."""
+    with PIPELINE_LOCK:
+        bases = [
+            b for b, d in PIPELINE["deliveries"].items()
+            if isinstance(d, dict) and d.get("status") == "sent" and not d.get("localPartsCleared")
+        ]
+    if not bases:
+        return
+    total = 0
+    for base in bases:
+        freed = clear_local_drive_parts(base)
+        total += freed
+        _delivery_update(base, localPartsCleared=True, partsDir=None)
+    log(f"drive parts sent-backfill: {len(bases)} delivery(ies), freed={total} bytes")
+
+
+def remove_drive_parts_for_delete(base):
+    """Clear Drive parts/<base>/ and update delivery state so UI does not claim parts ready.
+
+    Waiting/error deliveries are dropped (parts gone — retry would need Re-split).
+    Sent deliveries keep their history badge with localPartsCleared.
+    Returns bytes freed.
+    """
+    b = _safe_drive_parts_base(base)
+    if not b:
+        return 0
+    freed = clear_local_drive_parts(b)
+    with PIPELINE_LOCK:
+        d = PIPELINE["deliveries"].get(b)
+        if d is not None:
+            st = d.get("status")
+            if st == "sent":
+                d["localPartsCleared"] = True
+                d["partsDir"] = None
+                d["updatedAt"] = time.time()
+            else:
+                # waiting / error / anything else — parts no longer on disk
+                PIPELINE["deliveries"].pop(b, None)
+    _pipeline_save()
+    return freed
 
 
 def register_delivery(base, music_name, parts_dir, names, part_secs, source):
@@ -5048,6 +5182,7 @@ def register_delivery(base, music_name, parts_dir, names, part_secs, source):
             "parts": list(names), "sizes": sizes, "partSecs": round(part_secs, 1),
             "status": "waiting", "target": None, "sentAt": None, "error": None,
             "source": source, "createdAt": now, "updatedAt": now, "lastAttempt": 0,
+            "localPartsCleared": False,  # v6.37
         }
         # keep the state file small
         if len(PIPELINE["deliveries"]) > 300:
@@ -5064,6 +5199,9 @@ def deliver_one(base):
         if not d:
             return None
         d = dict(d)
+    # v6.37: already sent (local parts may already be cleared) — do not re-copy
+    if d.get("status") == "sent":
+        return d
     roots = detect_drive_roots()
     if not roots:
         return _delivery_update(base, status="waiting", error=None, lastAttempt=time.time(),
@@ -5078,6 +5216,7 @@ def deliver_one(base):
         return _delivery_update(base, status="error", error=err or "no target", lastAttempt=time.time())
     _delivery_update(base, status="sending", error=None, target=target, lastAttempt=time.time(), note=None)
     DELIVERY_STATE["busy"] = True
+    DELIVERY_STATE["base"] = base
     try:
         for nm in d.get("parts") or []:
             src = Path(d["partsDir"]) / nm
@@ -5090,8 +5229,16 @@ def deliver_one(base):
             except OSError:
                 pass
             atomic_copy(src, dest)
+        # Mark sent first so a crash mid-clear does not leave status=waiting with missing parts
         snap = _delivery_update(base, status="sent", sentAt=time.time(), target=target, error=None)
         log(f"drive delivery sent base={base} parts={len(d.get('parts') or [])} → {target}")
+        # v6.37: free local Drive parts after successful send (full -music.ogg kept)
+        freed = clear_local_drive_parts(base)
+        snap = _delivery_update(
+            base, status="sent", localPartsCleared=True, partsDir=None,
+        ) or snap
+        if freed:
+            log(f"drive parts post-send cleared base={base} freed={freed} bytes")
         return snap
     except Exception as e:
         log(f"drive delivery error base={base}: {e}")
@@ -5099,6 +5246,7 @@ def deliver_one(base):
         return _delivery_update(base, status="error", error=msg)
     finally:
         DELIVERY_STATE["busy"] = False
+        DELIVERY_STATE["base"] = None
 
 
 def delivery_loop():
@@ -5144,7 +5292,8 @@ def deliveries_snapshot(limit=60):
         for d in items[:limit]:
             out.append({k: d.get(k) for k in (
                 "base", "musicName", "parts", "sizes", "partSecs", "status", "target",
-                "sentAt", "error", "note", "source", "createdAt", "updatedAt")})
+                "sentAt", "error", "note", "source", "createdAt", "updatedAt",
+                "localPartsCleared")})
     return out
 
 
@@ -5216,6 +5365,8 @@ def _split_and_deliver(job_id, music_path, source, progress, pct=95):
     st = snap.get("status")
     if st == "sent":
         msg = f"Sent to Drive ({len(names)} part{'s' if len(names) != 1 else ''})"
+        if snap.get("localPartsCleared"):
+            msg += " · local parts cleared"
     elif st == "error":
         msg = f"{len(names)} parts ready — Drive send failed: {snap.get('error')}"
     else:
@@ -5805,6 +5956,11 @@ def main():
     threading.Thread(target=reaper_loop, daemon=True).start()
     # v6.36: after-stream Drive delivery state + periodic "Waiting for Drive" retry
     _pipeline_load()
+    # v6.37: free leftover local Drive parts for deliveries already sent (v6.36 leftovers)
+    try:
+        clear_sent_local_drive_parts_backfill()
+    except Exception as e:
+        log(f"drive parts sent-backfill failed: {e}")
     threading.Thread(target=delivery_loop, daemon=True, name="drive-delivery").start()
     request_delivery(None)
     threading.Thread(target=meter_loop, daemon=True, name="meter").start()

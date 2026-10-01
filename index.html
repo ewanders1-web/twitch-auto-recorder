@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.36</span>
+    <span class="badge">v6.37</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -512,7 +512,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.36'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.37'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false };
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
@@ -4325,8 +4325,10 @@ async function deleteRecordingFromHist(i){
   }
   const siblingOnly=isMusicExportName(r.name) || isSeamlessExportName(r.name);
   const msg=siblingOnly
-    ? ('Delete '+r.name+' from ~/TwitchRecordings?')
-    : ('Delete '+r.name+' from ~/TwitchRecordings? Music/vocals/seamless siblings for this recording are removed too.');
+    ? (isMusicExportName(r.name)
+        ? ('Delete '+r.name+' from ~/TwitchRecordings? Matching Drive parts folder is removed too.')
+        : ('Delete '+r.name+' from ~/TwitchRecordings?'))
+    : ('Delete '+r.name+' from ~/TwitchRecordings? Music/vocals/seamless siblings and Drive parts folders for this recording are removed too.');
   if(!confirm(msg)) return;
   try{
     const d=await helperFetch('/api/delete', {name:r.name, withSiblings:true}, 15000);
@@ -4421,7 +4423,7 @@ async function deleteSelectedFromHist(){
     return;
   }
   const msg='Delete '+toDelete.length+' selected recording'+(toDelete.length===1?'':'s')
-    +' from ~/TwitchRecordings? Music/vocals/seamless siblings for natives are removed too.';
+    +' from ~/TwitchRecordings? Music/vocals/seamless siblings and Drive parts folders for natives are removed too.';
   if(!confirm(msg)) return;
   try{
     const d=await helperFetch('/api/delete', {names:toDelete, withSiblings:true}, 60000);
@@ -4831,7 +4833,11 @@ function pipelineBadgeHtml(dv){
   const pl=n===1?'':'s';
   const st=dv.status||'';
   let txt, tip;
-  if(st==='sent'){ txt='☁ Sent to Drive ('+n+' part'+pl+')'; tip='In '+(dv.target||'Google Drive')+(dv.sentAt?(' · '+driveDate(dv.sentAt)):''); }
+  if(st==='sent'){
+    txt='☁ Sent to Drive ('+n+' part'+pl+')';
+    tip='In '+(dv.target||'Google Drive')+(dv.sentAt?(' · '+driveDate(dv.sentAt)):'');
+    if(dv.localPartsCleared){ txt+=' · local parts cleared'; tip+=' · local Drive parts cleared (Re-split for Drive can recreate)'; }
+  }
   else if(st==='sending'){ txt='⇪ Sending to Drive…'; tip=dv.target||''; }
   else if(st==='error'){ txt='⚠ Drive send failed'; tip=dv.error||'error'; }
   else { txt='⏳ Waiting for Drive ('+n+' part'+pl+' ready)'; tip=(dv.note||'Waiting for Google Drive for Desktop')+' — parts are in ~/TwitchRecordings/Drive parts/'+(dv.base||''); }
