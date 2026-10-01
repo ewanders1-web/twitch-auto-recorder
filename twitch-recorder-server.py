@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import socket  # v6.38: computer name for no-clobber Drive copies
+import ntpath  # v6.38: Windows Drive for Desktop detection (unit-testable on any OS)
 import time
 import urllib.parse
 import urllib.request
@@ -17,7 +19,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.37"
+HELPER_VERSION = "6.38"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -876,6 +878,12 @@ def _delete_one_primary(bn, with_siblings=True, already_deleted=None):
             errors.append(f"Drive parts/{drive_base}: {e}")
             log(f"delete Drive parts failed base={drive_base}: {e}")
 
+    # v6.38: a deleted original that never reached Drive can't be sent any more — drop it
+    for nm in list(deleted):
+        try:
+            forget_original_if_unsent(os.path.basename(str(nm)))
+        except Exception:
+            pass
     out = {"ok": True, "deleted": deleted, "bytesFreed": bytes_freed}
     if errors:
         out["errors"] = errors
@@ -2097,8 +2105,14 @@ def _pipeline_health_summary():
     with PIPELINE_LOCK:
         dels = list(PIPELINE["deliveries"].values())
         enabled = bool(PIPELINE["enabled"])
+        origs = list((PIPELINE.get("originals") or {}).values())
+        orig_on = bool(PIPELINE.get("origEnabled", True))
     return {
         "enabled": enabled,
+        "originals": orig_on,  # v6.38
+        "origWaiting": sum(1 for d in origs if d.get("status") in ("waiting", "queued")),
+        "origErrors": sum(1 for d in origs if d.get("status") == "error"),
+        "computer": computer_name(),
         "waiting": sum(1 for d in dels if d.get("status") == "waiting"),
         "errors": sum(1 for d in dels if d.get("status") == "error"),
         "sending": bool(DELIVERY_STATE.get("busy")),
@@ -2147,6 +2161,7 @@ def health_payload():
         # v6.36: after-stream → Drive delivery state
         "drivePipeline": _pipeline_health_summary(),
         "driveDeliveries": deliveries_snapshot(40),
+        "driveOriginals": originals_snapshot(60),  # v6.38
         "musicDemucsQueue": music_demucs_queue_info(),
         "seamlessJobs": seamless_jobs_for_health(),
         "updateRepo": f"https://github.com/{UPDATE_REPO}",
@@ -3566,10 +3581,56 @@ def _legacy_drive_volumes():
     return [Path("/Volumes/GoogleDrive")]
 
 
+def windows_drive_candidates(env=None, is_dir=None, letters="DEFGHIJKLMNOPQRSTUVWXYZ"):
+    """v6.38: Google Drive for Desktop locations on Windows (pure, unit-testable).
+
+    * Streaming mode: a drive letter (G: by default, any letter) whose root holds
+      "My Drive" and/or "Shared drives"  → root "G:\\".
+    * Mirror / legacy Backup & Sync: %USERPROFILE%\\Google Drive (may itself contain
+      "My Drive") and %USERPROFILE%\\My Drive.
+    Returns [{label, path, account, kind, shortcuts}] using Windows path syntax.
+    """
+    env = os.environ if env is None else env
+    is_dir = is_dir or os.path.isdir
+    out = []
+    for letter in letters:
+        root = f"{letter}:\\"
+        subs = [sc for sc in ("My Drive", "Shared drives") if is_dir(ntpath.join(root, sc))]
+        if subs:
+            out.append({"label": f"Google Drive ({letter}:)", "path": root, "account": "",
+                        "kind": "windows-letter",
+                        "shortcuts": [{"label": sc, "path": ntpath.join(root, sc)} for sc in subs]})
+    prof = env.get("USERPROFILE") or ""
+    if prof:
+        gd = ntpath.join(prof, "Google Drive")
+        if is_dir(gd):
+            inner = ntpath.join(gd, "My Drive")
+            md = inner if is_dir(inner) else gd
+            out.append({"label": "Google Drive (folder)", "path": gd, "account": "", "kind": "windows-folder",
+                        "shortcuts": [{"label": "My Drive", "path": md}]})
+        mdf = ntpath.join(prof, "My Drive")
+        if is_dir(mdf):
+            out.append({"label": "Google Drive (My Drive folder)", "path": mdf, "account": "",
+                        "kind": "windows-folder", "shortcuts": [{"label": "My Drive", "path": mdf}]})
+    return out
+
+
 def detect_drive_roots():
     """Return list of {label, path, account, kind, shortcuts:[{label,path}]} (real paths)."""
     roots = []
     seen = set()
+    if os.name == "nt":  # v6.38
+        try:
+            for r in windows_drive_candidates():
+                real = os.path.realpath(r["path"])
+                if os.path.normcase(real) in seen:
+                    continue
+                seen.add(os.path.normcase(real))
+                r["path"] = real
+                r["shortcuts"] = [{"label": sc["label"], "path": os.path.realpath(sc["path"])} for sc in r["shortcuts"]]
+                roots.append(r)
+        except OSError:
+            pass
     for base in _cloudstorage_bases():
         try:
             if not base.is_dir():
@@ -3608,6 +3669,8 @@ def detect_drive_roots():
         seen.add(real)
         roots.append({"label": "Google Drive (legacy volume)", "path": real, "account": "", "kind": "volume"})
     for r in roots:
+        if r.get("shortcuts") is not None:
+            continue  # v6.38: Windows candidates come with their shortcuts
         shortcuts = []
         for sub in ("My Drive", "Shared drives"):
             p = Path(r["path"]) / sub
@@ -3622,7 +3685,9 @@ def detect_drive_roots():
 
 def _path_within(real, root):
     try:
-        return os.path.commonpath([real, root]) == root
+        # v6.38: normcase so Windows drive letters / case differences compare equal
+        r = os.path.normcase(os.path.normpath(root))
+        return os.path.normcase(os.path.commonpath([real, root])) == r
     except ValueError:
         return False
 
@@ -4139,6 +4204,9 @@ def _demucs_devices():
         return [forced]
     if sys.platform == "darwin" and not _DEMUCS_DEVICE_STATE["mps_failed"]:
         return ["mps", "cpu"]
+    # v6.38: Windows/Linux with an NVIDIA GPU — try CUDA first, CPU fallback on any failure
+    if sys.platform != "darwin" and shutil.which("nvidia-smi") and not _DEMUCS_DEVICE_STATE.get("cuda_failed"):
+        return ["cuda", "cpu"]
     return ["cpu"]
 
 
@@ -4220,6 +4288,9 @@ def chunked_demucs_no_vocals(job_id, src, work, duration, progress, pct_lo=20.0,
                 stem_wav = cand
                 break
             last_err = tail[-500:]
+            if dev == "cuda":
+                _DEMUCS_DEVICE_STATE["cuda_failed"] = True
+                progress(f"{label}: CUDA failed, retrying on CPU…", None)
             if dev == "mps":
                 _DEMUCS_DEVICE_STATE["mps_failed"] = True
                 log(f"drive-music job={job_id}: demucs on mps failed — falling back to cpu")
@@ -4822,7 +4893,8 @@ PIPELINE_START_DELAY_SECS = float(os.environ.get("TWITCH_RECORDER_PIPELINE_DELAY
 DRIVE_PARTS_DIR = REC_DIR / "Drive parts"
 PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
 PIPELINE_LOCK = threading.RLock()
-PIPELINE = {"enabled": True, "users": {}, "target": "", "deliveries": {}}
+PIPELINE = {"enabled": True, "users": {}, "target": "", "deliveries": {},
+            "origEnabled": True, "origUsers": {}, "originals": {}}  # v6.38 originals
 DELIVERY_WAKE = threading.Event()
 DELIVERY_STATE = {"busy": False, "force": set(), "base": None}  # v6.37: base while mid-copy
 PIPELINE_SEEN = set()  # first-segment basenames already queued by this process
@@ -4848,6 +4920,15 @@ def _pipeline_load():
             if isinstance(d, dict) and d.get("status") == "sending":
                 d["status"] = "waiting"  # helper stopped mid-copy — retry
         PIPELINE["deliveries"] = {k: v for k, v in dels.items() if isinstance(v, dict)}
+        # v6.38: send-original prefs + per-file original deliveries
+        PIPELINE["origEnabled"] = data.get("origEnabled") is not False
+        ou = data.get("origUsers") if isinstance(data.get("origUsers"), dict) else {}
+        PIPELINE["origUsers"] = {str(k).lower(): bool(v) for k, v in ou.items()}
+        origs = data.get("originals") if isinstance(data.get("originals"), dict) else {}
+        for d in origs.values():
+            if isinstance(d, dict) and d.get("status") == "sending":
+                d["status"] = "queued"
+        PIPELINE["originals"] = {k: v for k, v in origs.items() if isinstance(v, dict)}
 
 
 def _pipeline_save():
@@ -4983,6 +5064,10 @@ def atomic_copy(src, dest):
 def drive_permission_message():
     """macOS privacy (TCC) blocks background apps from File Provider folders until allowed."""
     exe = os.path.realpath(sys.executable or "python3")
+    if os.name == "nt":  # v6.38
+        return ("Windows refused access to the Google Drive folder (permission denied). Make sure Google "
+                "Drive for Desktop is running and signed in, the target folder is not read-only, and no "
+                "file with the same name is open — the helper retries every 5 min.")
     return ("macOS is blocking the helper from Google Drive (Operation not permitted). "
             "Open System Settings → Privacy & Security → Full Disk Access, press +, add "
             f"{exe} (⌘⇧G to type the path) and turn it on — the helper retries every 5 min "
@@ -5222,13 +5307,9 @@ def deliver_one(base):
             src = Path(d["partsDir"]) / nm
             if not src.is_file():
                 raise RuntimeError(f"local part missing ({nm}) — use Split for Drive again")
-            dest = Path(target) / nm
-            try:
-                if dest.is_file() and dest.stat().st_size == src.stat().st_size:
-                    continue  # already delivered (idempotent retry)
-            except OSError:
-                pass
-            atomic_copy(src, dest)
+            # v6.38: same name+size already in Drive → skip; different size → <name>-<Computer>
+            # (a manual Re-split from this computer may replace its own earlier parts)
+            place_in_drive(src, Path(target), nm, allow_replace=(d.get("source") == "manual"))
         # Mark sent first so a crash mid-clear does not leave status=waiting with missing parts
         snap = _delivery_update(base, status="sent", sentAt=time.time(), target=target, error=None)
         log(f"drive delivery sent base={base} parts={len(d.get('parts') or [])} → {target}")
@@ -5258,6 +5339,16 @@ def delivery_loop():
             forced = set(DELIVERY_STATE["force"])
             DELIVERY_STATE["force"].clear()
             now = time.time()
+            # v6.38: originals first (they are queued before Demucs starts)
+            orig_todo = originals_due(forced, now)
+            if orig_todo:
+                if not detect_drive_roots():
+                    for name in orig_todo:
+                        _orig_update(name, status="waiting", lastAttempt=now,
+                                     note="Waiting for Drive (Drive for Desktop not found)")
+                else:
+                    for name in orig_todo:
+                        deliver_original(name)
             with PIPELINE_LOCK:
                 todo = []
                 for base, d in PIPELINE["deliveries"].items():
@@ -5301,13 +5392,18 @@ def pipeline_status_payload():
     roots = detect_drive_roots()
     target, kind, err = resolve_delivery_target(roots, create=False) if roots else (None, "auto", "Google Drive for Desktop not found")
     with PIPELINE_LOCK:
-        prefs = {"enabled": PIPELINE["enabled"], "users": dict(PIPELINE["users"]), "target": PIPELINE["target"]}
+        prefs = {"enabled": PIPELINE["enabled"], "users": dict(PIPELINE["users"]), "target": PIPELINE["target"],
+                 "origEnabled": bool(PIPELINE.get("origEnabled", True)),
+                 "origUsers": dict(PIPELINE.get("origUsers") or {})}
     return {
         "ok": True, "driveFound": bool(roots), "prefs": prefs,
         "resolvedTarget": target, "targetKind": kind, "targetError": err,
         "defaultTargetHint": 'a My Drive folder named "Twitch" (or TwitchRecordings) if present, else My Drive/Twitch Recordings/Music only',
         "partTargetBytes": PART_TARGET_BYTES, "partMaxBytes": PART_MAX_BYTES, "partMinSecs": PART_MIN_SECS,
         "deliveries": deliveries_snapshot(200),
+        "originals": originals_snapshot(200),  # v6.38
+        "originalsFolder": (os.path.join(target, ORIGINALS_SUBDIR) if target else None),
+        "computer": computer_name(),
     }
 
 
@@ -5324,6 +5420,16 @@ def api_pipeline_prefs(body):
                 u = safe_username(k)
                 if u:
                     PIPELINE["users"][u] = bool(v)
+                    changed = True
+        if "origEnabled" in body:  # v6.38
+            PIPELINE["origEnabled"] = bool(body.get("origEnabled"))
+            changed = True
+        ousers = body.get("origUsers")
+        if isinstance(ousers, dict):
+            for k, v in ousers.items():
+                u = safe_username(k)
+                if u:
+                    PIPELINE.setdefault("origUsers", {})[u] = bool(v)
                     changed = True
     if "target" in body:
         t = body.get("target") or ""
@@ -5392,6 +5498,7 @@ def pipeline_worker(job_id):
                 continue
         if not paths:
             raise RuntimeError("no finished segments on disk")
+        wait_for_originals(job_id, [p.name for p in paths], progress)  # v6.38: original → Drive first
         existing = find_existing_sibling(paths[0].name, "music") if len(paths) == 1 else None
         if existing and not redo:
             music_path = existing
@@ -5519,13 +5626,21 @@ def start_stream_pipeline(username, segments, redo=False, reason="stream-end"):
 def _on_session_finalized(username, segments):
     """Called from remember_session_segments (maybe holding LOCK) — never blocks."""
     segs = [s for s in (segments or []) if s]
-    if not segs or not pipeline_enabled_for(username):
+    if not segs or not (pipeline_enabled_for(username) or original_enabled_for(username)):
         return
     if segs[0] in PIPELINE_SEEN:
         return
+    PIPELINE_SEEN.add(segs[0])
 
     def run():
         time.sleep(PIPELINE_START_DELAY_SECS)  # let streamlink finish flushing
+        # v6.38: 1) original(s) → Drive straight away (local copy is never touched)
+        if original_enabled_for(username):
+            queued = [n for n in segs if register_original(n, username, "stream")]
+            if queued:
+                log(f"originals queued for Drive user={username}: {queued}")
+                request_delivery(None)
+        # 2) then remove voice → split → parts to Drive (the job waits for the originals)
         if not pipeline_enabled_for(username):
             return
         jid, err = start_stream_pipeline(username, segs)
@@ -5564,6 +5679,258 @@ def api_pipeline_deliver(body):
     return {"ok": True, "driveFound": found,
             "message": "sending…" if found else "Waiting for Drive — Drive for Desktop not found"}, 200
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v6.38: Send the ORIGINAL recording to Drive too (before Demucs)
+#   * The local original in ~/TwitchRecordings is never deleted or moved.
+#   * Copy goes to <Drive target>/Originals/<name> (atomic temp → rename), as-is,
+#     any size. Same target, Waiting-for-Drive / retry and permission messaging
+#     as the parts. Queued the moment a recording finalizes; the voice-removal job
+#     waits (up to ORIGINAL_WAIT_SECS) until the originals are sent / waiting.
+#   * No-clobber across computers (Mac + Windows backup): a file already in Drive
+#     with the same name AND size counts as sent (skipped); same name but a
+#     different size is written as <stem>-<ComputerName><ext> instead of replacing.
+# ─────────────────────────────────────────────────────────────────────────────
+ORIGINALS_SUBDIR = "Originals"
+ORIGINAL_WAIT_SECS = float(os.environ.get("TWITCH_RECORDER_ORIGINAL_WAIT_SECS") or 1800)
+
+
+def computer_name():
+    raw = (os.environ.get("TWITCH_RECORDER_COMPUTER_NAME") or os.environ.get("COMPUTERNAME")
+           or socket.gethostname() or "computer")
+    raw = raw.split(".")[0]
+    clean = "".join(ch if (ch.isalnum() or ch in "-_") else "-" for ch in raw).strip("-_")
+    return (clean or "computer")[:40]
+
+
+def _host_variant(name):
+    stem, ext = os.path.splitext(name)
+    return f"{stem}-{computer_name()}{ext}"
+
+
+def place_in_drive(src, dest_dir, name, allow_replace=False):
+    """Copy src into dest_dir/name without clobbering another computer's file.
+
+    Returns (dest_path, action) with action in copied | skipped | renamed | replaced.
+    """
+    src = Path(src)
+    dest_dir = Path(dest_dir)
+    size = src.stat().st_size
+    for i, nm in enumerate((name, _host_variant(name))):
+        dest = dest_dir / nm
+        try:
+            exists = dest.is_file()
+            same = exists and dest.stat().st_size == size
+        except OSError:
+            exists, same = False, False
+        if same:
+            return dest, "skipped"  # identical name + size already in Drive (other computer / earlier run)
+        if not exists:
+            atomic_copy(src, dest)
+            return dest, ("copied" if i == 0 else "renamed")
+        if allow_replace and i == 0:
+            atomic_copy(src, dest)
+            return dest, "replaced"
+    # both names taken by different-size files: replace our own host-named copy
+    dest = dest_dir / _host_variant(name)
+    atomic_copy(src, dest)
+    return dest, "replaced"
+
+
+def original_enabled_for(username):
+    u = (username or "").lower()
+    with PIPELINE_LOCK:
+        return bool(PIPELINE.get("origEnabled", True)) and bool((PIPELINE.get("origUsers") or {}).get(u, True))
+
+
+def set_original_user_pref(username, on):
+    u = safe_username(username) if username else None
+    if not u:
+        return
+    with PIPELINE_LOCK:
+        users = PIPELINE.setdefault("origUsers", {})
+        if users.get(u) == bool(on):
+            return
+        users[u] = bool(on)
+    _pipeline_save()
+
+
+def _orig_update(name, **kw):
+    with PIPELINE_LOCK:
+        d = PIPELINE.setdefault("originals", {}).get(name)
+        if d is None:
+            return None
+        d.update(kw)
+        d["updatedAt"] = time.time()
+        snap = dict(d)
+    _pipeline_save()
+    return snap
+
+
+def _file_is_recording(path):
+    try:
+        ap = os.path.abspath(str(path))
+    except OSError:
+        return False
+    with LOCK:
+        for rec in ACTIVE.values():
+            f = rec.get("file") or ""
+            if f and os.path.abspath(f) == ap:
+                return True
+    return False
+
+
+def register_original(name, username=None, source="stream", force=False):
+    """Queue one finished native recording for copy to Drive/Originals. Idempotent."""
+    name = basename_of(name)
+    if not name or is_music_export_name(name) or is_seamless_export_name(name):
+        return None
+    p = REC_DIR / name
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return None
+    now = time.time()
+    with PIPELINE_LOCK:
+        origs = PIPELINE.setdefault("originals", {})
+        d = origs.get(name)
+        if d and not force and d.get("status") in ("queued", "sending", "sent", "waiting"):
+            return dict(d)
+        if d and d.get("status") == "sent" and force and d.get("size") == size:
+            return dict(d)  # already in Drive, unchanged
+        origs[name] = {
+            "name": name, "base": Path(name).stem, "username": username or name.split("-")[0],
+            "size": size, "status": "queued", "target": None, "dest": None, "action": None,
+            "sentAt": None, "error": None, "note": "Queued — sending before voice removal",
+            "source": source, "createdAt": (d or {}).get("createdAt") or now, "updatedAt": now,
+            "lastAttempt": 0, "computer": computer_name(),
+        }
+        if len(origs) > 400:
+            old = sorted(origs.values(), key=lambda x: x.get("updatedAt") or 0)
+            for x in old[: len(old) - 400]:
+                origs.pop(x.get("name"), None)
+        snap = dict(origs[name])
+    _pipeline_save()
+    return snap
+
+
+def deliver_original(name):
+    """Copy one original into <target>/Originals. Never touches the local file."""
+    with PIPELINE_LOCK:
+        d = (PIPELINE.get("originals") or {}).get(name)
+        if not d:
+            return None
+        d = dict(d)
+    if d.get("status") == "sent":
+        return d
+    src = REC_DIR / name
+    if not src.is_file():
+        return _orig_update(name, status="error", error="local original is missing (deleted?)",
+                            lastAttempt=time.time())
+    if _file_is_recording(src):
+        return _orig_update(name, status="waiting", note="Still recording — will send when it finishes",
+                            lastAttempt=time.time())
+    roots = detect_drive_roots()
+    if not roots:
+        return _orig_update(name, status="waiting", error=None, lastAttempt=time.time(),
+                            note="Waiting for Drive (Drive for Desktop not found)")
+    try:
+        target, _kind, err = resolve_delivery_target(roots, create=True)
+    except PermissionError:
+        target, err = None, drive_permission_message()
+    except OSError as e:
+        target, err = None, f"cannot create target folder: {e}"
+    if err or not target:
+        return _orig_update(name, status="error", error=err or "no target", lastAttempt=time.time())
+    dest_dir = Path(target) / ORIGINALS_SUBDIR
+    _orig_update(name, status="sending", error=None, target=str(dest_dir), lastAttempt=time.time(),
+                 note=None)
+    DELIVERY_STATE["busy"] = True
+    DELIVERY_STATE["base"] = Path(name).stem
+    try:
+        dest, action = place_in_drive(src, dest_dir, name)
+        snap = _orig_update(name, status="sent", sentAt=time.time(), dest=str(dest), action=action,
+                            size=src.stat().st_size, error=None)
+        log(f"drive original {action}: {name} → {dest}")
+        return snap
+    except Exception as e:
+        log(f"drive original error {name}: {e}")
+        msg = drive_permission_message() if isinstance(e, PermissionError) else (str(e) or type(e).__name__)
+        return _orig_update(name, status="error", error=msg)
+    finally:
+        DELIVERY_STATE["busy"] = False
+        DELIVERY_STATE["base"] = None
+
+
+def originals_due(forced, now):
+    with PIPELINE_LOCK:
+        todo = []
+        for name, d in (PIPELINE.get("originals") or {}).items():
+            st = d.get("status")
+            if st in ("queued", "waiting") or name in forced or ("*" in forced and st == "error"):
+                todo.append(name)
+            elif st == "error" and now - float(d.get("lastAttempt") or 0) > DELIVERY_ERROR_RETRY_SECS:
+                todo.append(name)
+    return todo
+
+
+def originals_snapshot(limit=60):
+    with PIPELINE_LOCK:
+        items = sorted((PIPELINE.get("originals") or {}).values(),
+                       key=lambda d: d.get("updatedAt") or 0, reverse=True)
+        return [{k: d.get(k) for k in (
+            "name", "base", "username", "size", "status", "target", "dest", "action", "sentAt",
+            "error", "note", "source", "computer", "createdAt", "updatedAt")} for d in items[:limit]]
+
+
+def forget_original_if_unsent(name):
+    with PIPELINE_LOCK:
+        origs = PIPELINE.get("originals") or {}
+        d = origs.get(name)
+        if d is None or d.get("status") == "sent":
+            return
+        origs.pop(name, None)
+    _pipeline_save()
+
+
+def wait_for_originals(job_id, names, progress):
+    """Hold the voice-removal job until its originals are sent / waiting / failed."""
+    deadline = time.time() + ORIGINAL_WAIT_SECS
+    announced = False
+    while time.time() < deadline:
+        with PIPELINE_LOCK:
+            origs = PIPELINE.get("originals") or {}
+            pending = [n for n in names if (origs.get(n) or {}).get("status") in ("queued", "sending")]
+        if not pending:
+            return
+        if not announced:
+            progress("Sending the original to Drive first…", 2)
+            _set_music_job(job_id, phase="original")
+            announced = True
+            request_delivery(None)
+        _check_cancel(job_id)
+        time.sleep(1)
+    log(f"pipeline job={job_id}: originals still sending after {ORIGINAL_WAIT_SECS:.0f}s — continuing")
+
+
+def api_pipeline_original(body):
+    body = body if isinstance(body, dict) else {}
+    target = resolve_download_path(body.get("name"))
+    if not target:
+        return {"ok": False, "error": "not found in ~/TwitchRecordings"}, 404
+    if is_music_export_name(target.name) or is_seamless_export_name(target.name):
+        return {"ok": False, "error": "pick an original recording (not a -music / seamless export)"}, 400
+    if _file_is_recording(target):
+        return {"ok": False, "error": "still recording — it is sent automatically when it finishes"}, 409
+    snap = register_original(target.name, source="manual", force=True)
+    if not snap:
+        return {"ok": False, "error": "could not queue that file"}, 400
+    if snap.get("status") != "sent":
+        _orig_update(target.name, status="queued")
+    found = bool(detect_drive_roots())
+    request_delivery(target.name)
+    return {"ok": True, "driveFound": found, "original": snap,
+            "message": "sending…" if found else "Waiting for Drive — Drive for Desktop not found"}, 200
 
 
 def files_payload():
@@ -5799,6 +6166,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             quality = body.get("quality") or "audio_only"
             if "afterStream" in body:  # v6.36: per-streamer "remove voice → Drive" pref
                 set_pipeline_user_pref(username, bool(body.get("afterStream")))
+            if "sendOriginal" in body:  # v6.38: per-streamer "send original to Drive" pref
+                set_original_user_pref(username, bool(body.get("sendOriginal")))
             result = start_record(username, quality)
             self.send_json(result, status=200 if result.get("ok") else 400)
             return
@@ -5838,7 +6207,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload, status = api_delete_recordings(body if isinstance(body, dict) else {})
             self.send_json(payload, status=status)
             return
-        if path in ("/api/pipeline/prefs", "/api/pipeline/split", "/api/pipeline/deliver"):
+        if path in ("/api/pipeline/prefs", "/api/pipeline/split", "/api/pipeline/deliver", "/api/pipeline/original"):
             if not origin_allowed(self.headers.get("Origin")):
                 self.send_json({"ok": False, "error": "origin not allowed"}, status=403)
                 return
@@ -5847,6 +6216,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 payload, status = api_pipeline_prefs(body)
             elif path == "/api/pipeline/split":
                 payload, status = api_pipeline_split(body)
+            elif path == "/api/pipeline/original":
+                payload, status = api_pipeline_original(body)
             else:
                 payload, status = api_pipeline_deliver(body)
             self.send_json(payload, status=status)
