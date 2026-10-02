@@ -2,7 +2,7 @@
 
 Local multi-streamer Twitch recorder (**HTML UI** + **Python streamlink helper**) with seamless segment joins, Music only (Demucs), Auto Music only, and Convert upload.
 
-**Current version:** 6.38 — when a stream ends the original recording is copied as-is to Google Drive (`Originals` folder) first and kept locally, then the voice is removed and the -music file is split into equal parts under 50 MB (`<base>-music-partNofM.ogg`) that go to the same Drive folder; no-clobber naming across computers and Windows Drive for Desktop detection. v6.37 clears local parts after a successful send; v6.36 added the after-stream pipeline. v6.35 added the Convert tab Google Drive → remove voice card. v6.31 added the optional **Unmute add-on** (`extension/`). Helper recordings and Music only exports are **OGG** (not MP4/MP3). See badge in `twitch-auto-recorder.html` / `HELPER_VERSION` in `twitch-recorder-server.py` (also `VERSION`).
+**Current version:** 6.39 — sweeps stale Drive `.{name}.partial-*` temps under the Auto-send delivery target and its `Originals/` folder (startup + each delivery tick; age ~1h, or ~5 min when idle). v6.38 sends the original recording to Drive `Originals` first (kept locally), then voice-remove + split parts under 50 MB; no-clobber across computers and Windows Drive detection. v6.37 clears local parts after a successful send; v6.36 added the after-stream pipeline. v6.35 added Convert → Google Drive → remove voice. v6.31 optional **Unmute add-on** (`extension/`). Helper recordings and Music only exports are **OGG**. See badge / `HELPER_VERSION` / `VERSION`.
 
 ## Open the app (any browser)
 

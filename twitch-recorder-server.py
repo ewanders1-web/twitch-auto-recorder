@@ -19,7 +19,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.38"
+HELPER_VERSION = "6.39"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4897,6 +4897,9 @@ PIPELINE = {"enabled": True, "users": {}, "target": "", "deliveries": {},
             "origEnabled": True, "origUsers": {}, "originals": {}}  # v6.38 originals
 DELIVERY_WAKE = threading.Event()
 DELIVERY_STATE = {"busy": False, "force": set(), "base": None}  # v6.37: base while mid-copy
+# v6.39: stale Drive .{name}.partial-{hex} under Auto-send target (+ Originals/)
+DRIVE_PARTIAL_STALE_SECS = int(os.environ.get("TWITCH_RECORDER_DRIVE_PARTIAL_STALE_SECS") or 3600)
+DRIVE_PARTIAL_IDLE_SECS = int(os.environ.get("TWITCH_RECORDER_DRIVE_PARTIAL_IDLE_SECS") or 300)
 PIPELINE_SEEN = set()  # first-segment basenames already queued by this process
 MUSIC_OGG_ARGS = ["-c:a", "libvorbis", "-q:a", "6", "-ar", "44100", "-ac", "2"]
 AUTO_TARGET_NAMES = ("twitch", "twitchrecordings", "twitch recordings", "twitch-recordings")
@@ -5330,12 +5333,81 @@ def deliver_one(base):
         DELIVERY_STATE["base"] = None
 
 
+def cleanup_drive_target_partials(target, reason="tick"):
+    """Remove stale .{name}.partial-{hex} temps under the Auto-send Drive target
+    and its Originals/ subfolder (one level each — not the whole Drive tree).
+
+    Age rule: delete if mtime older than ~1 hour (match local REC_DIR cleanup).
+    When delivery is not busy, also delete leftovers older than ~5 minutes.
+    Never delete a partial that could belong to an in-flight atomic_copy.
+    PermissionError/OSError (e.g. macOS FDA) are soft — log and continue.
+    """
+    removed = 0
+    freed = 0
+    if not target:
+        return removed, freed
+    root = Path(target)
+    dirs = [root]
+    try:
+        originals = root / ORIGINALS_SUBDIR
+        if originals.is_dir():
+            dirs.append(originals)
+    except OSError as e:
+        log(f"drive target partial cleanup ({reason}): Originals check skipped: {e}")
+    now = time.time()
+    busy = bool(DELIVERY_STATE.get("busy"))
+    min_age = DRIVE_PARTIAL_STALE_SECS if busy else DRIVE_PARTIAL_IDLE_SECS
+    for d in dirs:
+        try:
+            for p in d.glob(".*.partial-*"):
+                try:
+                    if not p.is_file():
+                        continue
+                    st = p.stat()
+                    age = now - float(st.st_mtime)
+                    if age < min_age:
+                        continue
+                    sz = int(st.st_size)
+                    p.unlink()
+                    removed += 1
+                    freed += sz
+                except (PermissionError, OSError) as e:
+                    log(f"drive target partial cleanup ({reason}): skip {p.name}: {e}")
+                    continue
+        except (PermissionError, OSError) as e:
+            log(f"drive target partial cleanup ({reason}): scan {d}: {e}")
+            continue
+    if removed:
+        log(f"drive target partial cleanup ({reason}): {removed} items, {freed} bytes")
+    return removed, freed
+
+
+def maybe_cleanup_drive_target_partials(reason="tick"):
+    """Resolve Auto-send target (no create) and sweep stale .partial-* temps."""
+    try:
+        roots = detect_drive_roots()
+        if not roots:
+            return 0, 0
+        target, _kind, err = resolve_delivery_target(roots, create=False)
+        if err or not target:
+            return 0, 0
+        return cleanup_drive_target_partials(target, reason=reason)
+    except (PermissionError, OSError) as e:
+        log(f"drive target partial cleanup ({reason}) skipped: {e}")
+        return 0, 0
+    except Exception as e:
+        log(f"drive target partial cleanup ({reason}) skipped: {e}")
+        return 0, 0
+
+
 def delivery_loop():
     """Deliver waiting parts whenever Drive for Desktop is (or becomes) available."""
     while True:
         DELIVERY_WAKE.wait(DELIVERY_POLL_SECS)
         DELIVERY_WAKE.clear()
         try:
+            # v6.39: sweep stale Drive .partial-* under delivery target (+ Originals/)
+            maybe_cleanup_drive_target_partials(reason="tick")
             forced = set(DELIVERY_STATE["force"])
             DELIVERY_STATE["force"].clear()
             now = time.time()
@@ -6332,6 +6404,11 @@ def main():
         clear_sent_local_drive_parts_backfill()
     except Exception as e:
         log(f"drive parts sent-backfill failed: {e}")
+    # v6.39: sweep stale Drive .partial-* under Auto-send target (+ Originals/)
+    try:
+        maybe_cleanup_drive_target_partials(reason="startup")
+    except Exception as e:
+        log(f"drive target partial cleanup startup failed: {e}")
     threading.Thread(target=delivery_loop, daemon=True, name="drive-delivery").start()
     request_delivery(None)
     threading.Thread(target=meter_loop, daemon=True, name="meter").start()
