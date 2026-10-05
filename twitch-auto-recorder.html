@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.39</span>
+    <span class="badge">v6.40</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -300,6 +300,12 @@
           </label>
           <label title="v6.38: as soon as a recording finishes, copy the original recording as-is (any size) into the Drive target's Originals folder — before voice removal starts. The local original in ~/TwitchRecordings is always kept. Per-streamer switch on the Streamers tab." style="margin-left:1rem">
             <input type="checkbox" id="driveOrigToggle" checked onchange="saveDriveOrigToggle()"> Send original to Drive
+          </label>
+          <label title="v6.40: the helper stops this computer from going to sleep while it is recording, removing voice, splitting, joining or copying to Google Drive (plus ~10 min after, so the after-stream steps can start). The screen can still turn off. Mac: caffeinate · Windows: power request." style="margin-left:1rem">
+            <input type="checkbox" id="keepAwakeToggle" checked onchange="saveKeepAwakeToggle()"> Keep computer awake while recording / processing
+          </label>
+          <label title="v6.40: also keep this computer awake whenever this page is open with Auto-Rec on for at least one streamer, so it can't be asleep when they go live. Uses more power — the screen can still turn off." style="margin-left:1rem">
+            <input type="checkbox" id="keepAwakeArmedToggle" onchange="saveKeepAwakeToggle()"> …and while Auto-Rec is armed
           </label>
         </div>
       </div>
@@ -515,9 +521,9 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.39'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.40'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
-let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false };
+let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false };
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
 let musicJobsNotified = new Set(); // jobIds already fireNotify'd for done/error (health spam safe)
@@ -645,6 +651,8 @@ function persist(){
       autoMusicOnly: cfg.autoMusicOnly!==false,
       drivePipeline: cfg.drivePipeline!==false, // v6.36
       driveOriginals: cfg.driveOriginals!==false, // v6.38
+      keepAwake: cfg.keepAwake!==false, // v6.40
+      keepAwakeArmed: cfg.keepAwakeArmed===true, // v6.40
       homeStreamer: String(cfg.homeStreamer||'').toLowerCase(),
       returnHomeAfterSet: cfg.returnHomeAfterSet!==false,
       // v6.35: Google Drive card (same persist key)
@@ -687,6 +695,8 @@ function restoreSettings(){
     // v6.36: after-stream Drive pipeline default on
     cfg.drivePipeline=data.drivePipeline!==false;
     cfg.driveOriginals=data.driveOriginals!==false; // v6.38 default on
+    cfg.keepAwake=data.keepAwake!==false; // v6.40 default on
+    cfg.keepAwakeArmed=data.keepAwakeArmed===true; // v6.40 opt-in
     // v6.25: home streamer + return after guest/DJ set
     cfg.homeStreamer=data.homeStreamer?String(data.homeStreamer).toLowerCase():'';
     if(typeof data.returnHomeAfterSet==='boolean') cfg.returnHomeAfterSet=data.returnHomeAfterSet;
@@ -794,6 +804,7 @@ function markHelperDown(wasOk){
   if(helper.version) helperPriorVersion=helper.version;
   helper.ok=false; helper.streamlink=false; helper.ffmpeg=false; helper.seamless=false; helper.demucs=false; helper.version=''; helper.diskVersion=''; helper.pendingRestart=false; helper.demucsHint=''; helper.installHint=''; helper.updateRepo=''; helper.active=[]; helper.lastErrors={}; helper.musicDemucsQueue=null; helper.orphanTempsCleared=0; helper.orphanTempsBytes=0;
   helper.diskFree=null; helper.diskTotal=null; helper.diskWarn=false; helper.diskBlock=false;
+  helper.keepAwake=null; // v6.40
   // v6.24: hide demucs sticky while helper is down (not the same as demucs missing)
   helperDemucsMissingNotified=false;
   helperDiskMusicPaused=false;
@@ -1364,9 +1375,10 @@ function pingHelperAndStatus(){
   const run=async function(){
   const wasOk=helper.ok;
   try{
-    const d=await helperFetch('/api/health', undefined, 1000);
+    const d=await helperFetch(healthPath(), undefined, 1000);
     if(d && d.ok){
       helper.ok=true;
+      helper.keepAwake=(d.keepAwake && typeof d.keepAwake==='object')?d.keepAwake:null; // v6.40
       helper.streamlink=!!d.streamlink;
       helper.ffmpeg=!!d.ffmpeg;
       helper.seamless=!!(d.seamless!=null?d.seamless:d.ffmpeg);
@@ -2006,7 +2018,7 @@ function updateHelperBar(){
   const dot=document.getElementById('helperDot');
   const txt=document.getElementById('helperTxt');
   if(!dot||!txt) return;
-  const pendingBit=helper.pendingRestart?(' · restart pending (disk v'+(helper.diskVersion||'?')+')'):'';
+  const pendingBit=(helper.pendingRestart?(' · restart pending (disk v'+(helper.diskVersion||'?')+')'):'')+keepAwakeBit(); // v6.40 keep-awake bit
   if(helper.ok && helper.streamlink){
     const diskBit=(helper.diskFree!=null)?(' · '+fmtDiskBytes(helper.diskFree)+' free'):'';
     const demucsBit=helper.demucs?'':' · demucs missing';
@@ -4818,7 +4830,8 @@ function pipelinePrefsBody(){
   const users={};
   const origUsers={};
   streamers.forEach(function(s){ users[s.username]=s.drivePipe!==false; origUsers[s.username]=s.driveOrig!==false; });
-  return {enabled:cfg.drivePipeline!==false, users:users, origEnabled:cfg.driveOriginals!==false, origUsers:origUsers};
+  return {enabled:cfg.drivePipeline!==false, users:users, origEnabled:cfg.driveOriginals!==false, origUsers:origUsers,
+    keepAwake:cfg.keepAwake!==false, keepAwakeArmed:cfg.keepAwakeArmed===true}; // v6.40
 }
 async function syncPipelinePrefs(force){
   if(!helper.ok || !helperHasPipeline()) return;
@@ -4998,6 +5011,48 @@ function driveOrigActiveFor(username){
 function initDriveOrigToggle(){
   const el=document.getElementById('driveOrigToggle');
   if(el) el.checked=cfg.driveOriginals!==false;
+}
+// v6.40: keep the computer awake (helper holds a sleep blocker while busy; optional while armed)
+function initKeepAwakeToggle(){
+  const a=document.getElementById('keepAwakeToggle');
+  const b=document.getElementById('keepAwakeArmedToggle');
+  if(a) a.checked=cfg.keepAwake!==false;
+  if(b){ b.checked=cfg.keepAwakeArmed===true; b.disabled=cfg.keepAwake===false; }
+}
+function saveKeepAwakeToggle(){
+  const a=document.getElementById('keepAwakeToggle');
+  const b=document.getElementById('keepAwakeArmedToggle');
+  const prevArmed=cfg.keepAwakeArmed===true;
+  cfg.keepAwake=a?!!a.checked:true;
+  cfg.keepAwakeArmed=!!(b && b.checked);
+  if(b) b.disabled=!cfg.keepAwake;
+  persist();
+  syncPipelinePrefs(true);
+  pingHelperAndStatus().catch(function(){});
+  let msg;
+  if(!cfg.keepAwake) msg='Keep awake off — this computer may sleep mid-recording or before the voice removal / Drive send finishes.';
+  else if(cfg.keepAwakeArmed && !prevArmed) msg='Keep awake on, including while Auto-Rec is armed and this page is open (screen can still turn off).';
+  else msg='Keep awake on while recording, removing voice, splitting or sending to Drive (screen can still turn off).';
+  if(helper.ok && helper.version && helperVerLt(helper.version,'6.40')) msg+=' Needs helper v6.40 — Check for updates → Install update.';
+  flashOk(msg);
+}
+function helperVerLt(a,b){
+  const pa=String(a||'').split('.').map(Number), pb=String(b||'').split('.').map(Number);
+  for(let i=0;i<Math.max(pa.length,pb.length);i++){ const x=pa[i]||0, y=pb[i]||0; if(x!==y) return x<y; }
+  return false;
+}
+function keepAwakeBit(){
+  const k=helper.keepAwake;
+  if(!helper.ok || !k) return '';
+  if(k.active) return ' · ☕ staying awake ('+(k.reason||'busy')+')';
+  if(k.enabled && k.error) return ' · ⚠ can\'t keep awake: '+k.error;
+  if(k.enabled && !k.supported) return ' · keep-awake unavailable';
+  return '';
+}
+function healthPath(){
+  // v6.40: heartbeat which streamers have Auto-Rec on (helper ignores unless "while armed" is on)
+  const armed=streamers.filter(function(s){ return s && s.autoRec; }).map(function(s){ return s.username; });
+  return '/api/health?armed='+encodeURIComponent(armed.join(','));
 }
 function saveDriveOrigToggle(){
   const el=document.getElementById('driveOrigToggle');
@@ -5215,6 +5270,7 @@ initSeamlessToggle();
 initAutoMusicOnlyToggle();
 initDrivePipeToggle();
 initDriveOrigToggle();
+initKeepAwakeToggle(); // v6.40
 initDriveCard();
 updateHomeStreamerUI();
 renderStreamers();

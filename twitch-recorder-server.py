@@ -19,7 +19,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.39"
+HELPER_VERSION = "6.40"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -1704,6 +1704,7 @@ def start_record(username, quality):
         name=f"rec-{username}",
     )
     t.start()
+    KEEP_AWAKE_WAKE.set()  # v6.40: hold sleep off right away
     return {
         "ok": True,
         "file": "",
@@ -1850,6 +1851,7 @@ def schedule_graceful_restart(reason="manual"):
             os.chdir(str(INSTALL_DIR))
             argv = [sys.executable, str(script)] + list(sys.argv[1:])
             log(f"restarting helper ({reason}): execv {argv!r}")
+            keep_awake_release()  # v6.40: don't leave an orphan caffeinate behind
             os.execv(sys.executable, argv)
         except Exception as e:
             log(f"restart exec failed ({reason}): {e}")
@@ -2163,6 +2165,7 @@ def health_payload():
         "driveDeliveries": deliveries_snapshot(40),
         "driveOriginals": originals_snapshot(60),  # v6.38
         "musicDemucsQueue": music_demucs_queue_info(),
+        "keepAwake": keep_awake_snapshot(),  # v6.40
         "seamlessJobs": seamless_jobs_for_health(),
         "updateRepo": f"https://github.com/{UPDATE_REPO}",
         # v6.29: last orphan temp cleanup (UI one-shot flash when non-zero after reconnect)
@@ -4894,7 +4897,8 @@ DRIVE_PARTS_DIR = REC_DIR / "Drive parts"
 PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
 PIPELINE_LOCK = threading.RLock()
 PIPELINE = {"enabled": True, "users": {}, "target": "", "deliveries": {},
-            "origEnabled": True, "origUsers": {}, "originals": {}}  # v6.38 originals
+            "origEnabled": True, "origUsers": {}, "originals": {},  # v6.38 originals
+            "keepAwake": True, "keepAwakeArmed": False}  # v6.40 keep computer awake
 DELIVERY_WAKE = threading.Event()
 DELIVERY_STATE = {"busy": False, "force": set(), "base": None}  # v6.37: base while mid-copy
 # v6.39: stale Drive .{name}.partial-{hex} under Auto-send target (+ Originals/)
@@ -4932,6 +4936,9 @@ def _pipeline_load():
             if isinstance(d, dict) and d.get("status") == "sending":
                 d["status"] = "queued"
         PIPELINE["originals"] = {k: v for k, v in origs.items() if isinstance(v, dict)}
+        # v6.40: keep-awake prefs (default: on while recording/processing; armed hold opt-in)
+        PIPELINE["keepAwake"] = data.get("keepAwake") is not False
+        PIPELINE["keepAwakeArmed"] = data.get("keepAwakeArmed") is True
 
 
 def _pipeline_save():
@@ -4942,6 +4949,216 @@ def _pipeline_save():
         atomic_write_bytes(PIPELINE_FILE, blob)
     except Exception as e:
         log(f"pipeline state write failed: {e}")
+
+
+# ─── v6.40: KEEP THE COMPUTER AWAKE WHILE RECORDING / PROCESSING ─────
+# A Mac or PC that idle-sleeps mid-stream loses the rest of the recording, and one that sleeps
+# right after the stream never removes the voice or sends the parts to Drive. While anything is
+# recording, Demucs/split jobs are queued or running, a seamless join runs, or a Drive copy is in
+# flight (plus a short grace after the last of these), the helper holds an idle/system-sleep
+# assertion: macOS `caffeinate -i -s -w <helper pid>` (dies with the helper), Windows
+# SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED), Linux `systemd-inhibit` if present.
+# The display is still allowed to sleep. Optional: also hold while the page reports Auto-Rec
+# streamers (heartbeat on /api/health?armed=…), so a sleeping computer can't miss a go-live.
+KEEP_AWAKE_GRACE_SECS = int(os.environ.get("TWITCH_RECORDER_KEEP_AWAKE_GRACE_SECS") or 600)
+KEEP_AWAKE_ARMED_HOLD_SECS = int(os.environ.get("TWITCH_RECORDER_KEEP_AWAKE_ARMED_HOLD_SECS") or 240)
+KEEP_AWAKE_TICK_SECS = float(os.environ.get("TWITCH_RECORDER_KEEP_AWAKE_TICK_SECS") or 15)
+KEEP_AWAKE_ENV_OFF = (os.environ.get("TWITCH_RECORDER_KEEP_AWAKE") or "").strip().lower() in (
+    "0", "off", "false", "no")
+KEEP_AWAKE_WAKE = threading.Event()
+KEEP_AWAKE_LOCK = threading.Lock()
+KEEP_AWAKE = {"active": False, "reason": None, "since": None, "error": None,
+              "lastBusyAt": 0.0, "lastBusyReason": None,
+              "armedAt": 0.0, "armedUsers": [], "proc": None}
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def keep_awake_method():
+    """Which sleep-blocker this computer supports (None = unavailable / disabled by env)."""
+    if KEEP_AWAKE_ENV_OFF:
+        return None
+    if os.name == "nt":
+        return "windows"
+    if sys.platform == "darwin":
+        if shutil.which("caffeinate") or os.path.exists("/usr/bin/caffeinate"):
+            return "caffeinate"
+        return None
+    if shutil.which("systemd-inhibit"):
+        return "systemd-inhibit"
+    return None
+
+
+def note_armed_heartbeat(raw):
+    """Page says these streamers have Auto-Rec on (comma list; empty = none armed)."""
+    users = []
+    for part in str(raw or "").split(","):
+        u = safe_username(part)
+        if u and u not in users:
+            users.append(u)
+        if len(users) >= 50:
+            break
+    with KEEP_AWAKE_LOCK:
+        KEEP_AWAKE["armedUsers"] = users
+        KEEP_AWAKE["armedAt"] = time.time() if users else 0.0
+
+
+def _keep_awake_busy_reason():
+    """Human reason the computer must stay awake right now, or None when idle."""
+    with LOCK:
+        reap_locked()
+        rec = sorted(ACTIVE.keys())
+    if rec:
+        return "recording " + ", ".join(rec)
+    info = music_demucs_queue_info()
+    if int(info.get("running") or 0) > 0 or int(info.get("waiting") or 0) > 0:
+        return "removing voice / splitting"
+    if DELIVERY_STATE.get("busy"):
+        return "sending to Google Drive"
+    with SEAMLESS_JOBS_LOCK:
+        if any((j.get("status") or "") in ("queued", "running") for j in SEAMLESS_JOBS.values()):
+            return "joining segments"
+    return None
+
+
+def keep_awake_desired(now=None):
+    now = time.time() if now is None else now
+    with PIPELINE_LOCK:
+        on = PIPELINE.get("keepAwake", True) is not False
+        armed_on = bool(PIPELINE.get("keepAwakeArmed"))
+    if not on:
+        return None
+    reason = _keep_awake_busy_reason()
+    with KEEP_AWAKE_LOCK:
+        if reason:
+            KEEP_AWAKE["lastBusyAt"] = now
+            KEEP_AWAKE["lastBusyReason"] = reason
+            return reason
+        last = float(KEEP_AWAKE.get("lastBusyAt") or 0.0)
+        if last and now - last < KEEP_AWAKE_GRACE_SECS:
+            # covers the gap between a stream ending and the after-stream jobs queueing
+            return "just finished " + (KEEP_AWAKE.get("lastBusyReason") or "work") + " — waiting for after-stream steps"
+        users = list(KEEP_AWAKE.get("armedUsers") or [])
+        at = float(KEEP_AWAKE.get("armedAt") or 0.0)
+    if armed_on and users and now - at < KEEP_AWAKE_ARMED_HOLD_SECS:
+        return "Auto-Rec armed for " + ", ".join(users[:4]) + ("…" if len(users) > 4 else "")
+    return None
+
+
+def _keep_awake_cmd(method):
+    if method == "caffeinate":
+        exe = shutil.which("caffeinate") or "/usr/bin/caffeinate"
+        # -i idle sleep, -s system sleep on AC power; -w: exits on its own if the helper dies
+        return [exe, "-i", "-s", "-w", str(os.getpid())]
+    if method == "systemd-inhibit":
+        return [shutil.which("systemd-inhibit") or "systemd-inhibit", "--what=idle:sleep",
+                "--who=Twitch Auto-Recorder", "--why=Recording / processing a stream",
+                "--mode=block", "sh", "-c",
+                # exits on its own if the helper dies (same idea as caffeinate -w)
+                f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 5; done"]
+    return None
+
+
+def _keep_awake_stop_proc_locked():
+    proc = KEEP_AWAKE.get("proc")
+    KEEP_AWAKE["proc"] = None
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+    except Exception:
+        pass
+
+
+def _keep_awake_apply(reason):
+    """Hold or release the sleep assertion. Call only from keep_awake_loop (Windows state is per-thread)."""
+    method = keep_awake_method()
+    want = bool(reason)
+    err = None
+    with KEEP_AWAKE_LOCK:
+        was = bool(KEEP_AWAKE["active"])
+        if method == "windows":
+            try:
+                import ctypes  # noqa: WPS433 (Windows only)
+                flags = _ES_CONTINUOUS | (_ES_SYSTEM_REQUIRED if want else 0)
+                if not ctypes.windll.kernel32.SetThreadExecutionState(flags):
+                    err = "SetThreadExecutionState failed"
+            except Exception as e:
+                err = str(e) or type(e).__name__
+        elif method in ("caffeinate", "systemd-inhibit"):
+            proc = KEEP_AWAKE.get("proc")
+            alive = proc is not None and proc.poll() is None
+            if want and not alive:
+                try:
+                    KEEP_AWAKE["proc"] = subprocess.Popen(
+                        _keep_awake_cmd(method), stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+                except Exception as e:
+                    KEEP_AWAKE["proc"] = None
+                    err = str(e) or type(e).__name__
+            elif not want and (alive or proc is not None):
+                _keep_awake_stop_proc_locked()
+        elif want:
+            err = "no sleep blocker on this computer"
+        active = want and err is None and method is not None
+        KEEP_AWAKE["active"] = active
+        KEEP_AWAKE["error"] = err
+        prev_reason = KEEP_AWAKE.get("reason")
+        KEEP_AWAKE["reason"] = reason if active else None
+        if active and not was:
+            KEEP_AWAKE["since"] = time.time()
+        elif not active:
+            KEEP_AWAKE["since"] = None
+    if active and not was:
+        log(f"keep-awake ON via {method}: {reason}")
+    elif was and not active:
+        log("keep-awake OFF" + (f" ({err})" if err else " — computer may sleep normally"))
+    elif active and reason != prev_reason:
+        log(f"keep-awake still on: {reason}")
+    elif err and want:
+        log(f"keep-awake unavailable: {err}")
+
+
+def keep_awake_release():
+    """Drop the sleep blocker (restart / shutdown). Safe from any thread for caffeinate/inhibit."""
+    with KEEP_AWAKE_LOCK:
+        _keep_awake_stop_proc_locked()
+        KEEP_AWAKE["active"] = False
+        KEEP_AWAKE["reason"] = None
+        KEEP_AWAKE["since"] = None
+
+
+def keep_awake_loop():
+    while True:
+        try:
+            _keep_awake_apply(keep_awake_desired())
+        except Exception as e:
+            log(f"keep-awake loop error: {e}")
+        KEEP_AWAKE_WAKE.wait(KEEP_AWAKE_TICK_SECS)
+        KEEP_AWAKE_WAKE.clear()
+
+
+def keep_awake_snapshot():
+    with PIPELINE_LOCK:
+        on = PIPELINE.get("keepAwake", True) is not False
+        armed_on = bool(PIPELINE.get("keepAwakeArmed"))
+    with KEEP_AWAKE_LOCK:
+        return {
+            "supported": keep_awake_method() is not None,
+            "method": keep_awake_method(),
+            "enabled": on,
+            "armedEnabled": armed_on,
+            "active": bool(KEEP_AWAKE["active"]),
+            "reason": KEEP_AWAKE.get("reason"),
+            "since": KEEP_AWAKE.get("since"),
+            "error": KEEP_AWAKE.get("error"),
+            "armedUsers": list(KEEP_AWAKE.get("armedUsers") or []),
+        }
 
 
 def pipeline_enabled_for(username):
@@ -5496,6 +5713,14 @@ def api_pipeline_prefs(body):
         if "origEnabled" in body:  # v6.38
             PIPELINE["origEnabled"] = bool(body.get("origEnabled"))
             changed = True
+        if "keepAwake" in body:  # v6.40
+            PIPELINE["keepAwake"] = bool(body.get("keepAwake"))
+            changed = True
+            KEEP_AWAKE_WAKE.set()
+        if "keepAwakeArmed" in body:  # v6.40
+            PIPELINE["keepAwakeArmed"] = bool(body.get("keepAwakeArmed"))
+            changed = True
+            KEEP_AWAKE_WAKE.set()
         ousers = body.get("origUsers")
         if isinstance(ousers, dict):
             for k, v in ousers.items():
@@ -6140,6 +6365,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_text(data, status=200, content_type="text/html; charset=utf-8")
             return
         if path == "/api/health":
+            # v6.40: ?armed=a,b — page heartbeat of Auto-Rec streamers (keep-awake while armed)
+            try:
+                q = urllib.parse.parse_qs(parsed.query or "", keep_blank_values=True)
+                if "armed" in q:
+                    note_armed_heartbeat(q.get("armed", [""])[0])
+            except Exception as e:
+                log(f"armed heartbeat parse failed: {e}")
             self.send_json(health_payload())
             return
         if path == "/api/update/check":
@@ -6412,6 +6644,8 @@ def main():
     threading.Thread(target=delivery_loop, daemon=True, name="drive-delivery").start()
     request_delivery(None)
     threading.Thread(target=meter_loop, daemon=True, name="meter").start()
+    # v6.40: keep the computer from sleeping while recording / removing voice / sending to Drive
+    threading.Thread(target=keep_awake_loop, daemon=True, name="keep-awake").start()
     httpd = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
     sl = which_streamlink()
     ff = which_ffmpeg()
@@ -6428,6 +6662,8 @@ def main():
         log("google drive: " + (", ".join(r["path"] for r in _droots) if _droots else "Drive for Desktop not found (paste-a-link still works)"))
     except Exception as e:
         log(f"google drive detect failed: {e}")
+    _ka = keep_awake_method()
+    log("keep awake: " + (f"{_ka} (while recording / removing voice / sending to Drive)" if _ka else "unavailable on this computer"))
     log(f"html: {html_path if html_path.is_file() else 'MISSING — ' + HTML_NAME + ' not next to this script'}")
     try:
         httpd.serve_forever()
@@ -6435,6 +6671,7 @@ def main():
         log("shutting down…")
         with LOCK:
             stop_all_locked()
+        keep_awake_release()
         httpd.server_close()
         log("bye")
 
