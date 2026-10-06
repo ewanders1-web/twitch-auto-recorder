@@ -12,6 +12,7 @@ import threading
 import socket  # v6.38: computer name for no-clobber Drive copies
 import ntpath  # v6.38: Windows Drive for Desktop detection (unit-testable on any OS)
 import time
+import datetime  # v6.41: local timestamps in the Drive status file
 import urllib.parse
 import urllib.request
 import uuid
@@ -19,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.40"
+HELPER_VERSION = "6.41"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -2166,6 +2167,7 @@ def health_payload():
         "driveOriginals": originals_snapshot(60),  # v6.38
         "musicDemucsQueue": music_demucs_queue_info(),
         "keepAwake": keep_awake_snapshot(),  # v6.40
+        "statusFile": status_file_snapshot(),  # v6.41
         "seamlessJobs": seamless_jobs_for_health(),
         "updateRepo": f"https://github.com/{UPDATE_REPO}",
         # v6.29: last orphan temp cleanup (UI one-shot flash when non-zero after reconnect)
@@ -4939,6 +4941,8 @@ def _pipeline_load():
         # v6.40: keep-awake prefs (default: on while recording/processing; armed hold opt-in)
         PIPELINE["keepAwake"] = data.get("keepAwake") is not False
         PIPELINE["keepAwakeArmed"] = data.get("keepAwakeArmed") is True
+        # v6.41: post this computer's status file into Drive (default on)
+        PIPELINE["statusToDrive"] = data.get("statusToDrive") is not False
 
 
 def _pipeline_save():
@@ -5569,6 +5573,9 @@ def cleanup_drive_target_partials(target, reason="tick"):
         originals = root / ORIGINALS_SUBDIR
         if originals.is_dir():
             dirs.append(originals)
+        status_dir = root / STATUS_SUBDIR  # v6.41
+        if status_dir.is_dir():
+            dirs.append(status_dir)
     except OSError as e:
         log(f"drive target partial cleanup ({reason}): Originals check skipped: {e}")
     now = time.time()
@@ -5683,7 +5690,8 @@ def pipeline_status_payload():
     with PIPELINE_LOCK:
         prefs = {"enabled": PIPELINE["enabled"], "users": dict(PIPELINE["users"]), "target": PIPELINE["target"],
                  "origEnabled": bool(PIPELINE.get("origEnabled", True)),
-                 "origUsers": dict(PIPELINE.get("origUsers") or {})}
+                 "origUsers": dict(PIPELINE.get("origUsers") or {}),
+                 "statusToDrive": PIPELINE.get("statusToDrive", True) is not False}
     return {
         "ok": True, "driveFound": bool(roots), "prefs": prefs,
         "resolvedTarget": target, "targetKind": kind, "targetError": err,
@@ -5693,6 +5701,7 @@ def pipeline_status_payload():
         "originals": originals_snapshot(200),  # v6.38
         "originalsFolder": (os.path.join(target, ORIGINALS_SUBDIR) if target else None),
         "computer": computer_name(),
+        "statusFile": status_file_snapshot(),  # v6.41
     }
 
 
@@ -5721,6 +5730,10 @@ def api_pipeline_prefs(body):
             PIPELINE["keepAwakeArmed"] = bool(body.get("keepAwakeArmed"))
             changed = True
             KEEP_AWAKE_WAKE.set()
+        if "statusToDrive" in body:  # v6.41
+            PIPELINE["statusToDrive"] = bool(body.get("statusToDrive"))
+            changed = True
+            STATUS_FILE_WAKE.set()
         ousers = body.get("origUsers")
         if isinstance(ousers, dict):
             for k, v in ousers.items():
@@ -6271,6 +6284,368 @@ def files_payload():
     return {"ok": True, "dir": str(REC_DIR), "files": entries}
 
 
+# ─── v6.41: STATUS FILE IN GOOGLE DRIVE (REMOTE HEARTBEAT) ─────
+# Eric records on several computers (and one of them can't run anything but the helper), and
+# nobody can tell from outside whether a given helper is up, armed, recording or stuck on a
+# Drive send. Every few minutes — and right away when something changes (a recording starts or
+# stops, a delivery is sent or fails) — the helper writes a small status file for THIS computer
+# into the Drive target via Drive for Desktop:
+#   <Drive target>/Recorder status/<computer>.txt   (plain-English summary)
+#   <Drive target>/Recorder status/<computer>.json  (same facts, machine-readable)
+# Anyone (or any assistant) with Drive access can read them; a file that stops updating means
+# that computer is off, asleep, offline, or its helper isn't running. Writes are atomic
+# (temp + rename) and never block recording; failures are soft and show in /api/health.
+STATUS_SUBDIR = "Recorder status"
+STATUS_FILE_INTERVAL_SECS = max(30, int(os.environ.get("TWITCH_RECORDER_STATUS_SECS") or 300))
+STATUS_FILE_TICK_SECS = max(1.0, float(os.environ.get("TWITCH_RECORDER_STATUS_TICK_SECS") or 15))
+STATUS_FILE_MIN_GAP_SECS = max(0.0, float(os.environ.get("TWITCH_RECORDER_STATUS_MIN_GAP_SECS") or 20))
+STATUS_FILE_WAKE = threading.Event()
+STATUS_FILE_LOCK = threading.Lock()
+STATUS_FILE = {"lastWrittenAt": 0.0, "lastAttemptAt": 0.0, "folder": None, "txtPath": None,
+               "jsonPath": None, "error": None, "sig": None, "writes": 0}
+PAGE_SEEN = {"at": 0.0, "armed": []}
+HELPER_STARTED_AT = time.time()
+
+
+def status_file_enabled():
+    with PIPELINE_LOCK:
+        return PIPELINE.get("statusToDrive", True) is not False
+
+
+def note_page_seen(raw_armed):
+    users = []
+    for part in str(raw_armed or "").split(","):
+        u = safe_username(part)
+        if u and u not in users:
+            users.append(u)
+        if len(users) >= 50:
+            break
+    with STATUS_FILE_LOCK:
+        changed = users != PAGE_SEEN.get("armed")
+        PAGE_SEEN["at"] = time.time()
+        PAGE_SEEN["armed"] = users
+    if changed:
+        STATUS_FILE_WAKE.set()
+
+
+def _iso_local(ts):
+    try:
+        if not ts:
+            return None
+        return datetime.datetime.fromtimestamp(float(ts)).astimezone().isoformat(timespec="seconds")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _short(text, limit=300):
+    t = str(text or "")
+    return t if len(t) <= limit else t[: limit - 1] + "…"
+
+
+def _status_change_sig():
+    """Cheap fingerprint of the things worth an immediate status write (no Drive I/O)."""
+    with LOCK:
+        reap_locked()
+        active = tuple(sorted((u, basename_of(r.get("file") or ""), bool(r.get("retrying") or r.get("starting")))
+                              for u, r in ACTIVE.items()))
+        errs = tuple(sorted(LAST_ERROR.keys()))
+    with PIPELINE_LOCK:
+        dels = tuple(sorted((k, d.get("status")) for k, d in PIPELINE["deliveries"].items()))
+        origs = tuple(sorted((k, d.get("status")) for k, d in (PIPELINE.get("originals") or {}).items()))
+    q = music_demucs_queue_info()
+    with STATUS_FILE_LOCK:
+        armed = tuple(PAGE_SEEN.get("armed") or [])
+    return repr((active, errs, dels, origs, int(q.get("running") or 0), int(q.get("waiting") or 0),
+                 armed, pending_restart_needed()))
+
+
+def build_status_doc(now=None):
+    now = time.time() if now is None else now
+    with LOCK:
+        reap_locked()
+        active_items = [(u, dict(r)) for u, r in ACTIVE.items()]
+        last_errors = dict(LAST_ERROR)
+    disk = disk_status()
+    with STATUS_FILE_LOCK:
+        page_at = float(PAGE_SEEN.get("at") or 0.0)
+        armed = list(PAGE_SEEN.get("armed") or [])
+    page_open = bool(page_at) and now - page_at < 120
+    recording = []
+    for u, a in sorted(active_items):
+        path = a.get("file") or ""
+        recording.append({
+            "username": u,
+            "file": basename_of(path),
+            "startedAt": a.get("sessionStartedAt") or a.get("startedAt") or "",
+            "bytes": int(file_size(path) or 0) if path else 0,
+            "segments": len(a.get("sessionSegments") or []) + 1,
+            "retrying": bool(a.get("retrying") or a.get("starting")),
+        })
+    dels = deliveries_snapshot(6)
+    origs = originals_snapshot(6)
+    with PIPELINE_LOCK:
+        all_dels = list(PIPELINE["deliveries"].values())
+        all_origs = list((PIPELINE.get("originals") or {}).values())
+        pipe_on = bool(PIPELINE.get("enabled", True))
+        orig_on = bool(PIPELINE.get("origEnabled", True))
+    roots = detect_drive_roots()
+    target, _kind, terr = resolve_delivery_target(roots, create=False) if roots else (None, "auto", "Google Drive for Desktop not found")
+    recent = []
+    try:
+        for f in (files_payload().get("files") or []):
+            if f.get("recording"):
+                continue
+            recent.append({"name": f.get("name"), "bytes": int(f.get("size") or 0),
+                           "modifiedAt": _iso_local(f.get("mtime"))})
+            if len(recent) >= 8:
+                break
+    except Exception:
+        pass
+    q = music_demucs_queue_info()
+    ka = keep_awake_snapshot()
+    doc = {
+        "computer": computer_name(),
+        "updatedAt": _iso_local(now),
+        "updatedAtEpoch": int(now),
+        "nextUpdateBy": _iso_local(now + STATUS_FILE_INTERVAL_SECS),
+        "staleAfterSecs": STATUS_FILE_INTERVAL_SECS * 3,
+        "helperVersion": HELPER_VERSION,
+        "diskVersion": disk_file_version(),
+        "pendingRestart": pending_restart_needed(),
+        "helperStartedAt": _iso_local(HELPER_STARTED_AT),
+        "platform": sys.platform,
+        "streamlink": bool(which_streamlink()),
+        "ffmpeg": bool(which_ffmpeg()),
+        "demucs": demucs_available(),
+        "diskFreeBytes": disk.get("diskFree"),
+        "diskWarn": bool(disk.get("diskWarn")),
+        "diskBlock": bool(disk.get("diskBlock")),
+        "recorderPageOpen": page_open,
+        "recorderPageLastSeen": _iso_local(page_at) if page_at else None,
+        "autoRecArmed": armed if page_open else [],
+        "recording": recording,
+        "lastErrors": {u: _short(e) for u, e in last_errors.items()},
+        "voiceRemoval": {"running": int(q.get("running") or 0), "waiting": int(q.get("waiting") or 0)},
+        "drive": {
+            "found": bool(roots),
+            "target": target,
+            "targetError": terr,
+            "autoSend": pipe_on,
+            "sendOriginals": orig_on,
+            "partsWaiting": sum(1 for d in all_dels if d.get("status") == "waiting"),
+            "partsSending": sum(1 for d in all_dels if d.get("status") == "sending"),
+            "partsErrors": sum(1 for d in all_dels if d.get("status") == "error"),
+            "originalsWaiting": sum(1 for d in all_origs if d.get("status") in ("waiting", "queued")),
+            "originalsErrors": sum(1 for d in all_origs if d.get("status") == "error"),
+            "recentDeliveries": [{
+                "base": d.get("base"), "status": d.get("status"), "parts": len(d.get("parts") or []),
+                "sentAt": _iso_local(d.get("sentAt")), "note": _short(d.get("note"), 200),
+                "error": _short(d.get("error"), 300) or None} for d in dels],
+            "recentOriginals": [{
+                "name": o.get("name"), "status": o.get("status"),
+                "sentAt": _iso_local(o.get("sentAt")), "note": _short(o.get("note"), 200),
+                "error": _short(o.get("error"), 300) or None} for o in origs],
+        },
+        "keepAwake": {"active": bool(ka.get("active")), "reason": ka.get("reason"),
+                      "supported": bool(ka.get("supported")), "error": ka.get("error")},
+        "recentRecordings": recent,
+    }
+    return doc
+
+
+def _fmt_mb(n):
+    try:
+        v = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    if v >= 1e9:
+        return f"{v / 1e9:.1f} GB"
+    return f"{v / 1e6:.0f} MB"
+
+
+def render_status_text(doc):
+    L = []
+    L.append(f"Twitch Auto-Recorder status — {doc['computer']}")
+    L.append(f"Updated {doc['updatedAt']} (rewritten every {STATUS_FILE_INTERVAL_SECS // 60} min while the helper runs;"
+             f" if this is more than {doc['staleAfterSecs'] // 60} min old, this computer is off, asleep, offline,"
+             " or the helper isn't running)")
+    ver = f"Helper v{doc['helperVersion']}"
+    if doc.get("pendingRestart"):
+        ver += f" (v{doc.get('diskVersion')} installed, restart pending)"
+    ver += f", running since {doc.get('helperStartedAt')}"
+    L.append(ver)
+    tools = [("streamlink", doc["streamlink"]), ("ffmpeg", doc["ffmpeg"]), ("demucs", doc["demucs"])]
+    L.append("Tools: " + ", ".join(f"{n} {'ok' if ok else 'MISSING'}" for n, ok in tools))
+    disk = f"Disk free: {_fmt_mb(doc.get('diskFreeBytes'))}"
+    if doc.get("diskBlock"):
+        disk += " — ALMOST FULL, new recordings blocked"
+    elif doc.get("diskWarn"):
+        disk += " — low"
+    L.append(disk)
+    if doc.get("recorderPageOpen"):
+        armed = doc.get("autoRecArmed") or []
+        L.append("Recorder page: open; Auto-Rec armed for " + (", ".join(armed) if armed else "nobody"))
+    else:
+        seen = doc.get("recorderPageLastSeen")
+        L.append("Recorder page: NOT open" + (f" (last seen {seen})" if seen else "") +
+                 " — Auto-Rec only starts recordings while the page is open")
+    rec = doc.get("recording") or []
+    if rec:
+        for r in rec:
+            L.append(f"RECORDING {r['username']} since {r['startedAt']} — {r['file']}, {_fmt_mb(r['bytes'])}"
+                     + (f", segment {r['segments']}" if r.get("segments", 1) > 1 else "")
+                     + (" (reconnecting)" if r.get("retrying") else ""))
+    else:
+        L.append("Recording: nothing right now")
+    for u, e in (doc.get("lastErrors") or {}).items():
+        L.append(f"Last error for {u}: {e}")
+    vr = doc.get("voiceRemoval") or {}
+    if vr.get("running") or vr.get("waiting"):
+        L.append(f"Voice removal: {vr.get('running', 0)} running, {vr.get('waiting', 0)} waiting")
+    d = doc.get("drive") or {}
+    if not d.get("found"):
+        L.append("Google Drive: Drive for Desktop not found")
+    else:
+        L.append(f"Google Drive target: {d.get('target') or '?'}" + (f" — {d['targetError']}" if d.get("targetError") else ""))
+    L.append(f"Drive sends: {d.get('partsWaiting', 0)} part sets waiting, {d.get('partsErrors', 0)} failed;"
+             f" {d.get('originalsWaiting', 0)} originals waiting, {d.get('originalsErrors', 0)} failed")
+    for x in d.get("recentDeliveries") or []:
+        line = f"  parts {x['base']}: {x['status']}"
+        if x.get("sentAt"):
+            line += f" at {x['sentAt']}"
+        if x.get("error"):
+            line += f" — {x['error']}"
+        elif x.get("note") and x.get("status") != "sent":
+            line += f" — {x['note']}"
+        L.append(line)
+    for x in d.get("recentOriginals") or []:
+        line = f"  original {x['name']}: {x['status']}"
+        if x.get("sentAt"):
+            line += f" at {x['sentAt']}"
+        if x.get("error"):
+            line += f" — {x['error']}"
+        elif x.get("note") and x.get("status") != "sent":
+            line += f" — {x['note']}"
+        L.append(line)
+    ka = doc.get("keepAwake") or {}
+    if ka.get("active"):
+        L.append(f"Keeping the computer awake: {ka.get('reason')}")
+    elif ka.get("error"):
+        L.append(f"Keep awake problem: {ka.get('error')}")
+    rr = doc.get("recentRecordings") or []
+    if rr:
+        L.append("Recent files in TwitchRecordings:")
+        for f in rr:
+            L.append(f"  {f['name']} — {_fmt_mb(f['bytes'])}, {f.get('modifiedAt')}")
+    return "\n".join(L) + "\n"
+
+
+def _status_atomic_write(dest, data):
+    """Temp named like atomic_copy (.{name}.partial-{hex}) so the v6.39 sweep can clean leftovers."""
+    dest = Path(dest)
+    part = dest.parent / f".{dest.name}.partial-{uuid.uuid4().hex[:6]}"
+    try:
+        with open(part, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(part, dest)
+    finally:
+        try:
+            if part.exists():
+                part.unlink()
+        except OSError:
+            pass
+
+
+def write_status_file(reason="tick"):
+    """Write this computer's status into <Drive target>/Recorder status/. Returns True on success."""
+    now = time.time()
+    with STATUS_FILE_LOCK:
+        STATUS_FILE["lastAttemptAt"] = now
+    err = None
+    try:
+        roots = detect_drive_roots()
+        if not roots:
+            err = "Google Drive for Desktop not found"
+        else:
+            target, _kind, terr = resolve_delivery_target(roots, create=True)
+            if terr or not target:
+                err = terr or "Drive target unavailable"
+            else:
+                folder = Path(target) / STATUS_SUBDIR
+                folder.mkdir(parents=True, exist_ok=True)
+                doc = build_status_doc(now)
+                doc["reason"] = reason
+                name = computer_name()
+                txt = folder / f"{name}.txt"
+                js = folder / f"{name}.json"
+                _status_atomic_write(txt, render_status_text(doc).encode("utf-8"))
+                _status_atomic_write(js, (json.dumps(doc, indent=1, ensure_ascii=False) + "\n").encode("utf-8"))
+                with STATUS_FILE_LOCK:
+                    STATUS_FILE.update(lastWrittenAt=now, folder=str(folder), txtPath=str(txt),
+                                       jsonPath=str(js), error=None, writes=int(STATUS_FILE["writes"]) + 1)
+                return True
+    except PermissionError:
+        err = drive_permission_message()
+    except OSError as e:
+        err = f"could not write status file: {e}"
+    except Exception as e:
+        err = f"status file error: {e}"
+    with STATUS_FILE_LOCK:
+        if err != STATUS_FILE.get("error"):
+            log(f"status file ({reason}): {err}")
+        STATUS_FILE["error"] = err
+    return False
+
+
+def status_file_loop():
+    """Write on start, on meaningful change (min gap), and at least every STATUS_FILE_INTERVAL_SECS."""
+    first = True
+    while True:
+        try:
+            if status_file_enabled():
+                now = time.time()
+                sig = _status_change_sig()
+                with STATUS_FILE_LOCK:
+                    last_ok = float(STATUS_FILE["lastWrittenAt"] or 0.0)
+                    last_try = float(STATUS_FILE["lastAttemptAt"] or 0.0)
+                    prev_sig = STATUS_FILE.get("sig")
+                    had_err = bool(STATUS_FILE.get("error"))
+                changed = sig != prev_sig
+                if first:
+                    go = True
+                elif had_err:
+                    # after a failure (e.g. Drive missing / macOS Full Disk Access), retry on the interval
+                    go = now - last_try >= STATUS_FILE_INTERVAL_SECS
+                else:
+                    go = (now - last_ok >= STATUS_FILE_INTERVAL_SECS
+                          or (changed and now - last_ok >= STATUS_FILE_MIN_GAP_SECS))
+                if go:
+                    reason = "helper started" if first else ("change" if changed else "heartbeat")
+                    write_status_file(reason)
+                    with STATUS_FILE_LOCK:
+                        STATUS_FILE["sig"] = sig
+                    first = False
+        except Exception as e:
+            log(f"status file loop error: {e}")
+        STATUS_FILE_WAKE.wait(STATUS_FILE_TICK_SECS)
+        STATUS_FILE_WAKE.clear()
+
+
+def status_file_snapshot():
+    with STATUS_FILE_LOCK:
+        return {
+            "enabled": status_file_enabled(),
+            "intervalSecs": STATUS_FILE_INTERVAL_SECS,
+            "lastWrittenAt": STATUS_FILE["lastWrittenAt"] or None,
+            "folder": STATUS_FILE.get("folder"),
+            "txtPath": STATUS_FILE.get("txtPath"),
+            "error": STATUS_FILE.get("error"),
+            "computer": computer_name(),
+        }
+
+
 def reaper_loop():
     while True:
         time.sleep(1.5)
@@ -6370,6 +6745,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 q = urllib.parse.parse_qs(parsed.query or "", keep_blank_values=True)
                 if "armed" in q:
                     note_armed_heartbeat(q.get("armed", [""])[0])
+                    note_page_seen(q.get("armed", [""])[0])  # v6.41 status file
             except Exception as e:
                 log(f"armed heartbeat parse failed: {e}")
             self.send_json(health_payload())
@@ -6646,6 +7022,8 @@ def main():
     threading.Thread(target=meter_loop, daemon=True, name="meter").start()
     # v6.40: keep the computer from sleeping while recording / removing voice / sending to Drive
     threading.Thread(target=keep_awake_loop, daemon=True, name="keep-awake").start()
+    # v6.41: write <Drive target>/Recorder status/<computer>.txt + .json every few minutes
+    threading.Thread(target=status_file_loop, daemon=True, name="status-file").start()
     httpd = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
     sl = which_streamlink()
     ff = which_ffmpeg()
