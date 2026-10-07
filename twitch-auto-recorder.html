@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.41</span>
+    <span class="badge">v6.42</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -524,7 +524,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.41'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.42'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, statusToDrive:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false };
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
@@ -2786,9 +2786,19 @@ function applyLiveStatus(s, data){
       flashOk(`📴 ${s.username} went offline — stopping recording.`);
       stopRec(s.username, 'tab');
     }
-    if(helper.active.some(a=>a.username===s.username)){
-      flashOk(`📴 ${s.username} went offline — stopping helper recording.`);
-      stopRec(s.username, 'helper');
+    const hjOff=helper.active.find(a=>a.username===s.username);
+    if(hjOff){
+      // v6.42: helper is already retrying through a possible stream restart (ended +
+      // immediately went live again). Don't cancel that — it stops by itself at graceUntil
+      // and then finalizes the session (seamless / voice removal / Drive) as usual.
+      const gUntil=Number(hjOff.graceUntil||0)*1000;
+      if(hjOff.retrying && gUntil>Date.now()){
+        const t=new Date(gUntil).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+        flashOk(`📴 ${s.username} went offline — helper keeps watching for a restart until ${t}.`);
+      }else{
+        flashOk(`📴 ${s.username} went offline — stopping helper recording.`);
+        stopRec(s.username, 'helper');
+      }
     }
     // v6.25: guest/DJ set ended → return to home streamer if eligible
     const homeP=maybeReturnHome(s.username);

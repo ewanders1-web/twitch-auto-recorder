@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.41"
+HELPER_VERSION = "6.42"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -52,6 +52,16 @@ STALL_SECS = 90
 # Mid-resume: consecutive establish failures before giving up (stream likely offline /
 # page closed so Twitch poll cannot /api/stop). Auto-Rec can POST /api/record again if still live.
 MAX_MID_QUICK_FAILS = 5
+# v6.42: streamer ends and immediately restarts (new broadcast) → streamlink exits with
+# "no playable streams" for a minute or more while Twitch spins the new one up. Instead of
+# giving up after ~1 min, keep retrying with backoff for this long after a recording ends
+# or a start quick-fails, while that streamer has Auto-Rec armed (or no page has reported in).
+# 0 disables (old behavior). Env: TWITCH_RECORDER_RESTART_GRACE_SECS.
+try:
+    RESTART_GRACE_SECS = max(0.0, float(os.environ.get("TWITCH_RECORDER_RESTART_GRACE_SECS") or 480))
+except ValueError:
+    RESTART_GRACE_SECS = 480.0
+RESTART_GRACE_BACKOFFS = (15, 20, 30)  # once normal retries are used up; caps at 30s
 # Soft give-up sooner when streamlink stderr clearly says offline / no streams.
 OFFLINE_STDERR_HINTS = (
     "no playable streams",
@@ -1290,10 +1300,60 @@ def mid_resume_backoff(resume_idx):
     return MID_RESUME_BACKOFFS[-1]
 
 
+def restart_grace_applies(username):
+    """v6.42: keep retrying through a stream restart? True when the recorder page's latest
+    heartbeat lists this streamer as Auto-Rec armed, or no page has reported in since the
+    helper started (helper running alone). False when the page says they are not armed.
+
+    Takes STATUS_FILE_LOCK only — never call while holding LOCK.
+    """
+    if RESTART_GRACE_SECS <= 0:
+        return False
+    u = (username or "").lower()
+    try:
+        with STATUS_FILE_LOCK:
+            seen_at = float(PAGE_SEEN.get("at") or 0.0)
+            armed = [str(a).lower() for a in (PAGE_SEEN.get("armed") or [])]
+    except NameError:  # defined later in the module; only during import
+        return True
+    if not seen_at:
+        return True
+    return u in armed
+
+
+def grace_backoff(idx):
+    if idx < len(RESTART_GRACE_BACKOFFS):
+        return RESTART_GRACE_BACKOFFS[idx]
+    return RESTART_GRACE_BACKOFFS[-1]
+
+
+def _clock_label(ts):
+    """'9:14 PM' local (no %-I so Windows works)."""
+    lt = time.localtime(ts)
+    h = lt.tm_hour % 12 or 12
+    return f"{h}:{lt.tm_min:02d} {'AM' if lt.tm_hour < 12 else 'PM'}"
+
+
+def grace_wait_msg(username, until, err):
+    base = (f"waiting for {username} to come back (stream ended or restarting) — "
+            f"helper keeps trying until {_clock_label(until)}")
+    return base + (f" — last try: {err}" if err else "")
+
+
+def set_grace_until(username, gen, until):
+    with LOCK:
+        rec = ACTIVE.get(username)
+        if rec and rec.get("gen") == gen:
+            rec["graceUntil"] = float(until or 0.0)
+
+
 def record_supervisor(username, quality, gen):
     """Background: spawn streamlink, retry early failures, then mid-stream auto-resume."""
     attempt = 0
     max_attempts = 1 + len(RETRY_BACKOFFS)
+    first_fail_at = None  # v6.42 restart grace (start quick-fails)
+    grace_idx = 0
+    tries = 0
     while attempt < max_attempts:
         if not still_wanted(username, gen):
             with LOCK:
@@ -1356,6 +1416,7 @@ def record_supervisor(username, quality, gen):
             rec["starting"] = True
             rec["retrying"] = attempt > 0
 
+        tries += 1
         ok, err = monitor_quick_fail(username, gen, proc, out)
         if not still_wanted(username, gen):
             terminate_proc(proc)
@@ -1372,6 +1433,7 @@ def record_supervisor(username, quality, gen):
                 if rec and rec.get("gen") == gen:
                     rec["starting"] = False
                     rec["retrying"] = False
+                    rec["graceUntil"] = 0.0
                     rec["proc"] = proc
                     rec["file"] = str(out)
                     rec["pid"] = proc.pid
@@ -1397,12 +1459,41 @@ def record_supervisor(username, quality, gen):
             if rec and rec.get("gen") == gen and (rec.get("file") or "") == failed_path:
                 rec["file"] = ""
         scrub_failed_output(failed_path)
+        now = time.time()
+        if first_fail_at is None:
+            first_fail_at = now
         if attempt >= len(RETRY_BACKOFFS):
+            # v6.42: stream restart / slow playlist — keep trying for the grace window
+            until = first_fail_at + RESTART_GRACE_SECS
+            if now < until and restart_grace_applies(username):
+                backoff = grace_backoff(grace_idx)
+                grace_idx += 1
+                set_last_error(username, grace_wait_msg(username, until, err))
+                with LOCK:
+                    rec = ACTIVE.get(username)
+                    if not rec or rec.get("gen") != gen:
+                        return
+                    rec["proc"] = None
+                    rec["pid"] = None
+                    rec["starting"] = False
+                    rec["retrying"] = True
+                    rec["graceUntil"] = until
+                log(f"restart grace {username}: retry in {backoff}s (try {tries + 1}, until {_clock_label(until)})")
+                if not interruptible_backoff(username, gen, backoff):
+                    with LOCK:
+                        rec = ACTIVE.get(username)
+                        if rec and rec.get("gen") == gen:
+                            ACTIVE.pop(username, None)
+                    return
+                continue
+            if grace_idx:
+                set_last_error(username, f"stopped retrying {username} after {tries} tries over "
+                                         f"{int(round((now - first_fail_at) / 60.0))} min — {err}")
             with LOCK:
                 rec = ACTIVE.get(username)
                 if rec and rec.get("gen") == gen:
                     ACTIVE.pop(username, None)
-            log(f"gave up on {username} after {max_attempts} attempts")
+            log(f"gave up on {username} after {tries} attempts")
             return
         backoff = RETRY_BACKOFFS[attempt]
         attempt += 1
@@ -1439,14 +1530,45 @@ def watch_and_resume(username, quality, gen, proc):
     """
     resume_idx = 0
     consecutive_quick_fails = 0
+    # v6.42: when the last segment ended; restart grace runs from here
+    seg_ended_at = 0.0
+    grace_ok = False
+    grace_idx = 0
     with LOCK:
         rec0 = ACTIVE.get(username) or {}
         path0 = rec0.get("file") or ""
     last_size = file_size(path0)
     last_growth = time.time()
 
+    def in_grace():
+        """v6.42: still inside the restart window for this ended segment?"""
+        return grace_ok and time.time() < seg_ended_at + RESTART_GRACE_SECS
+
+    def grace_or_give_up(fails, last_err):
+        """Out of normal retries: keep waiting through a restart, or give up. True = keep going."""
+        nonlocal grace_ok
+        if grace_ok:
+            # re-check armed state (page may have turned Auto-Rec off meanwhile)
+            grace_ok = restart_grace_applies(username)
+        if in_grace():
+            until = seg_ended_at + RESTART_GRACE_SECS
+            set_last_error(username, grace_wait_msg(username, until, last_err))
+            return True
+        mins = int(round((time.time() - seg_ended_at) / 60.0)) if seg_ended_at else 0
+        give_up(
+            f"gave up after {fails} mid-resume fails"
+            + (f" over {mins} min" if grace_idx and mins else "")
+            + " — stream likely offline (Auto-Rec will restart if still live)"
+            + (f" — {last_err}" if last_err else "")
+        )
+        return False
+
     def begin_mid_resume(err_msg):
         """Mark slot retrying after a finished segment; caller owns resume loop."""
+        nonlocal seg_ended_at, grace_ok, grace_idx
+        seg_ended_at = time.time()
+        grace_idx = 0
+        grace_ok = restart_grace_applies(username)  # outside LOCK
         set_last_error(username, err_msg)
         with LOCK:
             rec = ACTIVE.get(username)
@@ -1462,6 +1584,7 @@ def watch_and_resume(username, quality, gen, proc):
             rec["pid"] = None
             rec["supervised"] = True
             rec["resumes"] = int(rec.get("resumes") or 0) + 1
+            rec["graceUntil"] = (seg_ended_at + RESTART_GRACE_SECS) if grace_ok else 0.0
         return True
 
     def give_up(reason):
@@ -1519,7 +1642,11 @@ def watch_and_resume(username, quality, gen, proc):
 
         # Keep trying while wanted; stop after consecutive establish failures.
         while still_wanted(username, gen):
-            backoff = mid_resume_backoff(resume_idx)
+            if consecutive_quick_fails >= MAX_MID_QUICK_FAILS:
+                backoff = grace_backoff(grace_idx)  # v6.42 restart grace
+                grace_idx += 1
+            else:
+                backoff = mid_resume_backoff(resume_idx)
             log(f"mid-resume {username} in {backoff}s (resume #{resume_idx + 1})")
             if not interruptible_backoff(username, gen, backoff):
                 break
@@ -1555,11 +1682,8 @@ def watch_and_resume(username, quality, gen, proc):
                 resume_idx += 1
                 consecutive_quick_fails += 1
                 if consecutive_quick_fails >= MAX_MID_QUICK_FAILS:
-                    give_up(
-                        f"gave up after {consecutive_quick_fails} mid-resume fails — "
-                        "stream likely offline (Auto-Rec will restart if still live)"
-                    )
-                    return
+                    if not grace_or_give_up(consecutive_quick_fails, err2):
+                        return
                 continue
 
             started = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -1592,11 +1716,14 @@ def watch_and_resume(username, quality, gen, proc):
                         rec["file"] = str(out)
                         rec["pid"] = new_proc.pid
                         rec["supervised"] = True
+                        rec["graceUntil"] = 0.0
                         if not rec.get("sessionStartedAt"):
                             rec["sessionStartedAt"] = started
-                log(f"recording {username} (segment resume) pid={new_proc.pid} -> {out}")
+                log(f"recording {username} (segment resume) pid={new_proc.pid} -> {out}"
+                    + (f" after {int(time.time() - seg_ended_at)}s restart wait" if grace_idx else ""))
                 proc = new_proc
                 resume_idx = 0
+                grace_idx = 0
                 last_size = file_size(out)
                 last_growth = time.time()
                 break  # back to outer watch loop
@@ -1622,12 +1749,9 @@ def watch_and_resume(username, quality, gen, proc):
             soft = looks_offline_err(qerr) and consecutive_quick_fails >= 2
             hard = consecutive_quick_fails >= MAX_MID_QUICK_FAILS
             if soft or hard:
-                give_up(
-                    f"gave up after {consecutive_quick_fails} mid-resume fails — "
-                    "stream likely offline (Auto-Rec will restart if still live)"
-                    + (f" — {qerr}" if qerr else "")
-                )
-                return
+                # v6.42: a restart looks exactly like "offline" for a minute or two
+                if not grace_or_give_up(consecutive_quick_fails, qerr):
+                    return
         else:
             # inner while exited without break → stop wanted false or gen mismatch
             break
@@ -2197,6 +2321,8 @@ def status_payload():
                 "retrying": bool(rec.get("retrying") or rec.get("starting")),
                 "resumes": int(rec.get("resumes") or 0),
                 "sessionSegments": list(rec.get("sessionSegments") or []),
+                # v6.42: >0 while waiting through a stream restart (epoch secs)
+                "graceUntil": float(rec.get("graceUntil") or 0.0),
             }
             peak = rec.get("peak")
             level = rec.get("level")
@@ -6380,6 +6506,7 @@ def build_status_doc(now=None):
             "bytes": int(file_size(path) or 0) if path else 0,
             "segments": len(a.get("sessionSegments") or []) + 1,
             "retrying": bool(a.get("retrying") or a.get("starting")),
+            "waitingForRestartUntil": _iso_local(a.get("graceUntil")) if float(a.get("graceUntil") or 0) > now else None,
         })
     dels = deliveries_snapshot(6)
     origs = originals_snapshot(6)
@@ -6494,7 +6621,9 @@ def render_status_text(doc):
         for r in rec:
             L.append(f"RECORDING {r['username']} since {r['startedAt']} — {r['file']}, {_fmt_mb(r['bytes'])}"
                      + (f", segment {r['segments']}" if r.get("segments", 1) > 1 else "")
-                     + (" (reconnecting)" if r.get("retrying") else ""))
+                     + (" (waiting for the stream to come back, until " + r["waitingForRestartUntil"][11:16] + ")"
+                        if r.get("retrying") and r.get("waitingForRestartUntil")
+                        else (" (reconnecting)" if r.get("retrying") else "")))
     else:
         L.append("Recording: nothing right now")
     for u, e in (doc.get("lastErrors") or {}).items():
