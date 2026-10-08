@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.42"
+HELPER_VERSION = "6.43"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -2038,14 +2038,28 @@ def maybe_auto_restart_idle():
         return
     if not pending_restart_needed():
         return
-    with LOCK:
-        reap_locked()
-        active = list(ACTIVE.keys())
-    if active:
+    # v6.43: same busy rules as the unattended updater (recording incl. restart-grace wait,
+    # Demucs/split queue, Drive copies + queued originals, seamless joins, uploads) and only
+    # after the helper has been idle for AUTO_UPDATE_IDLE_SECS (after-stream steps can queue).
+    busy = update_busy_reason()
+    if busy:
+        _auto_update_set(waitingFor=busy)
         return
-    if music_jobs_busy():
+    if not update_idle_settled():
+        _auto_update_set(waitingFor="just finished work — waiting a few idle minutes")
         return
+    disk = disk_file_version()
+    if os.environ.get("TWITCH_RECORDER_RESTARTED_FOR") == disk:
+        # v6.43: we already restarted once for this disk VERSION and still don't match
+        # (VERSION file out of step with the script) — don't loop restarting.
+        _auto_restart_scheduled = True
+        log(f"auto-restart skipped: already restarted for disk v{disk} but running v{HELPER_VERSION} "
+            "(VERSION file doesn't match the helper script)")
+        _auto_update_set(lastError=f"VERSION file says {disk} but the helper script is {HELPER_VERSION}")
+        return
+    os.environ["TWITCH_RECORDER_RESTARTED_FOR"] = disk  # survives execv into the new process
     _auto_restart_scheduled = True
+    _auto_update_set(state="restarting", waitingFor=None)
     log(
         "auto-restart scheduled (idle-after-update): "
         f"disk v{disk_file_version()} != running v{HELPER_VERSION}"
@@ -2161,8 +2175,98 @@ def atomic_write_bytes(dest: Path, data: bytes):
         raise
 
 
-def apply_update():
-    """Download UPDATE_FILES into INSTALL_DIR. Never self-kill; always needsRestart."""
+UPDATE_BACKUP_DIRNAME = ".update-backup"  # v6.43: previous install kept here (one generation)
+UPDATE_SELFTEST_TIMEOUT = 45
+
+
+def _validate_update_blobs(blobs, remote):
+    """v6.43: refuse a download that would leave a broken helper. Returns the new version."""
+    import re as _re
+    py = blobs.get("twitch-recorder-server.py") or b""
+    html = blobs.get(HTML_NAME) or b""
+    ver_raw = (blobs.get("VERSION") or b"").decode("utf-8", errors="replace").strip()
+    ver_file = ver_raw.splitlines()[0].strip() if ver_raw else ""
+    if len(py) < 20000:
+        raise RuntimeError(f"downloaded helper looks truncated ({len(py)} bytes) — not installed")
+    try:
+        compile(py, "twitch-recorder-server.py", "exec")
+    except SyntaxError as e:
+        raise RuntimeError(f"downloaded helper has a syntax error (line {e.lineno}: {e.msg}) — not installed")
+    m = _re.search(rb'HELPER_VERSION\s*=\s*["\']([^"\']+)["\']', py)
+    if not m:
+        raise RuntimeError("downloaded helper has no HELPER_VERSION — not installed")
+    py_ver = m.group(1).decode("utf-8", errors="replace").strip()
+    if not ver_file:
+        raise RuntimeError("downloaded VERSION file is empty — not installed")
+    if py_ver != ver_file:
+        # would make the helper think a restart is pending forever (disk != running)
+        raise RuntimeError(f"downloaded files disagree (VERSION {ver_file} vs helper {py_ver}) — not installed")
+    if remote and _parse_version_tuple(ver_file) != _parse_version_tuple(remote):
+        raise RuntimeError(f"GitHub changed while downloading (VERSION {remote} then {ver_file}) — try again")
+    if len(html) < 20000 or b"</html>" not in html[-4096:].lower():
+        raise RuntimeError(f"downloaded {HTML_NAME} looks truncated ({len(html)} bytes) — not installed")
+    return ver_file
+
+
+def _selftest_downloaded_helper(py_bytes):
+    """v6.43: run the downloaded helper with --self-test in a temp dir (no port, no threads,
+    temp recordings dir) to catch import-time / basic runtime errors before swapping.
+    Skipped for scripts that don't know --self-test (older than 6.43). Returns note string."""
+    if b"--self-test" not in py_bytes:
+        return "self-test skipped (downloaded helper predates --self-test)"
+    tmp = Path(tempfile.mkdtemp(prefix="tar-update-selftest-"))
+    try:
+        script = tmp / "twitch-recorder-server.py"
+        script.write_bytes(py_bytes)
+        rec = tmp / "rec"
+        rec.mkdir()
+        env = dict(os.environ)
+        env["TWITCH_RECORDER_REC_DIR"] = str(rec)
+        env["TWITCH_RECORDER_PORT"] = "0"
+        env["TWITCH_RECORDER_KEEP_AWAKE"] = "0"
+        try:
+            r = subprocess.run([sys.executable, str(script), "--self-test"], cwd=str(tmp), env=env,
+                               stdin=subprocess.DEVNULL, capture_output=True, timeout=UPDATE_SELFTEST_TIMEOUT,
+                               creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0))
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"downloaded helper self-test hung (> {UPDATE_SELFTEST_TIMEOUT}s) — not installed")
+        out = (r.stdout or b"").decode("utf-8", errors="replace")
+        err = (r.stderr or b"").decode("utf-8", errors="replace").strip()
+        if r.returncode != 0 or '"selfTest": "ok"' not in out:
+            tail = (err or out).strip().splitlines()[-1:] or ["no output"]
+            raise RuntimeError(f"downloaded helper failed its self-test (exit {r.returncode}: {tail[0][:200]}) — not installed")
+        return "self-test ok"
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+
+def _backup_install_files():
+    """v6.43: copy the current UPDATE_FILES into INSTALL_DIR/.update-backup/ (replaces older backup)."""
+    bdir = INSTALL_DIR / UPDATE_BACKUP_DIRNAME
+    bdir.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for name in UPDATE_FILES:
+        src = INSTALL_DIR / name
+        if src.is_file():
+            atomic_write_bytes(bdir / name, src.read_bytes())
+            saved.append(name)
+    try:
+        (bdir / "BACKUP-INFO.txt").write_text(
+            f"Files from helper v{local_helper_version()} saved {time.strftime('%Y-%m-%d %H:%M:%S')} before an update.\n"
+            "To roll back: stop the helper, copy these files back next to twitch-recorder-server.py, start it again.\n",
+            encoding="utf-8")
+    except OSError:
+        pass
+    return bdir, saved
+
+
+def apply_update(source="manual"):
+    """Download UPDATE_FILES into INSTALL_DIR. Never self-kill; always needsRestart.
+
+    v6.43: download everything first, validate (compile + versions agree + html complete +
+    --self-test of the new helper), back up the current files, then swap them in; if a write
+    fails midway the backup is restored so the install dir never holds a half update.
+    """
     local = local_helper_version()
     try:
         remote = fetch_remote_version()
@@ -2176,23 +2280,58 @@ def apply_update():
         }
 
     written = []
+    blobs = {}
     try:
         for name in UPDATE_FILES:
             url = UPDATE_RAW_BASE + name
             data = fetch_url_bytes(url, timeout=45)
             if not data:
                 raise RuntimeError(f"empty download: {name}")
-            dest = INSTALL_DIR / name
-            atomic_write_bytes(dest, data)
-            written.append(name)
-            log(f"update wrote {dest} ({len(data)} bytes)")
+            blobs[name] = data
+        new_ver = _validate_update_blobs(blobs, remote)
+        st_note = _selftest_downloaded_helper(blobs["twitch-recorder-server.py"])
+        log(f"update v{new_ver} ({source}) downloaded + checked: {st_note}")
     except Exception as e:
+        log(f"update ({source}) not installed: {e}")
         return {
             "ok": False,
             "error": str(e),
             "localVersion": local,
             "remoteVersion": remote,
             "written": written,
+            "restarted": False,
+            "needsRestart": False,
+        }
+    try:
+        bdir, saved = _backup_install_files()
+    except Exception as e:
+        log(f"update ({source}) not installed — could not back up current files: {e}")
+        return {"ok": False, "error": f"could not back up current files: {e}", "localVersion": local,
+                "remoteVersion": remote, "written": [], "restarted": False, "needsRestart": False}
+    try:
+        # VERSION last: pendingRestart only flips once every other file is in place
+        for name in sorted(UPDATE_FILES, key=lambda n: n == "VERSION"):
+            dest = INSTALL_DIR / name
+            atomic_write_bytes(dest, blobs[name])
+            written.append(name)
+            log(f"update wrote {dest} ({len(blobs[name])} bytes)")
+    except Exception as e:
+        restored = []
+        for name in written:
+            try:
+                b = bdir / name
+                if b.is_file():
+                    atomic_write_bytes(INSTALL_DIR / name, b.read_bytes())
+                    restored.append(name)
+            except Exception as e2:
+                log(f"update rollback of {name} failed: {e2}")
+        log(f"update ({source}) write failed ({e}); restored {restored or 'nothing'} from {bdir}")
+        return {
+            "ok": False,
+            "error": f"{e} (previous files restored)",
+            "localVersion": local,
+            "remoteVersion": remote,
+            "written": [],
             "restarted": False,
             "needsRestart": False,
         }
@@ -2212,6 +2351,9 @@ def apply_update():
             "Helper will auto-restart when recordings finish (and no Music jobs), "
             "or use Restart helper / POST /api/restart. Then hard-refresh the page."
         )
+    _auto_update_set(lastAppliedAt=time.time(), lastAppliedVersion=remote, lastAppliedSource=source,
+                     backupDir=str(bdir))
+    STATUS_FILE_WAKE.set()
 
     return {
         "ok": True,
@@ -2220,12 +2362,246 @@ def apply_update():
         "remoteVersion": remote,
         "written": written,
         "installDir": str(INSTALL_DIR),
+        "backupDir": str(bdir),
         "active": active,
         "restarted": False,
         "needsRestart": True,
         "note": note,
     }
 
+
+# ─── v6.43: HELPER UPDATES ITSELF UNATTENDED WHEN IDLE ───────────────
+# Every release used to need someone to click Check for updates → Install update in the page,
+# so a helper on a computer nobody looked at (Silver Bullet sat on 6.36) missed fixes. Now a
+# background loop checks GitHub ~2 min after start and then every ~3 h; when a newer version is
+# out and the "autoUpdate" pref is on (default) it waits until nothing is busy (see
+# update_busy_reason) plus a few idle minutes, installs it through apply_update (validated,
+# backed up) and restarts through the v6.32 deferred-safe restart. Never during a recording,
+# a stream-restart grace wait, Demucs/split jobs, Drive copies or seamless joins.
+def _env_secs(name, default, lo):
+    try:
+        return max(lo, float(os.environ.get(name) or default))
+    except ValueError:
+        return float(default)
+
+
+AUTO_UPDATE_ENV_OFF = (os.environ.get("TWITCH_RECORDER_AUTO_UPDATE") or "").strip().lower() in (
+    "0", "off", "false", "no")
+AUTO_UPDATE_FIRST_SECS = _env_secs("TWITCH_RECORDER_AUTO_UPDATE_FIRST_SECS", 120, 1)
+AUTO_UPDATE_EVERY_SECS = _env_secs("TWITCH_RECORDER_AUTO_UPDATE_SECS", 3 * 3600, 60)
+AUTO_UPDATE_RETRY_SECS = _env_secs("TWITCH_RECORDER_AUTO_UPDATE_RETRY_SECS", 1800, 30)
+AUTO_UPDATE_BUSY_SECS = _env_secs("TWITCH_RECORDER_AUTO_UPDATE_BUSY_SECS", 60, 1)
+AUTO_UPDATE_IDLE_SECS = _env_secs("TWITCH_RECORDER_AUTO_UPDATE_IDLE_SECS", 300, 0)
+AUTO_UPDATE_WAKE = threading.Event()
+AUTO_UPDATE_LOCK = threading.Lock()
+AUTO_UPDATE = {
+    "state": "starting", "lastCheckAt": 0.0, "lastCheckSource": None, "lastResult": None,
+    "lastError": None, "remoteVersion": None, "updateAvailable": False, "waitingFor": None,
+    "nextCheckAt": 0.0, "lastAppliedAt": 0.0, "lastAppliedVersion": None, "lastAppliedSource": None,
+    "backupDir": None, "lastBusyAt": 0.0, "checkNow": False,
+}
+UPLOADS_INFLIGHT = [0]  # v6.43: POST /api/music-only-upload bodies being received
+
+
+def _auto_update_set(**kw):
+    with AUTO_UPDATE_LOCK:
+        AUTO_UPDATE.update(kw)
+
+
+def auto_update_enabled():
+    if AUTO_UPDATE_ENV_OFF:
+        return False
+    with PIPELINE_LOCK:
+        return PIPELINE.get("autoUpdate", True) is not False
+
+
+def update_busy_reason():
+    """Plain-English reason the helper must NOT install/restart right now, or None when idle.
+
+    Reuses the v6.40 keep-awake busy check (recording incl. the v6.42 restart-grace wait — those
+    stay in ACTIVE — Demucs/split queue, Drive copy in flight, seamless joins) and adds originals
+    queued for Drive and uploads still arriving."""
+    reason = _keep_awake_busy_reason()
+    if not reason:
+        with PIPELINE_LOCK:
+            if any((d.get("status") in ("queued", "sending"))
+                   for d in (PIPELINE.get("originals") or {}).values()):
+                reason = "originals queued for Google Drive"
+            elif any(d.get("status") == "sending" for d in PIPELINE["deliveries"].values()):
+                reason = "sending to Google Drive"
+    if not reason and UPLOADS_INFLIGHT[0] > 0:
+        reason = "receiving an upload"
+    if reason:
+        _auto_update_set(lastBusyAt=time.time())
+    return reason
+
+
+def update_idle_settled(now=None):
+    """True once nothing has been busy for AUTO_UPDATE_IDLE_SECS (after-stream steps can queue)."""
+    now = time.time() if now is None else now
+    with AUTO_UPDATE_LOCK:
+        last = float(AUTO_UPDATE.get("lastBusyAt") or 0.0)
+    with KEEP_AWAKE_LOCK:  # keep-awake loop samples busy every ~15 s even when we don't
+        last = max(last, float(KEEP_AWAKE.get("lastBusyAt") or 0.0))
+    return (now - last) >= AUTO_UPDATE_IDLE_SECS
+
+
+def note_update_check(res, source):
+    """Remember the outcome of any GitHub check (manual or unattended) for health/status."""
+    now = time.time()
+    ok = bool(res.get("ok"))
+    with AUTO_UPDATE_LOCK:
+        AUTO_UPDATE["lastCheckAt"] = now
+        AUTO_UPDATE["lastCheckSource"] = source
+        if ok:
+            AUTO_UPDATE["remoteVersion"] = res.get("remoteVersion")
+            AUTO_UPDATE["updateAvailable"] = bool(res.get("updateAvailable"))
+            AUTO_UPDATE["lastResult"] = (f"v{res.get('remoteVersion')} available" if res.get("updateAvailable")
+                                         else f"up to date (GitHub v{res.get('remoteVersion')})")
+            AUTO_UPDATE["lastError"] = None
+        else:
+            AUTO_UPDATE["lastResult"] = "check failed"
+            AUTO_UPDATE["lastError"] = f"update check failed: {res.get('error') or 'unknown'}"
+    STATUS_FILE_WAKE.set()
+
+
+def auto_update_tick(now=None):
+    """One step of the unattended updater. Returns seconds until the next step."""
+    now = time.time() if now is None else now
+    # 1) files already on disk (manual install while busy, or our own apply) → restart when idle.
+    #    Runs even with the pref off: same as the v6.32 health-path auto-restart, but works with
+    #    the page closed.
+    if pending_restart_needed():
+        _auto_update_set(state="restart-pending")
+        maybe_auto_restart_idle()
+        return AUTO_UPDATE_BUSY_SECS
+    if not auto_update_enabled():
+        _auto_update_set(state="off", waitingFor=None, nextCheckAt=0.0)
+        return AUTO_UPDATE_EVERY_SECS
+    with AUTO_UPDATE_LOCK:
+        last = float(AUTO_UPDATE.get("lastCheckAt") or 0.0)
+        had_err = bool(AUTO_UPDATE.get("lastError")) and AUTO_UPDATE.get("lastResult") == "check failed"
+        force = bool(AUTO_UPDATE.get("checkNow"))
+        AUTO_UPDATE["checkNow"] = False
+        available = bool(AUTO_UPDATE.get("updateAvailable"))
+        remote = AUTO_UPDATE.get("remoteVersion")
+    due_every = AUTO_UPDATE_RETRY_SECS if had_err else AUTO_UPDATE_EVERY_SECS
+    if force or not last or now - last >= due_every or (
+            available and _parse_version_tuple(remote) <= _parse_version_tuple(local_helper_version())):
+        _auto_update_set(state="checking")
+        res = check_update()
+        note_update_check(res, "auto")
+        if not res.get("ok"):
+            log(f"auto-update: GitHub check failed ({res.get('error')}); retry in {int(AUTO_UPDATE_RETRY_SECS // 60)} min")
+            _auto_update_set(state="error", waitingFor=None, nextCheckAt=now + AUTO_UPDATE_RETRY_SECS)
+            return AUTO_UPDATE_RETRY_SECS
+        available = bool(res.get("updateAvailable"))
+        remote = res.get("remoteVersion")
+        last = now
+        if not available:
+            log(f"auto-update: up to date (v{local_helper_version()}, GitHub v{remote})")
+    if not available:
+        _auto_update_set(state="up-to-date", waitingFor=None, nextCheckAt=last + AUTO_UPDATE_EVERY_SECS)
+        return max(1.0, last + AUTO_UPDATE_EVERY_SECS - now)
+    busy = update_busy_reason()
+    if busy or not update_idle_settled(now):
+        why = busy or "just finished work — waiting a few idle minutes"
+        with AUTO_UPDATE_LOCK:
+            prev = AUTO_UPDATE.get("waitingFor")
+        if prev != why:
+            log(f"auto-update: v{remote} available — waiting until idle ({why})")
+        _auto_update_set(state="waiting-idle", waitingFor=why, nextCheckAt=last + AUTO_UPDATE_EVERY_SECS)
+        return AUTO_UPDATE_BUSY_SECS
+    log(f"auto-update: installing v{remote} (running v{HELPER_VERSION}, helper idle)")
+    _auto_update_set(state="installing", waitingFor=None)
+    res = apply_update(source="auto")
+    if not res.get("ok"):
+        err = res.get("error") or "unknown"
+        log(f"auto-update: install of v{remote} failed — {err}; helper keeps running v{HELPER_VERSION}; "
+            f"retry in {int(AUTO_UPDATE_RETRY_SECS // 60)} min")
+        _auto_update_set(state="error", lastError=f"install failed: {err}", lastResult="install failed",
+                         nextCheckAt=now + AUTO_UPDATE_RETRY_SECS)
+        STATUS_FILE_WAKE.set()
+        return AUTO_UPDATE_RETRY_SECS
+    log(f"auto-update: v{remote} installed into {INSTALL_DIR} (backup in {res.get('backupDir')}); restarting when idle")
+    _auto_update_set(state="restart-pending", lastResult=f"v{remote} installed", lastError=None,
+                     updateAvailable=False)
+    maybe_auto_restart_idle()
+    return AUTO_UPDATE_BUSY_SECS
+
+
+def auto_update_loop():
+    AUTO_UPDATE_WAKE.wait(AUTO_UPDATE_FIRST_SECS)
+    AUTO_UPDATE_WAKE.clear()
+    while True:
+        wait = AUTO_UPDATE_EVERY_SECS
+        try:
+            wait = auto_update_tick()
+        except Exception as e:
+            log(f"auto-update loop error: {e}")
+            _auto_update_set(state="error", lastError=f"auto-update error: {e}")
+            wait = AUTO_UPDATE_RETRY_SECS
+        AUTO_UPDATE_WAKE.wait(max(1.0, float(wait)))
+        AUTO_UPDATE_WAKE.clear()
+
+
+def auto_update_snapshot():
+    with AUTO_UPDATE_LOCK:
+        a = dict(AUTO_UPDATE)
+    pend = pending_restart_needed()
+    return {
+        "enabled": auto_update_enabled(),
+        "envDisabled": AUTO_UPDATE_ENV_OFF,
+        "state": ("restart-pending" if pend and a.get("state") not in ("restarting",) else a.get("state")),
+        "lastCheckAt": a.get("lastCheckAt") or None,
+        "lastCheckSource": a.get("lastCheckSource"),
+        "lastResult": a.get("lastResult"),
+        "lastError": a.get("lastError"),
+        "remoteVersion": a.get("remoteVersion"),
+        "updateAvailable": bool(a.get("updateAvailable")),
+        "waitingFor": a.get("waitingFor"),
+        "nextCheckAt": a.get("nextCheckAt") or None,
+        "lastAppliedAt": a.get("lastAppliedAt") or None,
+        "lastAppliedVersion": a.get("lastAppliedVersion"),
+        "backupDir": a.get("backupDir"),
+        "pendingRestart": pend,
+        "runningVersion": HELPER_VERSION,
+        "diskVersion": disk_file_version(),
+        "intervalSecs": int(AUTO_UPDATE_EVERY_SECS),
+        "idleSecs": int(AUTO_UPDATE_IDLE_SECS),
+    }
+
+
+def api_update_auto(body):
+    """POST /api/update/auto {enabled?: bool, checkNow?: bool} → snapshot."""
+    body = body if isinstance(body, dict) else {}
+    if "enabled" in body:
+        on = bool(body.get("enabled"))
+        with PIPELINE_LOCK:
+            PIPELINE["autoUpdate"] = on
+        _pipeline_save()
+        log(f"auto-update pref: {'on' if on else 'off'}")
+        STATUS_FILE_WAKE.set()
+    if body.get("checkNow"):
+        _auto_update_set(checkNow=True)
+    AUTO_UPDATE_WAKE.set()
+    return {"ok": True, "autoUpdate": auto_update_snapshot()}, 200
+
+
+def self_test():
+    """v6.43: `python twitch-recorder-server.py --self-test` — exercise the module without binding
+    the port or starting threads (used by apply_update before swapping in a download)."""
+    global _auto_restart_scheduled
+    _auto_restart_scheduled = True  # a self-test must never restart anything
+    _pipeline_load()
+    h = health_payload()
+    status_payload()
+    render_status_text(build_status_doc())
+    auto_update_snapshot()
+    json.dumps(h)
+    assert issubclass(Handler, http.server.BaseHTTPRequestHandler)
+    print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
+    return 0
 
 
 def _pipeline_health_summary():
@@ -2292,6 +2668,7 @@ def health_payload():
         "musicDemucsQueue": music_demucs_queue_info(),
         "keepAwake": keep_awake_snapshot(),  # v6.40
         "statusFile": status_file_snapshot(),  # v6.41
+        "autoUpdate": auto_update_snapshot(),  # v6.43
         "seamlessJobs": seamless_jobs_for_health(),
         "updateRepo": f"https://github.com/{UPDATE_REPO}",
         # v6.29: last orphan temp cleanup (UI one-shot flash when non-zero after reconnect)
@@ -5069,6 +5446,8 @@ def _pipeline_load():
         PIPELINE["keepAwakeArmed"] = data.get("keepAwakeArmed") is True
         # v6.41: post this computer's status file into Drive (default on)
         PIPELINE["statusToDrive"] = data.get("statusToDrive") is not False
+        # v6.43: install helper updates automatically when idle (default on)
+        PIPELINE["autoUpdate"] = data.get("autoUpdate") is not False
 
 
 def _pipeline_save():
@@ -5817,7 +6196,8 @@ def pipeline_status_payload():
         prefs = {"enabled": PIPELINE["enabled"], "users": dict(PIPELINE["users"]), "target": PIPELINE["target"],
                  "origEnabled": bool(PIPELINE.get("origEnabled", True)),
                  "origUsers": dict(PIPELINE.get("origUsers") or {}),
-                 "statusToDrive": PIPELINE.get("statusToDrive", True) is not False}
+                 "statusToDrive": PIPELINE.get("statusToDrive", True) is not False,
+                 "autoUpdate": PIPELINE.get("autoUpdate", True) is not False}  # v6.43
     return {
         "ok": True, "driveFound": bool(roots), "prefs": prefs,
         "resolvedTarget": target, "targetKind": kind, "targetError": err,
@@ -5860,6 +6240,14 @@ def api_pipeline_prefs(body):
             PIPELINE["statusToDrive"] = bool(body.get("statusToDrive"))
             changed = True
             STATUS_FILE_WAKE.set()
+        if "autoUpdate" in body:  # v6.43
+            on = bool(body.get("autoUpdate"))
+            if PIPELINE.get("autoUpdate", True) is not on:
+                log(f"auto-update pref: {'on' if on else 'off'}")
+                AUTO_UPDATE_WAKE.set()
+                STATUS_FILE_WAKE.set()
+            PIPELINE["autoUpdate"] = on
+            changed = True
         ousers = body.get("origUsers")
         if isinstance(ousers, dict):
             for k, v in ousers.items():
@@ -6481,8 +6869,10 @@ def _status_change_sig():
     q = music_demucs_queue_info()
     with STATUS_FILE_LOCK:
         armed = tuple(PAGE_SEEN.get("armed") or [])
+    au = auto_update_snapshot()  # v6.43
     return repr((active, errs, dels, origs, int(q.get("running") or 0), int(q.get("waiting") or 0),
-                 armed, pending_restart_needed()))
+                 armed, pending_restart_needed(), au.get("enabled"), au.get("state"), au.get("lastError"),
+                 au.get("remoteVersion")))
 
 
 def build_status_doc(now=None):
@@ -6530,6 +6920,7 @@ def build_status_doc(now=None):
         pass
     q = music_demucs_queue_info()
     ka = keep_awake_snapshot()
+    au = auto_update_snapshot()  # v6.43
     doc = {
         "computer": computer_name(),
         "updatedAt": _iso_local(now),
@@ -6575,6 +6966,13 @@ def build_status_doc(now=None):
         },
         "keepAwake": {"active": bool(ka.get("active")), "reason": ka.get("reason"),
                       "supported": bool(ka.get("supported")), "error": ka.get("error")},
+        # v6.43: unattended helper updates (ready check can see on/off, last check, last error)
+        "autoUpdate": {"enabled": au.get("enabled"), "state": au.get("state"),
+                       "lastCheckAt": _iso_local(au.get("lastCheckAt")), "lastResult": au.get("lastResult"),
+                       "lastError": _short(au.get("lastError"), 300) or None,
+                       "remoteVersion": au.get("remoteVersion"), "waitingFor": au.get("waitingFor"),
+                       "lastAppliedVersion": au.get("lastAppliedVersion"),
+                       "lastAppliedAt": _iso_local(au.get("lastAppliedAt"))},
         "recentRecordings": recent,
     }
     return doc
@@ -6656,6 +7054,29 @@ def render_status_text(doc):
         elif x.get("note") and x.get("status") != "sent":
             line += f" — {x['note']}"
         L.append(line)
+    au = doc.get("autoUpdate") or {}  # v6.43
+    if au:
+        if not au.get("enabled"):
+            line = "Helper auto-update: OFF (updates only via Check for updates → Install update)"
+        else:
+            line = "Helper auto-update: on"
+            st = au.get("state")
+            if st == "waiting-idle":
+                line += f" — v{au.get('remoteVersion')} available, installing when idle ({au.get('waitingFor')})"
+            elif st == "restart-pending":
+                line += " — update installed, restarting when idle" + (
+                    f" ({au.get('waitingFor')})" if au.get("waitingFor") else "")
+            elif st in ("installing", "restarting", "checking"):
+                line += f" — {st}"
+        if au.get("lastCheckAt"):
+            line += f"; last checked {au['lastCheckAt']}" + (f" ({au['lastResult']})" if au.get("lastResult") else "")
+        else:
+            line += "; not checked yet (first check ~2 min after the helper starts)"
+        L.append(line)
+        if au.get("lastError"):
+            L.append(f"Helper auto-update problem: {au['lastError']}")
+        if au.get("lastAppliedVersion"):
+            L.append(f"Last auto-installed: v{au['lastAppliedVersion']} at {au.get('lastAppliedAt')}")
     ka = doc.get("keepAwake") or {}
     if ka.get("active"):
         L.append(f"Keeping the computer awake: {ka.get('reason')}")
@@ -6880,7 +7301,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(health_payload())
             return
         if path == "/api/update/check":
-            self.send_json(check_update())
+            res = check_update()
+            note_update_check(res, "page")  # v6.43
+            res["autoUpdate"] = auto_update_snapshot()
+            self.send_json(res)
+            return
+        if path == "/api/update/auto":  # v6.43
+            self.send_json({"ok": True, "autoUpdate": auto_update_snapshot()})
             return
         if path == "/api/status":
             self.send_json(status_payload())
@@ -6957,8 +7384,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if path == "/api/update":
-            result = apply_update()
+            result = apply_update(source="page")
             self.send_json(result, status=200 if result.get("ok") else 400)
+            return
+        if path == "/api/update/auto":  # v6.43: {enabled?, checkNow?}
+            if not origin_allowed(self.headers.get("Origin")):
+                self.send_json({"ok": False, "error": "origin not allowed"}, status=403)
+                return
+            payload, status = api_update_auto(self.read_json())
+            self.send_json(payload, status=status)
             return
         if path == "/api/restart":
             body = self.read_json()
@@ -7062,7 +7496,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(payload, status=status)
             return
         if path == "/api/music-only-upload":
-            parsed, err = parse_multipart_file(self)
+            with AUTO_UPDATE_LOCK:
+                UPLOADS_INFLIGHT[0] += 1  # v6.43: don't auto-restart mid-upload
+            try:
+                parsed, err = parse_multipart_file(self)
+            finally:
+                with AUTO_UPDATE_LOCK:
+                    UPLOADS_INFLIGHT[0] -= 1
             if err:
                 self.send_json({"ok": False, "error": err}, status=400)
                 return
@@ -7154,6 +7594,8 @@ def main():
     # v6.41: write <Drive target>/Recorder status/<computer>.txt + .json every few minutes
     threading.Thread(target=status_file_loop, daemon=True, name="status-file").start()
     httpd = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
+    # v6.43: unattended GitHub update check (~2 min after start, then every ~3 h; installs when idle)
+    threading.Thread(target=auto_update_loop, daemon=True, name="auto-update").start()
     sl = which_streamlink()
     ff = which_ffmpeg()
     html_path = HERE / HTML_NAME
@@ -7172,6 +7614,11 @@ def main():
     _ka = keep_awake_method()
     log("keep awake: " + (f"{_ka} (while recording / removing voice / sending to Drive)" if _ka else "unavailable on this computer"))
     log(f"html: {html_path if html_path.is_file() else 'MISSING — ' + HTML_NAME + ' not next to this script'}")
+    if AUTO_UPDATE_ENV_OFF:
+        log("auto-update: disabled by TWITCH_RECORDER_AUTO_UPDATE=0")
+    else:
+        log(f"auto-update: {'on' if auto_update_enabled() else 'OFF (Settings)'} — first GitHub check in "
+            f"{int(AUTO_UPDATE_FIRST_SECS)}s, then every {AUTO_UPDATE_EVERY_SECS / 3600:g} h; installs only when idle")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -7184,4 +7631,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv[1:]:  # v6.43: used by apply_update before swapping in a download
+        sys.exit(self_test())
     main()

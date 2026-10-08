@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.42</span>
+    <span class="badge">v6.43</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -254,6 +254,7 @@
     <div id="updatePanel" class="update-box hidden">
       <strong style="font-size:.88rem">⬆ Helper update</strong>
       <div class="verline" id="updateVerLine">—</div>
+      <div class="verline" id="updateAutoLine"></div>
       <div style="display:flex;gap:.45rem;flex-wrap:wrap;align-items:center;">
         <button class="btn btn-purple btn-sm hidden" id="installUpdateBtn" onclick="installUpdate()">Install update</button>
         <button class="btn btn-gray btn-sm" onclick="hideUpdatePanel()">Dismiss</button>
@@ -309,6 +310,9 @@
           </label>
           <label title="v6.41: every 5 minutes (and right away when a recording starts/stops or a Drive send finishes or fails) the helper writes a small status file for this computer into your Drive target: Recorder status/&lt;computer&gt;.txt (+ .json). Lets you — or your assistant — check from anywhere whether each recording computer is on, armed, recording, and sending to Drive. A file that stops updating means that computer is off, asleep or its helper isn't running." style="margin-left:1rem">
             <input type="checkbox" id="statusFileToggle" checked onchange="saveStatusFileToggle()"> Post this computer's status to Drive
+          </label>
+          <label title="v6.43: the helper checks GitHub ~2 min after it starts and then every ~3 hours. When a newer version is out it installs it and restarts itself — but only when nothing is recording (or waiting through a stream restart), removing voice, splitting, joining or sending to Drive, and it has been idle a few minutes. A broken download is never installed and the previous files are kept in .update-backup. Helpers older than v6.43 need one last Check for updates → Install update; with this on, this page does that for them automatically once when they are idle." style="margin-left:1rem">
+            <input type="checkbox" id="autoUpdateToggle" checked onchange="saveAutoUpdateToggle()"> Install helper updates automatically when idle
           </label>
         </div>
       </div>
@@ -508,6 +512,7 @@
         <button class="btn btn-gray btn-sm" onclick="checkForUpdates()">Check for updates</button>
         <span id="setupUpdateHint" style="font-size:.76rem;color:#9ca3af"></span>
       </div>
+      <div id="setupAutoUpdateLine" class="hint" style="margin-top:.35rem"></div>
     </div>
     <div style="display:flex;gap:.7rem;margin-top:1rem;flex-wrap:wrap;">
       <button class="btn btn-purple" onclick="connectAPI()">🔌 Connect & Test</button>
@@ -524,9 +529,9 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.42'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.43'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
-let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, statusToDrive:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false };
+let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, statusToDrive:true, autoUpdate:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false };
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
 let musicJobsNotified = new Set(); // jobIds already fireNotify'd for done/error (health spam safe)
@@ -657,6 +662,7 @@ function persist(){
       keepAwake: cfg.keepAwake!==false, // v6.40
       keepAwakeArmed: cfg.keepAwakeArmed===true, // v6.40
       statusToDrive: cfg.statusToDrive!==false, // v6.41
+      autoUpdate: cfg.autoUpdate!==false, // v6.43
       homeStreamer: String(cfg.homeStreamer||'').toLowerCase(),
       returnHomeAfterSet: cfg.returnHomeAfterSet!==false,
       // v6.35: Google Drive card (same persist key)
@@ -702,6 +708,7 @@ function restoreSettings(){
     cfg.keepAwake=data.keepAwake!==false; // v6.40 default on
     cfg.keepAwakeArmed=data.keepAwakeArmed===true; // v6.40 opt-in
     cfg.statusToDrive=data.statusToDrive!==false; // v6.41 default on
+    cfg.autoUpdate=data.autoUpdate!==false; // v6.43 default on
     // v6.25: home streamer + return after guest/DJ set
     cfg.homeStreamer=data.homeStreamer?String(data.homeStreamer).toLowerCase():'';
     if(typeof data.returnHomeAfterSet==='boolean') cfg.returnHomeAfterSet=data.returnHomeAfterSet;
@@ -811,6 +818,8 @@ function markHelperDown(wasOk){
   helper.diskFree=null; helper.diskTotal=null; helper.diskWarn=false; helper.diskBlock=false;
   helper.keepAwake=null; // v6.40
   helper.statusFile=null; // v6.41
+  helper.autoUpdate=null; // v6.43
+  helperOkSince=0; // v6.43
   // v6.24: hide demucs sticky while helper is down (not the same as demucs missing)
   helperDemucsMissingNotified=false;
   helperDiskMusicPaused=false;
@@ -1386,6 +1395,7 @@ function pingHelperAndStatus(){
       helper.ok=true;
       helper.keepAwake=(d.keepAwake && typeof d.keepAwake==='object')?d.keepAwake:null; // v6.40
       helper.statusFile=(d.statusFile && typeof d.statusFile==='object')?d.statusFile:null; // v6.41
+      helper.autoUpdate=(d.autoUpdate && typeof d.autoUpdate==='object')?d.autoUpdate:null; // v6.43
       { const sf=helper.statusFile; const sig=sf?[sf.enabled,sf.lastWrittenAt,sf.error,Math.floor(Date.now()/60000)].join('|'):'';
         if(sig!==statusFileSig){ statusFileSig=sig; try{ renderPipelineBox(); }catch(e){} } }
       helper.streamlink=!!d.streamlink;
@@ -1415,6 +1425,8 @@ function pingHelperAndStatus(){
       if(Array.isArray(d.musicJobs)) applyMusicJobsFromHealth(d.musicJobs);
       if(Array.isArray(d.seamlessJobs)) applySeamlessJobsFromHealth(d.seamlessJobs);
       applyPipelineFromHealth(d); // v6.36
+      if(!helperOkSince) helperOkSince=Date.now(); // v6.43
+      renderAutoUpdateLine(); // v6.43
     }else{
       markHelperDown(wasOk);
       return;
@@ -1433,6 +1445,7 @@ function pingHelperAndStatus(){
   updatePendingRestartBanner();
   updateStatusUI();
   renderStreamers();
+  maybePageAutoUpdate(); // v6.43: one-time nudge for helpers that can't update themselves
   // Fresh connect / reconnect: merge disk files and immediately kick live Auto-Rec
   if(helper.ok && !wasOk){
     driveRefresh().catch(function(){}); // v6.35
@@ -2027,7 +2040,7 @@ function updateHelperBar(){
   const dot=document.getElementById('helperDot');
   const txt=document.getElementById('helperTxt');
   if(!dot||!txt) return;
-  const pendingBit=(helper.pendingRestart?(' · restart pending (disk v'+(helper.diskVersion||'?')+')'):'')+keepAwakeBit(); // v6.40 keep-awake bit
+  const pendingBit=(helper.pendingRestart?(' · restart pending (disk v'+(helper.diskVersion||'?')+')'):'')+keepAwakeBit()+autoUpdateBit(); // v6.40 keep-awake bit · v6.43 auto-update bit
   if(helper.ok && helper.streamlink){
     const diskBit=(helper.diskFree!=null)?(' · '+fmtDiskBytes(helper.diskFree)+' free'):'';
     const demucsBit=helper.demucs?'':' · demucs missing';
@@ -2414,6 +2427,8 @@ async function checkForUpdates(){
     updateCheck.updateAvailable=!!d.updateAvailable;
     const msg='Local v'+(updateCheck.localVersion||'?')+' · Remote v'+(updateCheck.remoteVersion||'?')
       +(d.repo?(' · '+d.repo):'');
+    if(d.autoUpdate && typeof d.autoUpdate==='object'){ helper.autoUpdate=d.autoUpdate; } // v6.43
+    renderAutoUpdateLine();
     if(d.updateAvailable){
       flashOk('Update available: v'+updateCheck.remoteVersion+' (you have v'+updateCheck.localVersion+'). Click Install update to confirm.');
       showUpdatePanel(msg+' — update available. Click Install update to download into the helper install dir.', true);
@@ -4851,7 +4866,8 @@ function pipelinePrefsBody(){
   streamers.forEach(function(s){ users[s.username]=s.drivePipe!==false; origUsers[s.username]=s.driveOrig!==false; });
   return {enabled:cfg.drivePipeline!==false, users:users, origEnabled:cfg.driveOriginals!==false, origUsers:origUsers,
     keepAwake:cfg.keepAwake!==false, keepAwakeArmed:cfg.keepAwakeArmed===true, // v6.40
-    statusToDrive:cfg.statusToDrive!==false}; // v6.41
+    statusToDrive:cfg.statusToDrive!==false, // v6.41
+    autoUpdate:cfg.autoUpdate!==false}; // v6.43
 }
 async function syncPipelinePrefs(force){
   if(!helper.ok || !helperHasPipeline()) return;
@@ -5111,6 +5127,106 @@ function helperVerLt(a,b){
   for(let i=0;i<Math.max(pa.length,pb.length);i++){ const x=pa[i]||0, y=pb[i]||0; if(x!==y) return x<y; }
   return false;
 }
+// ─── v6.43: HELPER UPDATES ITSELF WHEN IDLE ──────────
+// v6.43+ helpers run their own loop (GitHub check ~2 min after start, then every ~3 h; install +
+// restart only when idle). Older helpers can't, so this page nudges them once per session.
+var helperOkSince=0;
+var pageAutoUpdate={ tried:false, checkedAt:0, checking:false };
+function initAutoUpdateToggle(){
+  const el=document.getElementById('autoUpdateToggle');
+  if(el) el.checked=cfg.autoUpdate!==false;
+}
+function saveAutoUpdateToggle(){
+  const el=document.getElementById('autoUpdateToggle');
+  cfg.autoUpdate=el?!!el.checked:true;
+  persist();
+  syncPipelinePrefs(true);
+  let msg=cfg.autoUpdate
+    ? 'Helper updates install automatically — only when nothing is recording, removing voice or sending to Drive.'
+    : 'Automatic helper updates off — use Check for updates → Install update.';
+  if(cfg.autoUpdate && helper.ok && helper.version && helperVerLt(helper.version,'6.43')) msg+=' This helper (v'+helper.version+') is too old to update itself; this page will install the update once when it is idle (or click Check for updates → Install update now).';
+  flashOk(msg);
+  setTimeout(function(){ pingHelperAndStatus().catch(function(){}); }, 1500);
+}
+function auClock(ts){
+  if(!ts) return '';
+  try{ return new Date(Number(ts)*1000).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}); }catch(e){ return ''; }
+}
+function autoUpdateText(){
+  if(!helper.ok) return '';
+  const a=helper.autoUpdate;
+  if(!a){
+    return 'Auto-update: this helper (v'+(helper.version||'?')+') can\u2019t update itself yet — Check for updates → Install update once (v6.43+ then updates itself when idle).'
+      +(cfg.autoUpdate!==false?' This page will do it automatically once while the helper is idle.':'');
+  }
+  if(!a.enabled) return 'Auto-update: off'+(a.envDisabled?' (TWITCH_RECORDER_AUTO_UPDATE=0)':'')+' — updates only via Check for updates → Install update.'
+    +(a.lastCheckAt?' Last checked '+auClock(a.lastCheckAt)+(a.lastResult?' ('+a.lastResult+')':'')+'.':'');
+  let t='Auto-update: on';
+  if(a.state==='waiting-idle') t+=' — v'+(a.remoteVersion||'?')+' available, installs when idle'+(a.waitingFor?' (waiting: '+a.waitingFor+')':'');
+  else if(a.state==='restart-pending' || a.pendingRestart) t+=' — v'+(a.diskVersion||a.lastAppliedVersion||'?')+' installed, restarts when idle'+(a.waitingFor?' (waiting: '+a.waitingFor+')':'');
+  else if(a.state==='installing' || a.state==='restarting' || a.state==='checking') t+=' — '+a.state+'…';
+  t+=a.lastCheckAt?(' · last checked '+auClock(a.lastCheckAt)+(a.lastResult?' ('+a.lastResult+')':'')):' · first check ~2 min after the helper starts';
+  if(a.nextCheckAt && a.state==='up-to-date') t+=' · next ~'+auClock(a.nextCheckAt);
+  if(a.lastError) t+=' · ⚠ '+a.lastError;
+  return t;
+}
+function renderAutoUpdateLine(){
+  const t=autoUpdateText();
+  const a=document.getElementById('updateAutoLine');
+  if(a) a.textContent=t;
+  const b=document.getElementById('setupAutoUpdateLine');
+  if(b) b.textContent=t;
+}
+function autoUpdateBit(){
+  const a=helper.autoUpdate;
+  if(!helper.ok || !a || !a.enabled) return '';
+  if(a.state==='waiting-idle') return ' · ⬆ v'+(a.remoteVersion||'?')+' installs when idle';
+  if(a.state==='installing') return ' · ⬆ installing v'+(a.remoteVersion||'?');
+  if(a.state==='error' && a.lastError) return ' · ⚠ auto-update: '+String(a.lastError).slice(0,80);
+  return '';
+}
+function pageAutoUpdateBusy(){
+  // Same busy rules the helper uses, from what the page can see.
+  if((helper.active||[]).length) return 'recording';
+  if(streamers.some(function(s){ return s && (isRecording(s) || s.helperStarting || (s.autoRec && s.isLive)); })) return 'streamer live / recording';
+  const q=helper.musicDemucsQueue;
+  if(q && ((Number(q.running)||0)>0 || (Number(q.waiting)||0)>0)) return 'voice removal';
+  if(helper.pipeline && helper.pipeline.sending) return 'sending to Drive';
+  if(Object.keys(seamlessJobs).some(function(k){ const j=seamlessJobs[k]; return j && (j.status==='queued' || j.status==='running'); })) return 'joining segments';
+  if(updateCheck.checking || updateCheck.installing) return 'update in progress';
+  return null;
+}
+async function maybePageAutoUpdate(){
+  // Conservative: once per page session, only for helpers without their own loop (≤6.42),
+  // only after the helper has been connected and idle for 2+ min, never while anything is busy.
+  // Installs through the existing installUpdate(); the helper's own v6.32 idle logic restarts it.
+  if(pageAutoUpdate.tried || pageAutoUpdate.checking) return;
+  if(cfg.autoUpdate===false || !helper.ok || !helper.version) return;
+  if(helper.autoUpdate) return; // v6.43+ helper updates itself
+  if(helper.pendingRestart) return; // already on disk — helper restarts when idle
+  if(!helperOkSince || Date.now()-helperOkSince < 120000) return;
+  if(Date.now()-pageAutoUpdate.checkedAt < 30*60*1000) return; // GitHub at most every 30 min
+  if(pageAutoUpdateBusy()) return;
+  pageAutoUpdate.checking=true;
+  pageAutoUpdate.checkedAt=Date.now();
+  try{
+    const d=await helperFetch('/api/update/check', undefined, 15000);
+    if(!d || !d.ok || !d.updateAvailable) return;
+    if(helperVerLt(String(d.remoteVersion||''),'6.43')) return; // only nudge toward a self-updating helper
+    if(pageAutoUpdateBusy() || !helper.ok) return;
+    pageAutoUpdate.tried=true;
+    updateCheck.localVersion=d.localVersion||helper.version;
+    updateCheck.remoteVersion=d.remoteVersion||'';
+    updateCheck.updateAvailable=true;
+    console.log('[auto-update] helper v'+updateCheck.localVersion+' idle — installing v'+updateCheck.remoteVersion);
+    flashOk('Helper v'+updateCheck.localVersion+' is idle — installing v'+updateCheck.remoteVersion+' automatically (Settings → Install helper updates automatically). From v6.43 on it updates itself.');
+    await installUpdate();
+  }catch(e){
+    console.warn('[auto-update] page nudge failed', e);
+  }finally{
+    pageAutoUpdate.checking=false;
+  }
+}
 function keepAwakeBit(){
   const k=helper.keepAwake;
   if(!helper.ok || !k) return '';
@@ -5342,6 +5458,7 @@ initDrivePipeToggle();
 initDriveOrigToggle();
 initKeepAwakeToggle(); // v6.40
 initStatusFileToggle(); // v6.41
+initAutoUpdateToggle(); // v6.43
 initDriveCard();
 updateHomeStreamerUI();
 renderStreamers();
