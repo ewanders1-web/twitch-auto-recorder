@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.43"
+HELPER_VERSION = "6.44"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -5448,6 +5448,10 @@ def _pipeline_load():
         PIPELINE["statusToDrive"] = data.get("statusToDrive") is not False
         # v6.43: install helper updates automatically when idle (default on)
         PIPELINE["autoUpdate"] = data.get("autoUpdate") is not False
+        # v6.44: after-stream jobs that were queued/running when the helper last stopped
+        pj = data.get("pendingJobs") if isinstance(data.get("pendingJobs"), dict) else {}
+        PIPELINE["pendingJobs"] = {str(k): v for k, v in pj.items()
+                                   if isinstance(v, dict) and isinstance(v.get("segments"), list)}
 
 
 def _pipeline_save():
@@ -6385,6 +6389,11 @@ def pipeline_worker(job_id):
         log(f"pipeline error job={job_id}: {msg}")
         _set_music_job(job_id, status="error", progress="Error", error=msg, finishedAt=time.time())
     finally:
+        # v6.44: job reached an end state in this process — no resume needed after a restart
+        try:
+            _pending_job_drop(segs[0] if segs else None)
+        except Exception:
+            pass
         if slot_held:
             try:
                 DEMUCS_SLOTS.release()
@@ -6425,6 +6434,69 @@ def _new_job(name, display, source, target, **extra):
     return job_id
 
 
+# ─── v6.44: RESUME AFTER-STREAM JOBS INTERRUPTED BY A HELPER RESTART ─────
+# Voice removal runs for hours after a stream. If the helper quits mid-job (crash, reboot, power
+# blip, macOS killing it, manual restart) the job used to vanish from memory and that stream was
+# never voice-removed or sent to Drive. Queued/running stream jobs are now persisted in
+# .drive-pipeline.json and re-queued on startup (max PIPELINE_RESUME_MAX tries, newer than
+# PIPELINE_RESUME_MAX_AGE_SECS). Finished, cancelled or failed jobs are dropped from the list.
+PIPELINE_RESUME_MAX = int(os.environ.get("TWITCH_RECORDER_PIPELINE_RESUME_MAX") or 3)
+PIPELINE_RESUME_MAX_AGE_SECS = int(os.environ.get("TWITCH_RECORDER_PIPELINE_RESUME_MAX_AGE_SECS") or 3 * 86400)
+PIPELINE_RESUME_DELAY_SECS = float(os.environ.get("TWITCH_RECORDER_PIPELINE_RESUME_DELAY") or 20)
+
+
+def _pending_job_put(first, username, segs, redo, reason):
+    with PIPELINE_LOCK:
+        pj = PIPELINE.setdefault("pendingJobs", {})
+        prev = pj.get(first) if isinstance(pj.get(first), dict) else {}
+        pj[first] = {"segments": list(segs), "username": username, "redo": bool(redo),
+                     "reason": reason, "queuedAt": prev.get("queuedAt") or time.time(),
+                     "attempts": int(prev.get("attempts") or 0) + 1}
+    _pipeline_save()
+
+
+def _pending_job_drop(first):
+    if not first:
+        return
+    with PIPELINE_LOCK:
+        pj = PIPELINE.get("pendingJobs") or {}
+        if first not in pj:
+            return
+        pj.pop(first, None)
+    _pipeline_save()
+
+
+def resume_pending_pipeline_jobs(now=None):
+    """Startup: re-queue stream jobs interrupted by the last helper stop. Returns resumed names."""
+    now = now or time.time()
+    with PIPELINE_LOCK:
+        items = list((PIPELINE.get("pendingJobs") or {}).items())
+    resumed, dropped = [], []
+    for first, ent in items:
+        segs = [basename_of(x) for x in (ent.get("segments") or []) if isinstance(x, str)]
+        on_disk = [x for x in segs if x and (REC_DIR / x).is_file()]
+        age = now - float(ent.get("queuedAt") or 0)
+        if (not on_disk or int(ent.get("attempts") or 0) >= PIPELINE_RESUME_MAX
+                or age > PIPELINE_RESUME_MAX_AGE_SECS):
+            dropped.append(first)
+            continue
+        user = ent.get("username") or ""
+        jid, err = start_stream_pipeline(user, on_disk, redo=bool(ent.get("redo")),
+                                         reason="resumed after helper restart")
+        if jid:
+            resumed.append(first)
+        else:
+            log(f"pipeline resume skipped {first}: {err}")
+            if err == "no segments":
+                dropped.append(first)
+    for d in dropped:
+        log(f"pipeline resume: dropping stale pending job {d}")
+        _pending_job_drop(d)
+    if resumed:
+        log(f"pipeline resume: re-queued {len(resumed)} interrupted job(s): {resumed}")
+    return resumed
+
+
 def start_stream_pipeline(username, segments, redo=False, reason="stream-end"):
     segs = [basename_of(s) for s in (segments or []) if s]
     segs = [s for s in segs if s and not is_music_export_name(s) and not is_seamless_export_name(s)]
@@ -6443,6 +6515,10 @@ def start_stream_pipeline(username, segments, redo=False, reason="stream-end"):
     # name = first segment so History / Auto Music see it as that recording's Music-only job
     jid = _new_job(first, first, "pipeline", pipeline_worker, segments=segs, username=username,
                    redo=bool(redo), reason=reason)
+    try:
+        _pending_job_put(first, username, segs, redo, reason)
+    except Exception as e:
+        log(f"pipeline pending-save failed: {e}")
     log(f"pipeline queued job={jid} user={username} segments={segs} ({reason})")
     return jid, None
 
@@ -7588,6 +7664,15 @@ def main():
         log(f"drive target partial cleanup startup failed: {e}")
     threading.Thread(target=delivery_loop, daemon=True, name="drive-delivery").start()
     request_delivery(None)
+
+    # v6.44: re-queue voice-removal/split jobs a crash/reboot/restart interrupted
+    def _resume_later():
+        time.sleep(PIPELINE_RESUME_DELAY_SECS)
+        try:
+            resume_pending_pipeline_jobs()
+        except Exception as e:
+            log(f"pipeline resume failed: {e}")
+    threading.Thread(target=_resume_later, daemon=True, name="pipeline-resume").start()
     threading.Thread(target=meter_loop, daemon=True, name="meter").start()
     # v6.40: keep the computer from sleeping while recording / removing voice / sending to Drive
     threading.Thread(target=keep_awake_loop, daemon=True, name="keep-awake").start()
