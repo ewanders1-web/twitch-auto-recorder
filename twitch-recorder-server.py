@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.44"
+HELPER_VERSION = "6.45"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -1858,6 +1858,8 @@ def music_job_snapshot(job):
         "vocalsName": job.get("vocalsName"),
         "redo": bool(job.get("redo")) if job.get("redo") is not None else None,
         "startedAt": job.get("startedAt"),
+        "quality": job.get("quality"),  # v6.45 fast | better
+        "qualityNote": job.get("qualityNote"),
         # v6.35: Drive / link jobs (absent keys = native History/Auto Music job)
         **_drive_job_extra(job),
     }
@@ -2651,6 +2653,7 @@ def health_payload():
         "demucs": demucs_available(),
         # v6.24: install hint for HTML sticky banner / Convert / History "Need demucs"
         "demucsHint": None if demucs_available() else "pip install demucs (first run downloads models)",
+        "voiceQuality": voice_quality_snapshot(),  # v6.45 Fast (ffmpeg) / Better (demucs)
         "recordingsDir": str(REC_DIR),
         "active": active,
         "lastErrors": last_errors,
@@ -3137,13 +3140,15 @@ def music_only_worker(job_id, src_path):
     src_path = Path(src_path)
     work = None
     slot_held = False
+    quality = _job_get(job_id, "quality") or "better"  # v6.45
     try:
         # v6.28: stay queued until a demucs slot is free (one at a time).
         # v6.29: waiting is interruptible — Cancel waiting / Clear waiting Music.
+        # v6.45: Fast (ffmpeg) jobs wait in the same one-at-a-time line.
         _set_music_job(
             job_id,
             status="queued",
-            progress="Waiting for demucs (1 at a time)…",
+            progress=voice_wait_msg(quality),
             progressPct=0,
         )
         while True:
@@ -3184,13 +3189,24 @@ def music_only_worker(job_id, src_path):
             else:
                 _set_music_job(job_id, progress=msg)
 
-        stem_wav = _run_demucs(src_path, work, progress)
-        vocals_wav = _find_vocals(work)
-        progress("Encoding instrumental…", pct=90)
-        # Native source is never overwritten — sibling -music / -vocals only.
-        provisional = _unique_music_dest(src_path.name)
-        final = _remux_instrumental(stem_wav, provisional)
-        out_name = final.name
+        if quality == "fast":
+            # v6.45: Twitchy Too Fast path — ffmpeg center-cancel, no demucs, -music only.
+            info = probe_media(src_path)
+            parts = voice_removed_parts(job_id, [src_path], work, info["duration"],
+                                        progress, "fast", pct_lo=5.0, pct_hi=88.0)
+            tmp_out = encode_joined_ogg(job_id, parts, work / "out.ogg", info["duration"],
+                                        progress, pct_lo=88.0, pct_hi=98.0)
+            final = atomic_publish(tmp_out, _unique_music_dest(src_path.name))
+            vocals_wav = None
+            out_name = final.name
+        else:
+            stem_wav = _run_demucs(src_path, work, progress)
+            vocals_wav = _find_vocals(work)
+            progress("Encoding instrumental…", pct=90)
+            # Native source is never overwritten — sibling -music / -vocals only.
+            provisional = _unique_music_dest(src_path.name)
+            final = _remux_instrumental(stem_wav, provisional)
+            out_name = final.name
         url = "/api/download/" + urllib.parse.quote(out_name)
         vocals_name = None
         vocals_url = None
@@ -3216,9 +3232,12 @@ def music_only_worker(job_id, src_path):
             finishedAt=time.time(),
         )
         log(
-            f"music-only done job={job_id} out={out_name}"
+            f"music-only done job={job_id} quality={_job_get(job_id, 'quality')} out={out_name}"
             + (f" vocals={vocals_name}" if vocals_name else "")
         )
+    except _JobCancelled:
+        _finalize_cancelled_music_job(job_id)
+        log(f"music-only cancelled job={job_id}")
     except Exception as e:
         msg = str(e) or type(e).__name__
         log(f"music-only error job={job_id}: {msg}")
@@ -3244,7 +3263,7 @@ def music_only_worker(job_id, src_path):
             _unregister_work_path(work)
 
 
-def start_music_only(raw_name, redo=False):
+def start_music_only(raw_name, redo=False, quality=None):
     """Validate basename under REC_DIR, refuse if missing/recording, start background job.
 
     Native source is never deleted or overwritten. Output is always a sibling
@@ -3260,10 +3279,10 @@ def start_music_only(raw_name, redo=False):
     target = resolve_download_path(raw_name)
     if not target:
         return {"ok": False, "error": "not found"}, 404
-    if is_music_export_name(target.name):
+    if is_voice_removed_name(target.name):
         return {
             "ok": False,
-            "error": "pick the native recording — not a -music / -vocals export",
+            "error": "pick the native recording — not a -music / -vocals / -novoice export",
         }, 400
     abspath = os.path.abspath(str(target))
     with LOCK:
@@ -3313,11 +3332,13 @@ def start_music_only(raw_name, redo=False):
                     "redo": bool(job.get("redo")),
                 }, 200
 
-    if not demucs_available():
+    # v6.45: Better (demucs) or Fast (ffmpeg) — only fail when neither can run.
+    eff_q, q_note = resolve_voice_quality(quality)
+    if not eff_q:
         return {
             "ok": False,
-            "error": "demucs not installed — pip install demucs (first run downloads models)",
-            "demucs": False,
+            "error": q_note,
+            "demucs": demucs_available(),
         }, 400
 
     # v6.30: refuse new Music only / Demucs when disk almost full (diskBlock).
@@ -3350,7 +3371,7 @@ def start_music_only(raw_name, redo=False):
             "jobId": job_id,
             "status": "queued",
             "progress": (
-                "Waiting for demucs (1 at a time)…"
+                voice_wait_msg(eff_q)
                 if ahead
                 else "Queued…"
             ),
@@ -3363,6 +3384,8 @@ def start_music_only(raw_name, redo=False):
             "vocalsUrl": None,
             "startedAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "redo": bool(redo),
+            "quality": eff_q,  # v6.45
+            "qualityNote": q_note,
         }
     t = threading.Thread(
         target=music_only_worker,
@@ -3372,7 +3395,7 @@ def start_music_only(raw_name, redo=False):
     )
     t.start()
     log(
-        f"music-only started job={job_id} file={target.name} redo={bool(redo)}"
+        f"music-only started job={job_id} file={target.name} redo={bool(redo)} quality={eff_q}"
         + (f" waitingBehind={ahead}" if ahead else "")
     )
     return {
@@ -3381,6 +3404,8 @@ def start_music_only(raw_name, redo=False):
         "redo": bool(redo),
         "waitingBehind": bool(ahead),
         "queueAhead": int(ahead),
+        "quality": eff_q,
+        "qualityNote": q_note,
     }, 200
 
 
@@ -4857,6 +4882,161 @@ def encode_joined_ogg(job_id, parts, out_path, duration, progress, pct_lo=90.0, 
     raise RuntimeError(f"ffmpeg encode failed: {last}")
 
 
+# ─── v6.45: VOICE-REMOVAL QUALITY — Fast (ffmpeg) vs Better (demucs) ─────
+# Merged from Twitchy Too. One setting (Convert tab, saved in .drive-pipeline.json) drives
+# History/Auto Music only, Convert upload, Drive → remove voice, Drive link, and the
+# after-stream remove-voice → split → Drive pipeline. Requests may override per job.
+#   better — demucs two-stems no_vocals (unchanged behavior; needs demucs)
+#   fast   — ffmpeg center-cancel vocal reduce (no demucs; stereo sources only)
+#   auto   — Better when demucs is installed, else Fast (default)
+# Both still take the one-at-a-time voice-removal slot so jobs queue politely.
+VOICE_QUALITIES = ("auto", "better", "fast")
+FAST_VOICE_AF = "pan=stereo|c0=0.5*c0+-0.5*c1|c1=0.5*c0+-0.5*c1,afftdn=nf=-25"
+
+
+class _MonoAudioError(RuntimeError):
+    pass
+
+
+def _norm_voice_quality(q):
+    q = str(q or "").strip().lower()
+    if q in ("better", "demucs", "high", "best"):
+        return "better"
+    if q in ("fast", "ffmpeg", "quick"):
+        return "fast"
+    if q == "auto":
+        return "auto"
+    return None
+
+
+def voice_quality_pref():
+    with PIPELINE_LOCK:
+        return _norm_voice_quality(PIPELINE.get("voiceQuality")) or "auto"
+
+
+def resolve_voice_quality(requested=None):
+    """→ (effective 'better' | 'fast' | None, note). Better needs demucs; Fast needs ffmpeg."""
+    q = _norm_voice_quality(requested)
+    if q is None:
+        q = voice_quality_pref()
+    has_d = demucs_available()
+    has_ff = bool(which_ffmpeg())
+    if q == "auto":
+        q = "better" if has_d else "fast"
+    if q == "better":
+        if has_d:
+            return "better", None
+        if has_ff:
+            return "fast", "Better needs demucs (not installed) — using Fast (ffmpeg)"
+        return None, "demucs not installed and ffmpeg not found — install ffmpeg (Fast) or pip install demucs (Better)"
+    if not has_ff:
+        return None, "ffmpeg not found — install ffmpeg (needed for Fast voice removal)"
+    return "fast", None
+
+
+def voice_quality_snapshot():
+    eff, note = resolve_voice_quality(None)
+    return {"pref": voice_quality_pref(), "effective": eff, "note": note,
+            "demucs": demucs_available(), "ffmpeg": bool(which_ffmpeg())}
+
+
+def voice_wait_msg(quality):
+    return ("Waiting for demucs (1 at a time)…" if quality != "fast"
+            else "Waiting for voice removal (1 at a time)…")
+
+
+def is_voice_removed_name(name):
+    """-music / -vocals exports, plus Twitchy Too -novoice outputs (never re-process those)."""
+    if is_music_export_name(name):
+        return True
+    stem = Path(name or "").stem
+    return bool(_re_drive.search(r"-novoice(?:-\d+)?$", stem))
+
+
+def _audio_channels(path):
+    fp = _which_ffprobe()
+    if not fp:
+        return 0
+    try:
+        r = subprocess.run(
+            [fp, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=channels",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        return int((r.stdout or "").strip().splitlines()[0])
+    except Exception:
+        return 0
+
+
+def fast_voice_reduce_parts(job_id, src, work, duration, progress, pct_lo=20.0, pct_hi=90.0):
+    """Twitchy Too Fast path: ffmpeg center-cancel (+ light denoise) per source → ordered FLAC
+    list (same shape as chunked_demucs_no_vocals, so encode/split/Drive steps are unchanged)."""
+    srcs = list(src) if isinstance(src, (list, tuple)) else [src]
+    ff = which_ffmpeg()
+    if not ff:
+        raise RuntimeError("ffmpeg not found")
+    out_dir = Path(work) / "fast"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for one in srcs:
+        if _audio_channels(one) == 1:
+            raise _MonoAudioError(
+                f"{Path(one).name}: mono audio — Fast (center-cancel) needs stereo; use Better (demucs)")
+    durs = []
+    for one in srcs:
+        try:
+            durs.append(float(probe_media(one)["duration"] or 0))
+        except Exception:
+            durs.append(0.0)
+    total = sum(durs) or float(duration or 0) or 1.0
+    span = pct_hi - pct_lo
+    outs = []
+    done_secs = 0.0
+    for i, one in enumerate(srcs):
+        _check_cancel(job_id)
+        _wait_disk_ok(job_id, progress)
+        n = len(srcs)
+        label = "Fast voice removal" + (f" {i + 1}/{n}" if n > 1 else "")
+        progress(f"{label} (ffmpeg center-cancel)…", round(pct_lo + span * done_secs / total, 1))
+        flac = out_dir / f"s{i:03d}.flac"
+        base_done = done_secs
+
+        def on_line(line, base_done=base_done, label=label):
+            if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                try:
+                    v = float(line.split("=", 1)[1]) / 1_000_000.0
+                except ValueError:
+                    return
+                frac = max(0.0, min(1.0, (base_done + v) / total))
+                progress(f"{label} · {frac * 100:.0f}%", round(pct_lo + span * frac, 1))
+
+        rc, tail = _job_run_proc(
+            job_id,
+            [ff, "-nostdin", "-v", "error", "-y", "-i", str(one), "-vn", "-map", "0:a:0",
+             "-af", FAST_VOICE_AF, "-ac", "2", "-ar", "44100", "-c:a", "flac",
+             "-progress", "pipe:1", "-nostats", str(flac)],
+            line_cb=on_line, timeout=3 * 3600,
+        )
+        if rc != 0 or not flac.is_file() or flac.stat().st_size == 0:
+            raise RuntimeError(f"ffmpeg vocal reduce failed: {tail[-400:]}")
+        done_secs += durs[i]
+        outs.append(flac)
+    return outs
+
+
+def voice_removed_parts(job_id, src, work, duration, progress, quality, pct_lo=20.0, pct_hi=90.0):
+    """Dispatch to Fast (ffmpeg) or Better (chunked demucs). Mono + Fast → demucs if installed."""
+    if quality == "fast":
+        try:
+            return fast_voice_reduce_parts(job_id, src, work, duration, progress, pct_lo, pct_hi)
+        except _MonoAudioError as e:
+            if not demucs_available():
+                raise RuntimeError(str(e))
+            log(f"voice job={job_id}: {e} — switching to Better (demucs)")
+            _set_music_job(job_id, quality="better", qualityNote="mono source — used Better (demucs)")
+            progress("Mono audio — using Better (demucs) instead of Fast…", None)
+    return chunked_demucs_no_vocals(job_id, src, work, duration, progress, pct_lo, pct_hi)
+
+
 def atomic_publish(tmp_file, dest):
     """Write dest atomically (temp in dest folder, then rename) so Drive syncs one clean file."""
     dest = Path(dest)
@@ -5084,17 +5264,18 @@ def drive_music_worker(job_id):
             note += f" · leading silence {lead:.0f}s (info only)"
         _set_music_job(job_id, info=note, leadingSilence=round(lead, 1), duration=info["duration"])
         log(f"drive-music job={job_id}: {note}")
-        # One demucs at a time (shared with History / Auto Music).
+        # One demucs at a time (shared with History / Auto Music). v6.45: Fast waits too.
+        quality = _job_get(job_id, "quality") or "better"
         _set_music_job(job_id, status="queued", phase="wait",
-                       progress="Waiting for demucs (1 at a time)…")
+                       progress=voice_wait_msg(quality))
         while True:
             _check_cancel(job_id)
             if DEMUCS_SLOTS.acquire(timeout=0.5):
                 slot_held = True
                 break
         _check_cancel(job_id)
-        _set_music_job(job_id, status="running", phase="demucs")
-        parts = chunked_demucs_no_vocals(job_id, staged, work, info["duration"], progress)
+        _set_music_job(job_id, status="running", phase="demucs" if quality != "fast" else "fast")
+        parts = voice_removed_parts(job_id, staged, work, info["duration"], progress, quality)
         _check_cancel(job_id)
         _set_music_job(job_id, phase="encode")
         tmp_out = encode_joined_ogg(job_id, parts, work / "out.ogg", info["duration"], progress)
@@ -5184,12 +5365,12 @@ def _new_drive_job(name, display, source, **extra):
     return job_id
 
 
-def _drive_preflight():
+def _drive_preflight(quality=None):
     if not which_ffmpeg():
         return {"ok": False, "error": "ffmpeg not found — install ffmpeg"}, 400
-    if not demucs_available():
-        return {"ok": False, "error": "demucs not installed — pip install demucs (first run downloads models)",
-                "demucs": False}, 400
+    if not resolve_voice_quality(quality)[0]:  # v6.45: Fast works without demucs
+        return {"ok": False, "error": resolve_voice_quality(quality)[1],
+                "demucs": demucs_available()}, 400
     if disk_block_error():
         free, _t = disk_usage_for_rec_dir()
         return {"ok": False, "diskBlock": True,
@@ -5215,9 +5396,10 @@ def start_drive_music(body):
         return {"ok": False, "error": "no files selected"}, 400
     if len(paths) > 100:
         return {"ok": False, "error": "too many files (max 100 per request)"}, 400
-    pre = _drive_preflight()
+    pre = _drive_preflight(body.get("quality"))
     if pre:
         return pre
+    eff_q, q_note = resolve_voice_quality(body.get("quality"))  # v6.45
     redo = bool(body.get("redo"))
     mode = _norm_out_mode(body.get("outMode"))
     roots = detect_drive_roots()
@@ -5237,8 +5419,8 @@ def start_drive_music(body):
         if Path(name).suffix.lower() not in DRIVE_MEDIA_EXTS:
             skipped.append({"path": real, "reason": "not an audio/video file"})
             continue
-        if is_music_export_name(name):
-            skipped.append({"path": real, "reason": "already a -music / -vocals export"})
+        if is_voice_removed_name(name):
+            skipped.append({"path": real, "reason": "already a -music / -vocals / -novoice export"})
             continue
         dest = _drive_output_path(real, mode)
         if mode != "recordings":
@@ -5256,10 +5438,10 @@ def start_drive_music(body):
             skipped.append({"path": real, "reason": "already running", "jobId": jid})
             continue
         jid = _new_drive_job(key, name, "drive", srcPath=real, outputPath=str(dest),
-                             outMode=mode, redo=redo)
+                             outMode=mode, redo=redo, quality=eff_q, qualityNote=q_note)
         started.append({"path": real, "jobId": jid, "outputPath": str(dest)})
-        log(f"drive-music queued job={jid} src={real} out={dest} redo={redo}")
-    return {"ok": True, "started": started, "skipped": skipped}, 200
+        log(f"drive-music queued job={jid} src={real} out={dest} redo={redo} quality={eff_q}")
+    return {"ok": True, "started": started, "skipped": skipped, "quality": eff_q, "qualityNote": q_note}, 200
 
 
 def start_drive_fetch(body):
@@ -5268,18 +5450,19 @@ def start_drive_fetch(body):
     file_id, err = parse_drive_file_id(body.get("url"))
     if err:
         return {"ok": False, "error": err}, 400
-    pre = _drive_preflight()
+    pre = _drive_preflight(body.get("quality"))
     if pre:
         return pre
+    eff_q, q_note = resolve_voice_quality(body.get("quality"))  # v6.45
     key = "link:" + file_id
     jid = _inflight_job_for(key)
     if jid:
         return {"ok": True, "jobId": jid, "alreadyRunning": True, "fileId": file_id}, 200
     jid = _new_drive_job(key, f"Drive file {file_id[:10]}…", "link", fileId=file_id,
                          keepSource=bool(body.get("keepSource")), redo=bool(body.get("redo")),
-                         outMode="recordings")
-    log(f"drive-fetch queued job={jid} id={file_id}")
-    return {"ok": True, "jobId": jid, "fileId": file_id}, 200
+                         outMode="recordings", quality=eff_q, qualityNote=q_note)
+    log(f"drive-fetch queued job={jid} id={file_id} quality={eff_q}")
+    return {"ok": True, "jobId": jid, "fileId": file_id, "quality": eff_q, "qualityNote": q_note}, 200
 
 
 def cancel_drive_job(job_id):
@@ -5448,6 +5631,8 @@ def _pipeline_load():
         PIPELINE["statusToDrive"] = data.get("statusToDrive") is not False
         # v6.43: install helper updates automatically when idle (default on)
         PIPELINE["autoUpdate"] = data.get("autoUpdate") is not False
+        # v6.45: voice-removal quality (auto = Better when demucs installed, else Fast)
+        PIPELINE["voiceQuality"] = _norm_voice_quality(data.get("voiceQuality")) or "auto"
         # v6.44: after-stream jobs that were queued/running when the helper last stopped
         pj = data.get("pendingJobs") if isinstance(data.get("pendingJobs"), dict) else {}
         PIPELINE["pendingJobs"] = {str(k): v for k, v in pj.items()
@@ -6201,7 +6386,8 @@ def pipeline_status_payload():
                  "origEnabled": bool(PIPELINE.get("origEnabled", True)),
                  "origUsers": dict(PIPELINE.get("origUsers") or {}),
                  "statusToDrive": PIPELINE.get("statusToDrive", True) is not False,
-                 "autoUpdate": PIPELINE.get("autoUpdate", True) is not False}  # v6.43
+                 "autoUpdate": PIPELINE.get("autoUpdate", True) is not False,  # v6.43
+                 "voiceQuality": _norm_voice_quality(PIPELINE.get("voiceQuality")) or "auto"}  # v6.45
     return {
         "ok": True, "driveFound": bool(roots), "prefs": prefs,
         "resolvedTarget": target, "targetKind": kind, "targetError": err,
@@ -6212,6 +6398,7 @@ def pipeline_status_payload():
         "originalsFolder": (os.path.join(target, ORIGINALS_SUBDIR) if target else None),
         "computer": computer_name(),
         "statusFile": status_file_snapshot(),  # v6.41
+        "voiceQuality": voice_quality_snapshot(),  # v6.45
     }
 
 
@@ -6244,6 +6431,13 @@ def api_pipeline_prefs(body):
             PIPELINE["statusToDrive"] = bool(body.get("statusToDrive"))
             changed = True
             STATUS_FILE_WAKE.set()
+        if "voiceQuality" in body:  # v6.45
+            vq = _norm_voice_quality(body.get("voiceQuality"))
+            if vq and PIPELINE.get("voiceQuality") != vq:
+                log(f"voice quality pref: {vq}")
+            if vq:
+                PIPELINE["voiceQuality"] = vq
+                changed = True
         if "autoUpdate" in body:  # v6.43
             on = bool(body.get("autoUpdate"))
             if PIPELINE.get("autoUpdate", True) is not on:
@@ -6348,17 +6542,18 @@ def pipeline_worker(job_id):
                 _set_music_job(job_id, status="queued", progress="Paused — disk low (<2 GB free); waiting for space…")
                 _check_cancel(job_id)
                 time.sleep(5)
-            _set_music_job(job_id, status="queued", phase="wait", progress="Waiting for demucs (1 at a time)…")
+            quality = _job_get(job_id, "quality") or resolve_voice_quality(None)[0] or "better"  # v6.45
+            _set_music_job(job_id, status="queued", phase="wait", progress=voice_wait_msg(quality))
             while True:
                 _check_cancel(job_id)
                 if DEMUCS_SLOTS.acquire(timeout=0.5):
                     slot_held = True
                     break
             _check_cancel(job_id)
-            _set_music_job(job_id, status="running", phase="demucs")
+            _set_music_job(job_id, status="running", phase="demucs" if quality != "fast" else "fast")
             work = Path(tempfile.mkdtemp(prefix="music-only-", dir=str(REC_DIR)))
             _register_work_path(work)
-            parts = chunked_demucs_no_vocals(job_id, paths, work, total, progress, pct_lo=5.0, pct_hi=85.0)
+            parts = voice_removed_parts(job_id, paths, work, total, progress, quality, pct_lo=5.0, pct_hi=85.0)
             _set_music_job(job_id, phase="encode")
             tmp_out = encode_joined_ogg(job_id, parts, work / "out.ogg", total, progress,
                                         pct_lo=85.0, pct_hi=94.0, codec_args=MUSIC_OGG_ARGS)
@@ -6509,17 +6704,20 @@ def start_stream_pipeline(username, segments, redo=False, reason="stream-end"):
                 job.get("name") == first or first in (job.get("segments") or [])
             ):
                 return jid, "already running"
-    if not demucs_available() or not which_ffmpeg():
-        return None, "demucs/ffmpeg not installed"
+    if not which_ffmpeg():
+        return None, "ffmpeg not installed"
+    eff_q, q_note = resolve_voice_quality(None)  # v6.45: Fast needs no demucs
+    if not eff_q:
+        return None, q_note or "voice removal unavailable"
     PIPELINE_SEEN.add(first)
     # name = first segment so History / Auto Music see it as that recording's Music-only job
     jid = _new_job(first, first, "pipeline", pipeline_worker, segments=segs, username=username,
-                   redo=bool(redo), reason=reason)
+                   redo=bool(redo), reason=reason, quality=eff_q, qualityNote=q_note)
     try:
         _pending_job_put(first, username, segs, redo, reason)
     except Exception as e:
         log(f"pipeline pending-save failed: {e}")
-    log(f"pipeline queued job={jid} user={username} segments={segs} ({reason})")
+    log(f"pipeline queued job={jid} user={username} segments={segs} quality={eff_q} ({reason})")
     return jid, None
 
 
@@ -7563,7 +7761,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.read_json()
             name = (body or {}).get("name") if isinstance(body, dict) else None
             redo = bool((body or {}).get("redo")) if isinstance(body, dict) else False
-            payload, status = start_music_only(name, redo=redo)
+            quality = (body or {}).get("quality") if isinstance(body, dict) else None  # v6.45
+            payload, status = start_music_only(name, redo=redo, quality=quality)
             self.send_json(payload, status=status)
             return
         if path == "/api/seamless":
@@ -7572,6 +7771,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(payload, status=status)
             return
         if path == "/api/music-only-upload":
+            up_quality = (urllib.parse.parse_qs(parsed.query or "").get("quality") or [None])[0]  # v6.45
             with AUTO_UPDATE_LOCK:
                 UPLOADS_INFLIGHT[0] += 1  # v6.43: don't auto-restart mid-upload
             try:
@@ -7590,12 +7790,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError as e:
                 self.send_json({"ok": False, "error": f"save failed: {e}"}, status=500)
                 return
-            if not demucs_available():
+            if not resolve_voice_quality(up_quality)[0]:
                 self.send_json(
                     {
                         "ok": False,
-                        "error": "demucs not installed — pip install demucs (first run downloads models)",
-                        "demucs": False,
+                        "error": resolve_voice_quality(up_quality)[1],
+                        "demucs": demucs_available(),
                         "savedName": dest.name,
                         "savedAs": dest.name,
                         "path": str(dest),
@@ -7623,7 +7823,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     status=507,
                 )
                 return
-            payload, status = start_music_only(dest.name, redo=False)
+            payload, status = start_music_only(dest.name, redo=False, quality=up_quality)
             if payload.get("ok"):
                 payload = dict(payload)
                 payload["savedName"] = dest.name

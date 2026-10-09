@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.44</span>
+    <span class="badge">v6.45</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -423,6 +423,20 @@
       </div>
       <button class="btn btn-gray btn-sm" onclick="switchTab(document.querySelectorAll('.tab')[3],'hist')">📜 History →</button>
     </div>
+    <!-- v6.45: voice-removal quality (merged from Twitchy Too) — applies to every remove-voice path -->
+    <div class="upload-music-box" id="voiceQualityCard">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap;">
+        <strong style="font-size:.88rem">🎚️ Voice removal quality</strong>
+        <label style="font-size:.75rem;color:#9ca3af;display:flex;align-items:center;gap:.3rem;margin:0">Quality
+          <select id="voiceQualitySel" onchange="saveVoiceQuality()" style="font-size:.75rem;padding:.2rem .4rem;width:auto;margin:0">
+            <option value="auto">Auto (Better if demucs is installed, else Fast)</option>
+            <option value="better">Better — Demucs (slow, best)</option>
+            <option value="fast">Fast — ffmpeg center-cancel (quick, no demucs)</option>
+          </select></label>
+      </div>
+      <div id="voiceQualityStatus" class="hint" style="margin-top:.35rem"></div>
+      <div class="hint">Used by History <strong>Music only</strong>, Auto Music only, the upload below, <strong>Google Drive → remove voice</strong>, Drive links, and the after-stream remove voice → Drive step. <strong>Better</strong> runs Demucs (also writes <code>-vocals</code> from History/upload). <strong>Fast</strong> cancels centered voice with ffmpeg in seconds-to-minutes — good on stereo VODs, lower quality, needs no Demucs (mono files fall back to Demucs when installed). Either way: one job at a time, output <code>&lt;stem&gt;-music.ogg</code> (unique <code>-2</code>, <code>-3</code>… on collision), originals untouched, and <code>-music</code> / <code>-vocals</code> / <code>-novoice</code> files are skipped as sources.</div>
+    </div>
     <div class="upload-music-box">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap;">
         <strong style="font-size:.88rem">🎵 Upload for Music only</strong>
@@ -431,7 +445,7 @@
           <button class="btn btn-purple btn-sm" id="musicUploadBtn" onclick="uploadMusicOnly()">Upload &amp; Music only</button>
         </div>
       </div>
-      <div class="hint">Saves under <code>~/TwitchRecordings</code> as <code>&lt;name&gt;</code>, then <code>&lt;stem&gt;-music</code> / <code>-vocals</code>. Unique name on collision. Native file is never deleted. Requires helper + demucs.</div>
+      <div class="hint">Saves under <code>~/TwitchRecordings</code> as <code>&lt;name&gt;</code>, then <code>&lt;stem&gt;-music</code> / <code>-vocals</code>. Unique name on collision. Native file is never deleted. Requires helper + demucs (Better) or ffmpeg (Fast).</div>
       <div id="demucsConvertHint" class="hint" style="display:none;color:#fca5a5;margin-top:.35rem">demucs not installed — <code>pip install demucs</code> (first run downloads models), then restart the helper.</div>
       <div id="musicUploadMeter" class="hidden" style="margin-top:.55rem"></div>
     </div>
@@ -452,7 +466,7 @@
       </div>
       <div id="driveNotFound" class="hint hidden" style="color:#fbbf24">Google Drive for Desktop isn&#39;t installed (or signed in) on the helper&#39;s Mac, so there&#39;s no Drive folder to browse. <a href="https://www.google.com/drive/download/" target="_blank" rel="noopener" style="color:#bf94ff">Install Drive for Desktop</a>, sign in, then press ↻. Meanwhile you can paste a share link below.</div>
       <div id="driveDesktopBody"></div>
-      <div class="hint">Pick files and press <strong>Remove voice</strong>: the helper copies each one locally, runs Demucs in 10-minute chunks (1 job at a time), and writes <code>&lt;name&gt;-music.ogg</code> back into Drive, where Drive for Desktop syncs it. Files that already have a <code>-music</code> file are skipped unless you tick Redo. The originals are never changed.</div>
+      <div class="hint">Pick files and press <strong>Remove voice</strong>: the helper copies each one locally, runs Demucs in 10-minute chunks — or ffmpeg when Quality is Fast — (1 job at a time), and writes <code>&lt;name&gt;-music.ogg</code> back into Drive, where Drive for Desktop syncs it. Files that already have a <code>-music</code> file are skipped unless you tick Redo. The originals are never changed.</div>
       <div style="border-top:1px solid #31313a;margin-top:.7rem;padding-top:.6rem">
         <strong style="font-size:.8rem">🔗 Or paste a Drive link</strong>
         <div class="drive-link-row">
@@ -529,9 +543,10 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.44'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.45'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
-let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, statusToDrive:true, autoUpdate:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false };
+let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, statusToDrive:true, autoUpdate:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
+let voiceQualityFromStorage=false; // v6.45
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
 let musicJobsNotified = new Set(); // jobIds already fireNotify'd for done/error (health spam safe)
@@ -668,7 +683,8 @@ function persist(){
       // v6.35: Google Drive card (same persist key)
       driveLastPath: String(cfg.driveLastPath||''),
       driveOutMode: cfg.driveOutMode||'subfolder',
-      driveKeepSource: !!cfg.driveKeepSource
+      driveKeepSource: !!cfg.driveKeepSource,
+      voiceQuality: normVoiceQuality(cfg.voiceQuality) // v6.45
     }));
   }catch(e){ console.warn('persist failed', e); }
 }
@@ -717,6 +733,8 @@ function restoreSettings(){
     cfg.driveLastPath=typeof data.driveLastPath==='string'?data.driveLastPath:'';
     cfg.driveOutMode=['subfolder','sibling','recordings'].indexOf(data.driveOutMode)>=0?data.driveOutMode:'subfolder';
     cfg.driveKeepSource=data.driveKeepSource===true;
+    cfg.voiceQuality=normVoiceQuality(data.voiceQuality); // v6.45 Fast / Better / Auto
+    voiceQualityFromStorage=(typeof data.voiceQuality==='string');
     if(Array.isArray(data.streamers)){
       restoredStreamerList=true; // even an empty list is user data — don't overwrite
       streamers=data.streamers.filter(s=>s&&s.username).map((s,i)=>{
@@ -814,7 +832,7 @@ function markHelperDown(wasOk){
     helperActiveOnDrop=(helper.active||[]).map(function(a){ return a && a.username; }).filter(Boolean);
   }
   if(helper.version) helperPriorVersion=helper.version;
-  helper.ok=false; helper.streamlink=false; helper.ffmpeg=false; helper.seamless=false; helper.demucs=false; helper.version=''; helper.diskVersion=''; helper.pendingRestart=false; helper.demucsHint=''; helper.installHint=''; helper.updateRepo=''; helper.active=[]; helper.lastErrors={}; helper.musicDemucsQueue=null; helper.orphanTempsCleared=0; helper.orphanTempsBytes=0;
+  helper.ok=false; helper.streamlink=false; helper.ffmpeg=false; helper.seamless=false; helper.demucs=false; helper.voiceQuality=null; helper.version=''; helper.diskVersion=''; helper.pendingRestart=false; helper.demucsHint=''; helper.installHint=''; helper.updateRepo=''; helper.active=[]; helper.lastErrors={}; helper.musicDemucsQueue=null; helper.orphanTempsCleared=0; helper.orphanTempsBytes=0;
   helper.diskFree=null; helper.diskTotal=null; helper.diskWarn=false; helper.diskBlock=false;
   helper.keepAwake=null; // v6.40
   helper.statusFile=null; // v6.41
@@ -1337,7 +1355,8 @@ async function queueAutoMusicOnly(name, opts){
     if(r && r.name===name && (r.recording || r.dur==='recording…')) return null;
   }
   // v6.24: soft-skip when demucs missing — noticeHelperDemucs owns the one-shot UX
-  if(!helper.demucs){
+  // v6.45: Fast (ffmpeg) quality runs without demucs
+  if(!voiceReady()){
     return null;
   }
   // v6.30: soft-skip when disk low — do NOT add to autoMusicQueued (retry when space recovers)
@@ -1346,7 +1365,7 @@ async function queueAutoMusicOnly(name, opts){
   }
   autoMusicQueued.add(name);
   try{
-    const d=await helperFetch('/api/music-only', {name:name, redo:false}, 8000);
+    const d=await helperFetch('/api/music-only', {name:name, redo:false, quality:normVoiceQuality(cfg.voiceQuality)}, 8000);
     if(!d || !d.ok){
       autoMusicQueued.delete(name);
       // 409 still-recording is expected if we raced the active file — stay quiet unless unexpected
@@ -1402,6 +1421,9 @@ function pingHelperAndStatus(){
       helper.ffmpeg=!!d.ffmpeg;
       helper.seamless=!!(d.seamless!=null?d.seamless:d.ffmpeg);
       helper.demucs=!!d.demucs;
+      helper.voiceQuality=(d.voiceQuality && typeof d.voiceQuality==='object')?d.voiceQuality:null; // v6.45
+      // v6.45: a browser that never chose a quality adopts the helper's saved setting
+      if(!voiceQualityFromStorage && helper.voiceQuality && helper.voiceQuality.pref){ cfg.voiceQuality=normVoiceQuality(helper.voiceQuality.pref); voiceQualityFromStorage=true; persist(); }
       helper.version=d.version?String(d.version):'';
       helper.diskVersion=(d.diskVersion!=null)?String(d.diskVersion):'';
       helper.pendingRestart=!!d.pendingRestart;
@@ -1836,6 +1858,62 @@ function noticeHelperDisk(){
   }
 }
 // v6.24: one-shot demucs-missing status when Auto Music only is on (soft-skip auto-queue until demucs true).
+// ─── v6.45: VOICE-REMOVAL QUALITY (Fast = ffmpeg, Better = demucs) ─────
+function normVoiceQuality(q){ q=String(q||'').toLowerCase(); return (q==='fast'||q==='better')?q:'auto'; }
+function helperVoiceQualityAware(){ return !!(helper.voiceQuality && typeof helper.voiceQuality==='object'); }
+// Effective quality a new job would use on this helper (null = cannot remove voice).
+function effectiveVoiceQuality(){
+  if(!helper.ok) return null;
+  if(!helperVoiceQualityAware()) return helper.demucs?'better':null; // helper older than v6.45: demucs only
+  const want=normVoiceQuality(cfg.voiceQuality);
+  const vq=helper.voiceQuality;
+  if(want==='auto') return vq.demucs?'better':(vq.ffmpeg?'fast':null);
+  if(want==='better') return vq.demucs?'better':(vq.ffmpeg?'fast':null);
+  return vq.ffmpeg?'fast':null;
+}
+function voiceReady(){ return !!effectiveVoiceQuality(); }
+function voiceQualityLabel(q){ return q==='fast'?'Fast (ffmpeg)':(q==='better'?'Better (demucs)':'—'); }
+function voiceNotReadyMsg(){
+  if(helper.ok && !helperVoiceQualityAware()) return 'demucs not installed — '+demucsInstallMsg()+' (or update the helper to v6.45+ for Fast mode)';
+  return 'voice removal unavailable — install ffmpeg (Fast) or '+demucsInstallMsg()+' (Better)';
+}
+function renderVoiceQualityUi(){
+  const sel=document.getElementById('voiceQualitySel');
+  if(sel && sel.value!==normVoiceQuality(cfg.voiceQuality)) sel.value=normVoiceQuality(cfg.voiceQuality);
+  const st=document.getElementById('voiceQualityStatus');
+  if(!st) return;
+  let txt, color='#9ca3af';
+  if(!helper.ok) txt='Helper not connected.';
+  else if(!helperVoiceQualityAware()){ txt='This helper (v'+(helper.version||'?')+') only knows Demucs — update it to v6.45+ for Fast mode.'; color='#fbbf24'; }
+  else{
+    const eff=effectiveVoiceQuality();
+    const want=normVoiceQuality(cfg.voiceQuality);
+    if(!eff){ txt='Unavailable — '+voiceNotReadyMsg(); color='#fca5a5'; }
+    else{
+      txt='Using '+voiceQualityLabel(eff)+'.';
+      if(want==='better' && eff==='fast'){ txt+=' Demucs isn\u2019t installed on this helper, so Better falls back to Fast — '+demucsInstallMsg()+', then restart the helper.'; color='#fbbf24'; }
+      else if(want==='auto' && eff==='fast'){ txt+=' Install Demucs for Better: '+demucsInstallMsg()+'.'; }
+      txt+=' Demucs: '+(helper.voiceQuality.demucs?'installed':'not installed')+' · ffmpeg: '+(helper.voiceQuality.ffmpeg?'ok':'missing')+'.';
+    }
+  }
+  st.textContent=txt; st.style.color=color;
+}
+async function saveVoiceQuality(){
+  const sel=document.getElementById('voiceQualitySel');
+  cfg.voiceQuality=normVoiceQuality(sel?sel.value:cfg.voiceQuality);
+  persist();
+  renderVoiceQualityUi();
+  try{ updateDemucsUi(); }catch(e){}
+  if(helper.ok && helperVoiceQualityAware()){
+    try{
+      const d=await helperFetch('/api/pipeline/prefs', {voiceQuality:cfg.voiceQuality}, 6000);
+      if(d && d.voiceQuality) helper.voiceQuality=d.voiceQuality;
+      renderVoiceQualityUi();
+    }catch(e){}
+  }
+  const eff=effectiveVoiceQuality();
+  flashOk('Voice removal quality: '+(cfg.voiceQuality==='auto'?'Auto → ':'')+voiceQualityLabel(eff||cfg.voiceQuality)+' (History, Convert, Drive and after-stream)');
+}
 function demucsInstallMsg(){
   return helper.demucsHint || 'pip install demucs (first run downloads models)';
 }
@@ -1849,6 +1927,12 @@ function noticeHelperDemucs(){
     }
     helperDemucsMissingNotified=false;
     if(ban){ ban.classList.add('hidden'); ban.innerHTML=''; }
+    return;
+  }
+  // v6.45: demucs missing but Fast (ffmpeg) works — no scary banner; Convert card explains.
+  if(voiceReady()){
+    if(ban){ ban.classList.add('hidden'); ban.innerHTML=''; }
+    helperDemucsMissingNotified=false;
     return;
   }
   // Sticky banner while demucs missing (even if Auto Music only is off — History/Convert need it too)
@@ -1867,15 +1951,16 @@ let _demucsUiPrev = null; // v6.24: only re-render History when demucs availabil
 function updateDemucsUi(){
   const btn=document.getElementById('musicUploadBtn');
   const hint=document.getElementById('demucsConvertHint');
-  const need=helper.ok && !helper.demucs;
+  const need=helper.ok && !voiceReady(); // v6.45: Fast (ffmpeg) also counts
   if(btn){
     btn.disabled=!!need;
-    btn.title=need?('demucs not installed — '+demucsInstallMsg()):'Upload a finished recording and run Demucs Music only';
+    btn.title=need?voiceNotReadyMsg():('Upload a finished recording and remove voice — '+voiceQualityLabel(effectiveVoiceQuality()));
   }
   if(hint){
     hint.style.display=need?'block':'none';
   }
-  const sig=helper.ok?(helper.demucs?'1':'0'):'x';
+  try{ renderVoiceQualityUi(); }catch(e){}
+  const sig=helper.ok?((helper.demucs?'1':'0')+(voiceReady()?'v':'-')+(effectiveVoiceQuality()||'')):'x';
   if(_demucsUiPrev!==sig){
     _demucsUiPrev=sig;
     try{ renderHist(); }catch(e){}
@@ -1954,7 +2039,7 @@ async function clearWaitingMusic(){
 function musicQueueBit(){
   // v6.28: demucs runs 1 at a time — surface waiting/running on helper bar
   const q=helper.musicDemucsQueue;
-  if(!q || !helper.demucs) return '';
+  if(!q || !voiceReady()) return '';
   const run=Number(q.running)||0;
   const wait=Number(q.waiting)||0;
   if(run<=0 && wait<=0) return '';
@@ -2043,7 +2128,7 @@ function updateHelperBar(){
   const pendingBit=(helper.pendingRestart?(' · restart pending (disk v'+(helper.diskVersion||'?')+')'):'')+keepAwakeBit()+autoUpdateBit(); // v6.40 keep-awake bit · v6.43 auto-update bit
   if(helper.ok && helper.streamlink){
     const diskBit=(helper.diskFree!=null)?(' · '+fmtDiskBytes(helper.diskFree)+' free'):'';
-    const demucsBit=helper.demucs?'':' · demucs missing';
+    const demucsBit=helper.demucs?'':(voiceReady()?' · voice removal: Fast (no demucs)':' · demucs missing');
     const mqBit=musicQueueBit();
     const musicPausedBit=(cfg.autoMusicOnly!==false && (helper.diskWarn||helper.diskBlock))?' · Auto Music paused':'';
     if(helper.diskBlock){
@@ -2052,8 +2137,8 @@ function updateHelperBar(){
     }else if(helper.diskWarn){
       dot.className='dot spin';
       txt.textContent='Connected (low disk'+diskBit+demucsBit+mqBit+musicPausedBit+pendingBit+')'+(helper.recordingsDir?' — '+helper.recordingsDir:'');
-    }else if(!helper.demucs){
-      // v6.24: surface demucs gap without looking fully "ok"
+    }else if(!voiceReady()){
+      // v6.24: surface demucs gap without looking fully "ok" (v6.45: only when Fast can't run either)
       dot.className='dot spin';
       txt.textContent='Connected (streamlink ready · demucs missing — Music only unavailable)'+diskBit+pendingBit+(helper.recordingsDir?' — '+helper.recordingsDir:'');
     }else{
@@ -2072,7 +2157,7 @@ function updateHelperBar(){
   }
   const clearBtn=document.getElementById('clearWaitingMusicBtn');
   if(clearBtn){
-    const wait=(helper.ok && helper.demucs && helper.musicDemucsQueue)?(Number(helper.musicDemucsQueue.waiting)||0):0;
+    const wait=(helper.ok && voiceReady() && helper.musicDemucsQueue)?(Number(helper.musicDemucsQueue.waiting)||0):0;
     if(wait>0){
       clearBtn.classList.remove('hidden');
       clearBtn.textContent=wait===1?'Clear waiting Music':'Clear waiting Music ('+wait+')';
@@ -4006,14 +4091,14 @@ function renderHist(){
         if(waiting && mj.jobId){
           musicCtrl+='<button class="btn btn-gray btn-sm" onclick="cancelMusicOnly(\''+String(mj.jobId).replace(/[^a-zA-Z0-9_-]/g,'')+'\')" title="Cancel this waiting Music only job">Cancel</button>';
         }
-      }else if(helper.ok && !helper.demucs){
+      }else if(helper.ok && !voiceReady()){
         // v6.24: explain unavailable instead of opaque click → flashErr
-        const tip=('demucs not installed — '+demucsInstallMsg()).replace(/"/g,'&quot;');
+        const tip=voiceNotReadyMsg().replace(/"/g,'&quot;');
         musicCtrl=`<span class="btn btn-gray btn-sm" title="${tip}" style="opacity:.7;cursor:not-allowed">Need demucs</span>`;
       }else{
         const hasMusic=!!musicName;
         const label=hasMusic?'Music ready':'Music only';
-        const errTitle=(mj && mj.status==='error')?String(mj.error||'error').replace(/"/g,'&quot;'):'Export instrumental (demucs); native file stays untouched';
+        const errTitle=(mj && mj.status==='error')?String(mj.error||'error').replace(/"/g,'&quot;'):('Export instrumental — '+voiceQualityLabel(effectiveVoiceQuality())+'; native file stays untouched');
         musicCtrl=`<label class="music-redo" title="When checked, replace existing -music / -vocals export"><input type="checkbox" data-music-redo="${i}" onchange="syncMusicBtnLabel(${i})"> Redo</label>`
           +`<button class="btn ${hasMusic?'btn-gray':'btn-purple'} btn-sm" data-music-btn="${i}" data-has-music="${hasMusic?'1':'0'}" onclick="startMusicOnly(${i})" title="${errTitle}">${label}</button>`;
       }
@@ -4156,8 +4241,8 @@ async function startMusicOnly(i){
     triggerNamedDownload(musicName);
     return;
   }
-  if(!helper.demucs){
-    flashErr('demucs not installed — pip install demucs (first run downloads models)');
+  if(!voiceReady()){
+    flashErr(voiceNotReadyMsg());
     return;
   }
   const existing=musicJobs[r.name];
@@ -4166,7 +4251,7 @@ async function startMusicOnly(i){
     return;
   }
   try{
-    const d=await helperFetch('/api/music-only', {name:r.name, redo:!!redo}, 8000);
+    const d=await helperFetch('/api/music-only', {name:r.name, redo:!!redo, quality:normVoiceQuality(cfg.voiceQuality)}, 8000);
     if(!d || !d.ok){
       flashErr((d && d.error) || 'Music only failed to start');
       return;
@@ -4192,7 +4277,7 @@ async function startMusicOnly(i){
     musicJobs[r.name]={jobId:d.jobId, status:'queued', progress:d.waitingBehind?'Waiting for demucs (1 at a time)…':(redo?'Redo queued…':'Queued…'), progressPct:0};
     renderHist();
     flashOk((redo?'Redo music':'Music only')+' '+(d.waitingBehind?'queued':'started')+' for '+r.name
-      +(d.waitingBehind?' — demucs runs 1 at a time':' — demucs can take a while')+' (native kept)');
+      +(d.waitingBehind?' — 1 job at a time':(d.quality==='fast'?' — Fast (ffmpeg)':' — demucs can take a while'))+' (native kept)');
     pollMusicOnlyJob(r.name, d.jobId);
   }catch(e){
     flashErr('Music only failed: '+(e.message||e));
@@ -4293,8 +4378,8 @@ async function uploadMusicOnly(){
     flashErr('Local helper not running — start twitch-recorder-server.py for Music only upload.');
     return;
   }
-  if(!helper.demucs){
-    flashErr('demucs not installed — pip install demucs (first run downloads models)');
+  if(!voiceReady()){
+    flashErr(voiceNotReadyMsg());
     return;
   }
   const file=input.files[0];
@@ -4316,7 +4401,7 @@ async function uploadMusicOnly(){
   try{
     d=await new Promise(function(resolve, reject){
       const xhr=new XMLHttpRequest();
-      xhr.open('POST', HELPER_URL+'/api/music-only-upload');
+      xhr.open('POST', HELPER_URL+'/api/music-only-upload?quality='+encodeURIComponent(normVoiceQuality(cfg.voiceQuality))); // v6.45
       xhr.timeout=120000;
       xhr.upload.onprogress=function(ev){
         if(!ev.lengthComputable) return;
@@ -4623,9 +4708,9 @@ function renderDriveActions(){
   const btn=document.getElementById('driveRemoveBtn');
   if(!btn) return;
   const n=driveState.selected.size;
-  btn.disabled=!n || !helper.ok || !helper.demucs;
+  btn.disabled=!n || !helper.ok || !voiceReady();
   btn.textContent=n?('Remove voice ('+n+')'):'Remove voice';
-  btn.title=!helper.demucs?'demucs not installed on the helper':('Queue Music only for the selected files → '+driveOutLabel());
+  btn.title=!voiceReady()?voiceNotReadyMsg():('Queue remove voice ('+voiceQualityLabel(effectiveVoiceQuality())+') for the selected files → '+driveOutLabel());
 }
 function renderDriveCard(){
   const body=document.getElementById('driveDesktopBody');
@@ -4698,16 +4783,16 @@ async function driveRemoveVoice(){
   const paths=Array.from(driveState.selected);
   if(!paths.length){ flashErr('Select one or more Drive files first.'); return; }
   if(!helper.ok){ flashErr('Local helper not running.'); return; }
-  if(!helper.demucs){ flashErr('demucs not installed — '+demucsInstallMsg()); return; }
+  if(!voiceReady()){ flashErr(voiceNotReadyMsg()); return; }
   const redo=driveRedoChecked();
   try{
-    const d=await helperFetch('/api/drive/music', {paths:paths, redo:redo, outMode:cfg.driveOutMode||'subfolder'}, 15000);
+    const d=await helperFetch('/api/drive/music', {paths:paths, redo:redo, outMode:cfg.driveOutMode||'subfolder', quality:normVoiceQuality(cfg.voiceQuality)}, 15000);
     if(!d || !d.ok){ flashErr('Remove voice: '+((d&&d.error)||'failed to start')); return; }
     const started=(d.started||[]).length;
     const skipped=d.skipped||[];
     const already=skipped.filter(function(s){return s.reason==='already';}).length;
     const other=skipped.filter(function(s){return s.reason!=='already';});
-    let msg=started?('Remove voice queued for '+started+' file'+(started===1?'':'s')+' → '+driveOutLabel()+' (1 demucs at a time)'):'Nothing new queued';
+    let msg=started?('Remove voice queued for '+started+' file'+(started===1?'':'s')+' → '+driveOutLabel()+' ('+voiceQualityLabel(d.quality||effectiveVoiceQuality())+', 1 at a time)'):'Nothing new queued';
     if(already) msg+=' · '+already+' already have -music (check Redo to re-run)';
     if(other.length) msg+=' · skipped '+other.length+': '+other.map(function(s){ return (String(s.path||'').split('/').pop())+' ('+s.reason+')'; }).join(', ');
     (started?flashOk:flashErr)(driveEsc(msg));
@@ -4721,11 +4806,11 @@ async function driveFetchLink(){
   const url=(inp&&inp.value||'').trim();
   if(!url){ flashErr('Paste a Google Drive file link first.'); return; }
   if(!helper.ok){ flashErr('Local helper not running.'); return; }
-  if(!helper.demucs){ flashErr('demucs not installed — '+demucsInstallMsg()); return; }
+  if(!voiceReady()){ flashErr(voiceNotReadyMsg()); return; }
   const keep=!!(document.getElementById('driveKeepSource')||{}).checked;
   const redo=!!(document.getElementById('driveLinkRedo')||{}).checked;
   try{
-    const d=await helperFetch('/api/drive/fetch', {url:url, keepSource:keep, redo:redo}, 15000);
+    const d=await helperFetch('/api/drive/fetch', {url:url, keepSource:keep, redo:redo, quality:normVoiceQuality(cfg.voiceQuality)}, 15000);
     if(!d || !d.ok){ flashErr('Drive link: '+driveEsc((d&&d.error)||'failed')); return; }
     driveJobs[d.jobId]=Object.assign(driveJobs[d.jobId]||{}, {jobId:d.jobId, source:'link', fileId:d.fileId, displayName:'Drive file '+String(d.fileId||'').slice(0,10)+'…', status:'running', progress:d.alreadyRunning?'Already running…':'Contacting Google Drive…', progressPct:0});
     flashOk(d.alreadyRunning?'That Drive file is already in the queue.':'Downloading from Drive, then removing voice → ~/TwitchRecordings');
@@ -4786,7 +4871,7 @@ function renderDriveJobs(){
     else if(st==='done') line+='<div class="drive-job-sub ok">✓ '+driveEsc(j.already?'Already had music: ':'Saved: ')+driveEsc(j.outputPath||j.outputName||'')+(j.keptSourceName?' · source kept as '+driveEsc(j.keptSourceName):'')+'</div>';
     else if(st==='error') line+='<div class="drive-job-sub err">✗ '+driveEsc(j.error||'error')+'</div>';
     else if(st==='cancelled') line+='<div class="drive-job-sub">Cancelled</div>';
-    if(j.info) line+='<div class="drive-job-sub">'+driveEsc(j.info)+'</div>';
+    if(j.info || j.quality) line+='<div class="drive-job-sub">'+driveEsc([j.info, j.quality?('Quality: '+voiceQualityLabel(j.quality)+(j.qualityNote?' — '+j.qualityNote:'')):''].filter(Boolean).join(' · '))+'</div>';
     return line+'</div>';
   }).join('');
   el.innerHTML=html;
@@ -4867,7 +4952,8 @@ function pipelinePrefsBody(){
   return {enabled:cfg.drivePipeline!==false, users:users, origEnabled:cfg.driveOriginals!==false, origUsers:origUsers,
     keepAwake:cfg.keepAwake!==false, keepAwakeArmed:cfg.keepAwakeArmed===true, // v6.40
     statusToDrive:cfg.statusToDrive!==false, // v6.41
-    autoUpdate:cfg.autoUpdate!==false}; // v6.43
+    autoUpdate:cfg.autoUpdate!==false, // v6.43
+    voiceQuality:normVoiceQuality(cfg.voiceQuality)}; // v6.45
 }
 async function syncPipelinePrefs(force){
   if(!helper.ok || !helperHasPipeline()) return;
