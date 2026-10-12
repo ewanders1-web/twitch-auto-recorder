@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.45"
+HELPER_VERSION = "6.46"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -62,6 +62,9 @@ try:
 except ValueError:
     RESTART_GRACE_SECS = 480.0
 RESTART_GRACE_BACKOFFS = (15, 20, 30)  # once normal retries are used up; caps at 30s
+# v6.46: same window as status-file recorderPageOpen — after this, the page is gone
+# and restart_grace_applies treats the helper as running alone.
+PAGE_HEARTBEAT_STALE_SECS = float(os.environ.get("TWITCH_RECORDER_PAGE_STALE_SECS") or 120)
 # Soft give-up sooner when streamlink stderr clearly says offline / no streams.
 OFFLINE_STDERR_HINTS = (
     "no playable streams",
@@ -1301,9 +1304,17 @@ def mid_resume_backoff(resume_idx):
 
 
 def restart_grace_applies(username):
-    """v6.42: keep retrying through a stream restart? True when the recorder page's latest
-    heartbeat lists this streamer as Auto-Rec armed, or no page has reported in since the
-    helper started (helper running alone). False when the page says they are not armed.
+    """v6.42 / v6.46: keep retrying through a stream restart?
+
+    True when:
+      • no page has reported in since the helper started (helper running alone), or
+      • the latest heartbeat lists this streamer as Auto-Rec armed, or
+      • the page heartbeat is stale (v6.46: Chrome closed/crashed / tab gone — same
+        PAGE_HEARTBEAT_STALE_SECS window as status-file recorderPageOpen). The helper is
+        alone with whatever it is already recording, so keep trying instead of using a
+        stale empty armed list that would drop the restart grace.
+
+    False only while a fresh page heartbeat says this streamer is not armed.
 
     Takes STATUS_FILE_LOCK only — never call while holding LOCK.
     """
@@ -1317,6 +1328,13 @@ def restart_grace_applies(username):
     except NameError:  # defined later in the module; only during import
         return True
     if not seen_at:
+        return True
+    # v6.46: page closed/crashed — don't trust a stale armed list; keep trying
+    try:
+        stale = float(PAGE_HEARTBEAT_STALE_SECS)
+    except (TypeError, ValueError, NameError):
+        stale = 120.0
+    if stale > 0 and (time.time() - seen_at) >= stale:
         return True
     return u in armed
 
@@ -2602,6 +2620,22 @@ def self_test():
     auto_update_snapshot()
     json.dumps(h)
     assert issubclass(Handler, http.server.BaseHTTPRequestHandler)
+    # v6.46: stale page heartbeat → restart grace on; fresh empty armed → off; armed → on
+    with STATUS_FILE_LOCK:
+        prev_at, prev_armed = PAGE_SEEN.get("at"), list(PAGE_SEEN.get("armed") or [])
+        PAGE_SEEN["at"] = time.time() - max(float(PAGE_HEARTBEAT_STALE_SECS), 1) - 5
+        PAGE_SEEN["armed"] = []
+    assert restart_grace_applies("whistleface") is True
+    with STATUS_FILE_LOCK:
+        PAGE_SEEN["at"] = time.time()
+        PAGE_SEEN["armed"] = []
+    assert restart_grace_applies("whistleface") is False
+    with STATUS_FILE_LOCK:
+        PAGE_SEEN["armed"] = ["whistleface"]
+    assert restart_grace_applies("whistleface") is True
+    with STATUS_FILE_LOCK:
+        PAGE_SEEN["at"] = prev_at
+        PAGE_SEEN["armed"] = prev_armed
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -7159,7 +7193,7 @@ def build_status_doc(now=None):
     with STATUS_FILE_LOCK:
         page_at = float(PAGE_SEEN.get("at") or 0.0)
         armed = list(PAGE_SEEN.get("armed") or [])
-    page_open = bool(page_at) and now - page_at < 120
+    page_open = bool(page_at) and now - page_at < PAGE_HEARTBEAT_STALE_SECS  # v6.46
     recording = []
     for u, a in sorted(active_items):
         path = a.get("file") or ""
