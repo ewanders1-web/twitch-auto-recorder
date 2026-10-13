@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.46</span>
+    <span class="badge">v6.47</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -266,6 +266,8 @@
     <div id="diskLowMusicBanner" class="alert alert-err hidden" role="status"></div>
     <!-- v6.32: sticky when update on disk but helper process still running old version -->
     <div id="pendingRestartBanner" class="alert alert-err hidden" role="status"></div>
+    <!-- v6.47: sticky when macOS Full Disk Access / missing Drive blocks status + parts -->
+    <div id="driveAccessBanner" class="alert alert-err hidden" role="status"></div>
 
     <!-- live now banners -->
     <div id="liveNowBox"></div>
@@ -543,7 +545,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.46'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.47'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, statusToDrive:true, autoUpdate:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -553,6 +555,7 @@ let musicJobsNotified = new Set(); // jobIds already fireNotify'd for done/error
 let orphanTempsFlashedKey = ''; // v6.29: one soft flash per orphan cleanup summary
 let autoMusicQueued = new Set(); // basenames already auto-queued this session (dedupe mid-stream + stop)
 let helperDemucsMissingNotified = false; // v6.24: one-shot demucs-missing flash/notify per episode
+let helperDriveAccessBlockedNotified = false; // v6.47: one-shot Drive-access flash/notify per blocked episode
 let updateCheck = { localVersion:'', remoteVersion:'', updateAvailable:false, checking:false, installing:false }; // v6.25
 
 let seamlessJobs = {}; // key(name|joinKey) -> {jobId, status, progress, error, outputName, names}
@@ -836,11 +839,13 @@ function markHelperDown(wasOk){
   helper.diskFree=null; helper.diskTotal=null; helper.diskWarn=false; helper.diskBlock=false;
   helper.keepAwake=null; // v6.40
   helper.statusFile=null; // v6.41
+  helper.driveAccess=null; // v6.47
   helper.autoUpdate=null; // v6.43
   helperOkSince=0; // v6.43
   // v6.24: hide demucs sticky while helper is down (not the same as demucs missing)
   helperDemucsMissingNotified=false;
   helperDiskMusicPaused=false;
+  helperDriveAccessBlockedNotified=false; // v6.47
   const demucsBan=document.getElementById('demucsMissingBanner');
   if(demucsBan){ demucsBan.classList.add('hidden'); demucsBan.innerHTML=''; }
   const diskMusicBan=document.getElementById('diskLowMusicBanner');
@@ -848,6 +853,8 @@ function markHelperDown(wasOk){
   try{ updateHistDeleteDiskHint(); }catch(e){}
   const pendingBan=document.getElementById('pendingRestartBanner');
   if(pendingBan){ pendingBan.classList.add('hidden'); pendingBan.innerHTML=''; }
+  const driveAccBan=document.getElementById('driveAccessBanner');
+  if(driveAccBan){ driveAccBan.classList.add('hidden'); driveAccBan.innerHTML=''; }
   noticeHelperDropped(wasOk);
   try{ driveState.status=null; driveState.loaded=false; renderDriveCard(); }catch(e){}
   updateHelperBar();
@@ -1414,8 +1421,10 @@ function pingHelperAndStatus(){
       helper.ok=true;
       helper.keepAwake=(d.keepAwake && typeof d.keepAwake==='object')?d.keepAwake:null; // v6.40
       helper.statusFile=(d.statusFile && typeof d.statusFile==='object')?d.statusFile:null; // v6.41
+      helper.driveAccess=(d.driveAccess && typeof d.driveAccess==='object')?d.driveAccess:null; // v6.47
       helper.autoUpdate=(d.autoUpdate && typeof d.autoUpdate==='object')?d.autoUpdate:null; // v6.43
-      { const sf=helper.statusFile; const sig=sf?[sf.enabled,sf.lastWrittenAt,sf.error,Math.floor(Date.now()/60000)].join('|'):'';
+      { const sf=helper.statusFile; const da=helper.driveAccess;
+        const sig=sf?[sf.enabled,sf.lastWrittenAt,sf.error,sf.localLastWrittenAt,sf.localError,(da&&da.ok),(da&&da.kind),Math.floor(Date.now()/60000)].join('|'):'';
         if(sig!==statusFileSig){ statusFileSig=sig; try{ renderPipelineBox(); }catch(e){} } }
       helper.streamlink=!!d.streamlink;
       helper.ffmpeg=!!d.ffmpeg;
@@ -1441,6 +1450,7 @@ function pingHelperAndStatus(){
       helper.orphanTempsBytes=(typeof d.orphanTempsBytes==='number')?d.orphanTempsBytes:0;
       noticeHelperDisk();
       noticeHelperDemucs();
+      noticeHelperDriveAccess(); // v6.47
       noticeOrphanTempsCleared(wasOk);
       updatePendingRestartBanner();
       updateDemucsUi();
@@ -1946,6 +1956,45 @@ function noticeHelperDemucs(){
   helperDemucsMissingNotified=true;
   flashErr('Auto Music only paused — demucs missing. '+demucsInstallMsg()+', then restart the helper.');
   fireNotify('tar-demucs', 'demucs missing', 'Auto Music only soft-skipped until you pip install demucs and restart the helper');
+}
+function noticeHelperDriveAccess(){
+  // v6.47: sticky banner when Drive status/parts writes are blocked (FDA / missing Drive / other)
+  if(!helper.ok) return;
+  const ban=document.getElementById('driveAccessBanner');
+  const da=helper.driveAccess;
+  if(!da || da.ok!==false){
+    if(helperDriveAccessBlockedNotified){
+      flashOk('Google Drive access looks OK again — status file and parts can reach Drive.');
+      fireNotify('tar-drive-access', 'Drive access OK', 'Status file and Drive sends can resume');
+    }
+    helperDriveAccessBlockedNotified=false;
+    if(ban){ ban.classList.add('hidden'); ban.innerHTML=''; }
+    return;
+  }
+  const err=String(da.error||'Google Drive blocked');
+  const kind=da.kind||'other';
+  let body;
+  if(kind==='fda'){
+    body='❌ <strong>macOS is blocking Google Drive</strong> (Full Disk Access) — status file and part sends cannot reach Drive. '
+      +'Open <strong>System Settings → Privacy &amp; Security → Full Disk Access</strong>, add the helper&#39;s python3, turn it on. '
+      +'A local copy still updates under <code>~/TwitchRecordings/Recorder status/</code>. '
+      +'<span style="opacity:.85">'+driveEsc(err)+'</span>';
+  }else if(kind==='missing'){
+    body='❌ <strong>Google Drive for Desktop not found</strong> — status file and parts wait until Drive is installed/signed in. '
+      +'Local status still updates under <code>~/TwitchRecordings/Recorder status/</code>.';
+  }else{
+    body='❌ <strong>Google Drive write blocked</strong> — '+driveEsc(err)
+      +' Local status still updates under <code>~/TwitchRecordings/Recorder status/</code>.';
+  }
+  if(ban){ ban.innerHTML=body; ban.classList.remove('hidden'); }
+  if(helperDriveAccessBlockedNotified) return;
+  helperDriveAccessBlockedNotified=true;
+  flashErr(kind==='fda'
+    ? 'macOS Full Disk Access is blocking Google Drive — add the helper python3 in System Settings → Privacy & Security → Full Disk Access. Local status is still written under ~/TwitchRecordings/Recorder status/.'
+    : (kind==='missing'
+      ? 'Google Drive for Desktop not found — install/sign in. Local status still updates under ~/TwitchRecordings/Recorder status/.'
+      : ('Google Drive blocked: '+err)));
+  fireNotify('tar-drive-access', 'Drive access blocked', kind==='fda'?'Full Disk Access needed for Drive':(kind==='missing'?'Drive for Desktop not found':err));
 }
 let _demucsUiPrev = null; // v6.24: only re-render History when demucs availability flips
 function updateDemucsUi(){
@@ -5197,14 +5246,22 @@ function statusFileRowHtml(){
   const name=driveEsc(sf.computer||'this computer');
   if(!on || sf.enabled===false){ html+=' <span class="hint">off</span></div>'; return html; }
   if(sf.error){
-    html+=' <span style="color:#fca5a5">status file not written'+(sf.lastWrittenAt?' since '+statusFileAgo(sf.lastWrittenAt):'')+'</span></div>'
+    html+=' <span style="color:#fca5a5">Drive status write failed'+(sf.lastWrittenAt?' (last Drive ok '+statusFileAgo(sf.lastWrittenAt)+')':'')+'</span></div>'
       +'<div class="hint" style="color:#fca5a5;margin:.1rem 0 .3rem">'+driveEsc(sf.error)+'</div>';
+    if(sf.localLastWrittenAt){
+      html+='<div class="hint" style="margin:.1rem 0 .3rem">local mirror → <code>'+driveEsc(sf.localTxtPath||('~/TwitchRecordings/Recorder status/'+(sf.computer||'')+'.txt'))+'</code> updated '+statusFileAgo(sf.localLastWrittenAt)+'</div>';
+    }else if(sf.localError){
+      html+='<div class="hint" style="color:#fca5a5;margin:.1rem 0 .3rem">local mirror also failed: '+driveEsc(sf.localError)+'</div>';
+    }
     return html;
   }
   if(sf.lastWrittenAt){
     html+=' → <code>'+driveEsc(sf.txtPath||('Recorder status/'+(sf.computer||'')+'.txt'))+'</code> <span class="hint">updated '+statusFileAgo(sf.lastWrittenAt)+'</span>';
   }else{
     html+=' <span class="hint">writing Recorder status/'+name+'.txt…</span>';
+  }
+  if(sf.localLastWrittenAt && sf.localTxtPath){
+    html+='</div><div class="hint" style="margin:.1rem 0 .3rem">local mirror → <code>'+driveEsc(sf.localTxtPath)+'</code> '+statusFileAgo(sf.localLastWrittenAt);
   }
   return html+'</div>';
 }

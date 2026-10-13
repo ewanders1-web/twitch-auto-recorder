@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.46"
+HELPER_VERSION = "6.47"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -2636,6 +2636,41 @@ def self_test():
     with STATUS_FILE_LOCK:
         PAGE_SEEN["at"] = prev_at
         PAGE_SEEN["armed"] = prev_armed
+    # v6.47: status_file_snapshot exposes local mirror + driveOk keys
+    with STATUS_FILE_LOCK:
+        prev_sf = dict(STATUS_FILE)
+        STATUS_FILE.update(localLastWrittenAt=time.time(), localTxtPath="/tmp/fake-status.txt",
+                           localError=None, lastWrittenAt=0.0, error="Google Drive for Desktop not found")
+    snap = status_file_snapshot()
+    for k in ("localLastWrittenAt", "localTxtPath", "localError", "driveOk"):
+        assert k in snap, f"status_file_snapshot missing {k}"
+    assert snap["driveOk"] is False
+    assert snap["localTxtPath"] == "/tmp/fake-status.txt"
+    da = drive_access_snapshot()
+    assert da.get("ok") is False and da.get("kind") in ("missing", "fda", "other")
+    # Local mirror write into a temp REC_DIR (Drive may fail; local must succeed)
+    import tempfile
+    global REC_DIR
+    prev_rec = REC_DIR
+    try:
+        with tempfile.TemporaryDirectory(prefix="tar-status-") as td:
+            REC_DIR = Path(td)
+            with STATUS_FILE_LOCK:
+                STATUS_FILE["error"] = None
+                STATUS_FILE["localError"] = None
+                STATUS_FILE["localLastWrittenAt"] = 0.0
+                STATUS_FILE["localTxtPath"] = None
+            write_status_file("self-test")
+            folder, txt, js = status_local_paths()
+            assert txt.is_file() and js.is_file(), "local status mirror not written"
+            snap2 = status_file_snapshot()
+            assert snap2.get("localLastWrittenAt"), "localLastWrittenAt not set after write"
+            assert snap2.get("localTxtPath") == str(txt)
+    finally:
+        REC_DIR = prev_rec
+        with STATUS_FILE_LOCK:
+            STATUS_FILE.clear()
+            STATUS_FILE.update(prev_sf)
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -2705,6 +2740,7 @@ def health_payload():
         "musicDemucsQueue": music_demucs_queue_info(),
         "keepAwake": keep_awake_snapshot(),  # v6.40
         "statusFile": status_file_snapshot(),  # v6.41
+        "driveAccess": drive_access_snapshot(),  # v6.47: sticky banner when FDA/Drive blocks
         "autoUpdate": auto_update_snapshot(),  # v6.43
         "seamlessJobs": seamless_jobs_for_health(),
         "updateRepo": f"https://github.com/{UPDATE_REPO}",
@@ -7124,7 +7160,9 @@ STATUS_FILE_MIN_GAP_SECS = max(0.0, float(os.environ.get("TWITCH_RECORDER_STATUS
 STATUS_FILE_WAKE = threading.Event()
 STATUS_FILE_LOCK = threading.Lock()
 STATUS_FILE = {"lastWrittenAt": 0.0, "lastAttemptAt": 0.0, "folder": None, "txtPath": None,
-               "jsonPath": None, "error": None, "sig": None, "writes": 0}
+               "jsonPath": None, "error": None, "sig": None, "writes": 0,
+               # v6.47: local mirror under REC_DIR (no FDA) + Drive write tracked separately
+               "localLastWrittenAt": 0.0, "localTxtPath": None, "localError": None}
 PAGE_SEEN = {"at": 0.0, "armed": []}
 HELPER_STARTED_AT = time.time()
 
@@ -7181,6 +7219,51 @@ def _status_change_sig():
     return repr((active, errs, dels, origs, int(q.get("running") or 0), int(q.get("waiting") or 0),
                  armed, pending_restart_needed(), au.get("enabled"), au.get("state"), au.get("lastError"),
                  au.get("remoteVersion")))
+
+
+def _drive_access_kind(err):
+    """Classify a Drive write/resolve error for UI banners (fda / missing / other)."""
+    e = str(err or "").lower()
+    if "full disk access" in e or "operation not permitted" in e:
+        return "fda"
+    if "google drive for desktop not found" in e:
+        return "missing"
+    if "not found" in e and "drive" in e:
+        return "missing"
+    return "other"
+
+
+def drive_access_snapshot():
+    """Whether Drive status/delivery writes can succeed. Prefer STATUS_FILE.error from
+    write_status_file (the real probe); when no error yet, refresh from Drive roots + target."""
+    with STATUS_FILE_LOCK:
+        err = STATUS_FILE.get("error")
+        last = float(STATUS_FILE.get("lastWrittenAt") or 0.0)
+    if err:
+        return {"ok": False, "error": err, "kind": _drive_access_kind(err)}
+    roots = detect_drive_roots()
+    if not roots:
+        return {"ok": False, "error": "Google Drive for Desktop not found", "kind": "missing"}
+    try:
+        target, _kind, terr = resolve_delivery_target(roots, create=False)
+    except PermissionError:
+        msg = drive_permission_message()
+        return {"ok": False, "error": msg, "kind": _drive_access_kind(msg)}
+    except Exception as e:
+        msg = str(e) or type(e).__name__
+        return {"ok": False, "error": msg, "kind": _drive_access_kind(msg)}
+    if terr or not target:
+        msg = terr or "Drive target unavailable"
+        return {"ok": False, "error": msg, "kind": _drive_access_kind(msg)}
+    # Drive found + writable path resolved; lastWrittenAt may still be 0 before first write
+    return {"ok": True, "error": None, "kind": "ok"}
+
+
+def status_local_paths():
+    """Local Recorder status mirror under REC_DIR (no Full Disk Access needed)."""
+    folder = REC_DIR / STATUS_SUBDIR
+    name = computer_name()
+    return folder, folder / f"{name}.txt", folder / f"{name}.json"
 
 
 def build_status_doc(now=None):
@@ -7283,6 +7366,13 @@ def build_status_doc(now=None):
                        "lastAppliedAt": _iso_local(au.get("lastAppliedAt"))},
         "recentRecordings": recent,
     }
+    # v6.47: local mirror path + Drive write error so the local JSON is useful when Drive is blocked
+    local_folder, local_txt, _local_js = status_local_paths()
+    with STATUS_FILE_LOCK:
+        drive_err = STATUS_FILE.get("error")
+    doc["statusLocalPath"] = str(local_txt)
+    doc["driveStatusError"] = drive_err
+    doc["driveAccess"] = drive_access_snapshot()
     return doc
 
 
@@ -7342,6 +7432,18 @@ def render_status_text(doc):
         L.append("Google Drive: Drive for Desktop not found")
     else:
         L.append(f"Google Drive target: {d.get('target') or '?'}" + (f" — {d['targetError']}" if d.get("targetError") else ""))
+    # v6.47: one clear line for local mirror + Drive status-write problems (FDA / missing Drive)
+    local_p = doc.get("statusLocalPath")
+    drive_werr = doc.get("driveStatusError")
+    if local_p or drive_werr:
+        line = "Status file: "
+        if local_p:
+            line += f"local mirror {local_p}"
+        if drive_werr:
+            line += ("; " if local_p else "") + f"Drive write FAILED — {drive_werr}"
+        elif local_p:
+            line += " (also posted to Drive when reachable)"
+        L.append(line)
     L.append(f"Drive sends: {d.get('partsWaiting', 0)} part sets waiting, {d.get('partsErrors', 0)} failed;"
              f" {d.get('originalsWaiting', 0)} originals waiting, {d.get('originalsErrors', 0)} failed")
     for x in d.get("recentDeliveries") or []:
@@ -7417,10 +7519,38 @@ def _status_atomic_write(dest, data):
 
 
 def write_status_file(reason="tick"):
-    """Write this computer's status into <Drive target>/Recorder status/. Returns True on success."""
+    """Build status once → always mirror under REC_DIR/Recorder status/ → try Drive.
+
+    Returns True only when the Drive write succeeded (callers that care about Drive).
+    Local fields update even when Drive is blocked (FDA / missing Drive).
+    STATUS_FILE.error stays the Drive error so UI / ready check see the block.
+    """
     now = time.time()
     with STATUS_FILE_LOCK:
         STATUS_FILE["lastAttemptAt"] = now
+    doc = build_status_doc(now)
+    doc["reason"] = reason
+    local_folder, local_txt, local_js = status_local_paths()
+    doc["statusLocalPath"] = str(local_txt)
+    with STATUS_FILE_LOCK:
+        doc["driveStatusError"] = STATUS_FILE.get("error")
+    doc["driveAccess"] = drive_access_snapshot()
+
+    # ── local mirror (no FDA needed) ──
+    try:
+        local_folder.mkdir(parents=True, exist_ok=True)
+        _status_atomic_write(local_txt, render_status_text(doc).encode("utf-8"))
+        _status_atomic_write(local_js, (json.dumps(doc, indent=1, ensure_ascii=False) + "\n").encode("utf-8"))
+        with STATUS_FILE_LOCK:
+            STATUS_FILE.update(localLastWrittenAt=now, localTxtPath=str(local_txt), localError=None)
+    except Exception as e:
+        local_err = f"could not write local status mirror: {e}"
+        with STATUS_FILE_LOCK:
+            if local_err != STATUS_FILE.get("localError"):
+                log(f"status file local ({reason}): {local_err}")
+            STATUS_FILE["localError"] = local_err
+
+    # ── Drive write (same folder layout as before) ──
     err = None
     try:
         roots = detect_drive_roots()
@@ -7433,11 +7563,11 @@ def write_status_file(reason="tick"):
             else:
                 folder = Path(target) / STATUS_SUBDIR
                 folder.mkdir(parents=True, exist_ok=True)
-                doc = build_status_doc(now)
-                doc["reason"] = reason
                 name = computer_name()
                 txt = folder / f"{name}.txt"
                 js = folder / f"{name}.json"
+                doc["driveStatusError"] = None
+                doc["driveAccess"] = {"ok": True, "error": None, "kind": "ok"}
                 _status_atomic_write(txt, render_status_text(doc).encode("utf-8"))
                 _status_atomic_write(js, (json.dumps(doc, indent=1, ensure_ascii=False) + "\n").encode("utf-8"))
                 with STATUS_FILE_LOCK:
@@ -7455,6 +7585,7 @@ def write_status_file(reason="tick"):
             log(f"status file ({reason}): {err}")
         STATUS_FILE["error"] = err
     return False
+
 
 
 def status_file_loop():
@@ -7493,14 +7624,22 @@ def status_file_loop():
 
 def status_file_snapshot():
     with STATUS_FILE_LOCK:
+        last = STATUS_FILE["lastWrittenAt"] or None
+        err = STATUS_FILE.get("error")
+        local_last = STATUS_FILE.get("localLastWrittenAt") or None
         return {
             "enabled": status_file_enabled(),
             "intervalSecs": STATUS_FILE_INTERVAL_SECS,
-            "lastWrittenAt": STATUS_FILE["lastWrittenAt"] or None,
+            "lastWrittenAt": last,
             "folder": STATUS_FILE.get("folder"),
             "txtPath": STATUS_FILE.get("txtPath"),
-            "error": STATUS_FILE.get("error"),
+            "error": err,
             "computer": computer_name(),
+            # v6.47: local REC_DIR mirror (always when statusToDrive on)
+            "localLastWrittenAt": local_last or None,
+            "localTxtPath": STATUS_FILE.get("localTxtPath"),
+            "localError": STATUS_FILE.get("localError"),
+            "driveOk": bool(last) and not err,
         }
 
 
