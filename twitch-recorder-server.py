@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.47"
+HELPER_VERSION = "6.48"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -65,6 +65,17 @@ RESTART_GRACE_BACKOFFS = (15, 20, 30)  # once normal retries are used up; caps a
 # v6.46: same window as status-file recorderPageOpen — after this, the page is gone
 # and restart_grace_applies treats the helper as running alone.
 PAGE_HEARTBEAT_STALE_SECS = float(os.environ.get("TWITCH_RECORDER_PAGE_STALE_SECS") or 120)
+# v6.48: the recorder page ends the restart grace early (POST /api/grace/release) once Twitch
+# Helix has said the streamer is offline for this long while the helper is waiting. Real restarts
+# usually come back within a minute or two; a normal stream end then reaches voice removal /
+# Drive ~2.5 min after the end instead of 8. The page enforces the timing (Helix is only visible
+# there); the helper just publishes this value in /api/health.graceOfflineSecs. With the page
+# closed/stale there is no Helix signal and the full RESTART_GRACE_SECS still applies.
+# Env: TWITCH_RECORDER_GRACE_OFFLINE_SECS (default 150; 0 = page never releases early).
+try:
+    GRACE_OFFLINE_SECS = max(0.0, float(os.environ.get("TWITCH_RECORDER_GRACE_OFFLINE_SECS") or 150))
+except ValueError:
+    GRACE_OFFLINE_SECS = 150.0
 # Soft give-up sooner when streamlink stderr clearly says offline / no streams.
 OFFLINE_STDERR_HINTS = (
     "no playable streams",
@@ -1287,13 +1298,68 @@ def monitor_quick_fail(username, gen, proc, out_path):
 
 
 def interruptible_backoff(username, gen, seconds):
-    """Sleep up to seconds; return False if stop/gen cancelled."""
+    """Sleep up to seconds; return False if stop/gen cancelled.
+
+    v6.48: returns True early when the restart grace was released (graceRelease) so the
+    supervisor finalizes right away instead of finishing a 30 s sleep. Callers that can be
+    in grace must check grace_release_reason() after this returns True.
+    """
     end = time.time() + seconds
     while time.time() < end:
-        if not still_wanted(username, gen):
-            return False
+        with LOCK:
+            rec = ACTIVE.get(username)
+            if not (rec and rec.get("want", True) and rec.get("gen") == gen):
+                return False
+            if rec.get("graceRelease"):
+                return True
         time.sleep(0.25)
     return still_wanted(username, gen)
+
+
+def grace_release_reason(username, gen):
+    """v6.48: reason string if the page released this slot's restart grace, else None."""
+    with LOCK:
+        rec = ACTIVE.get(username)
+        if rec and rec.get("gen") == gen and rec.get("graceRelease"):
+            return str(rec.get("graceReleaseReason") or "restart grace released")
+    return None
+
+
+def clear_grace_release_locked(rec):
+    """v6.48: new grace episode / re-established — forget any earlier release. Hold LOCK."""
+    rec["graceRelease"] = False
+    rec.pop("graceReleaseReason", None)
+
+
+def release_restart_grace(username, reason=None):
+    """v6.48: end the v6.42 stream-restart wait early for a slot currently in grace.
+
+    Called by POST /api/grace/release when the recorder page has seen Twitch Helix report the
+    streamer offline for GRACE_OFFLINE_SECS. Sets graceRelease and clears graceUntil; the
+    supervisor notices within ~0.25 s (interruptible_backoff) or right after the try in flight,
+    and finalizes exactly like a grace timeout (segments → seamless / voice removal / Drive).
+    A try that establishes before that wins: the flag is cleared and recording continues.
+    """
+    u = safe_username(username)
+    if not u:
+        return {"ok": False, "error": "invalid username"}, 400
+    why = " ".join(str(reason or "").split())[:200] or "Twitch says offline"
+    now = time.time()
+    with LOCK:
+        rec = ACTIVE.get(u)
+        if not rec:
+            return {"ok": False, "error": f"not recording {u}"}, 400
+        until = float(rec.get("graceUntil") or 0.0)
+        if rec.get("graceRelease"):
+            return {"ok": True, "released": True, "already": True,
+                    "reason": str(rec.get("graceReleaseReason") or why), "username": u}, 200
+        if not rec.get("retrying") or until <= now:
+            return {"ok": False, "error": f"{u} is not waiting through a stream restart"}, 400
+        rec["graceRelease"] = True
+        rec["graceReleaseReason"] = why
+        rec["graceUntil"] = 0.0
+    log(f"restart grace released {u}: {why}")
+    return {"ok": True, "released": True, "reason": why, "username": u}, 200
 
 
 def mid_resume_backoff(resume_idx):
@@ -1452,6 +1518,7 @@ def record_supervisor(username, quality, gen):
                     rec["starting"] = False
                     rec["retrying"] = False
                     rec["graceUntil"] = 0.0
+                    clear_grace_release_locked(rec)  # v6.48: came back — keep recording
                     rec["proc"] = proc
                     rec["file"] = str(out)
                     rec["pid"] = proc.pid
@@ -1483,7 +1550,8 @@ def record_supervisor(username, quality, gen):
         if attempt >= len(RETRY_BACKOFFS):
             # v6.42: stream restart / slow playlist — keep trying for the grace window
             until = first_fail_at + RESTART_GRACE_SECS
-            if now < until and restart_grace_applies(username):
+            released = grace_release_reason(username, gen)  # v6.48: Helix confirmed offline
+            if now < until and not released and restart_grace_applies(username):
                 backoff = grace_backoff(grace_idx)
                 grace_idx += 1
                 set_last_error(username, grace_wait_msg(username, until, err))
@@ -1503,8 +1571,14 @@ def record_supervisor(username, quality, gen):
                         if rec and rec.get("gen") == gen:
                             ACTIVE.pop(username, None)
                     return
-                continue
-            if grace_idx:
+                released = grace_release_reason(username, gen)
+                if not released:
+                    continue
+            if released:
+                # v6.48: same finalize as the grace deadline, just sooner
+                set_last_error(username, f"stopped waiting for {username} to come back after {tries} tries — "
+                                         f"{released}")
+            elif grace_idx:
                 set_last_error(username, f"stopped retrying {username} after {tries} tries over "
                                          f"{int(round((now - first_fail_at) / 60.0))} min — {err}")
             with LOCK:
@@ -1562,9 +1636,22 @@ def watch_and_resume(username, quality, gen, proc):
         """v6.42: still inside the restart window for this ended segment?"""
         return grace_ok and time.time() < seg_ended_at + RESTART_GRACE_SECS
 
+    def give_up_released(reason):
+        """v6.48: page saw Helix offline long enough — finalize like a grace timeout."""
+        mins = int(round((time.time() - seg_ended_at) / 60.0)) if seg_ended_at else 0
+        give_up(
+            f"stopped waiting for {username} to come back"
+            + (f" after {mins} min" if mins else "")
+            + f" — {reason}"
+        )
+
     def grace_or_give_up(fails, last_err):
         """Out of normal retries: keep waiting through a restart, or give up. True = keep going."""
         nonlocal grace_ok
+        released = grace_release_reason(username, gen)  # v6.48
+        if released:
+            give_up_released(released)
+            return False
         if grace_ok:
             # re-check armed state (page may have turned Auto-Rec off meanwhile)
             grace_ok = restart_grace_applies(username)
@@ -1603,6 +1690,7 @@ def watch_and_resume(username, quality, gen, proc):
             rec["supervised"] = True
             rec["resumes"] = int(rec.get("resumes") or 0) + 1
             rec["graceUntil"] = (seg_ended_at + RESTART_GRACE_SECS) if grace_ok else 0.0
+            clear_grace_release_locked(rec)  # v6.48: fresh grace episode for this segment end
         return True
 
     def give_up(reason):
@@ -1670,6 +1758,10 @@ def watch_and_resume(username, quality, gen, proc):
                 break
             if not still_wanted(username, gen):
                 break
+            released = grace_release_reason(username, gen)  # v6.48: woke early on release
+            if released:
+                give_up_released(released)
+                return
 
             with LOCK:
                 rec = ACTIVE.get(username)
@@ -1735,6 +1827,7 @@ def watch_and_resume(username, quality, gen, proc):
                         rec["pid"] = new_proc.pid
                         rec["supervised"] = True
                         rec["graceUntil"] = 0.0
+                        clear_grace_release_locked(rec)  # v6.48: came back — keep recording
                         if not rec.get("sessionStartedAt"):
                             rec["sessionStartedAt"] = started
                 log(f"recording {username} (segment resume) pid={new_proc.pid} -> {out}"
@@ -2636,6 +2729,48 @@ def self_test():
     with STATUS_FILE_LOCK:
         PAGE_SEEN["at"] = prev_at
         PAGE_SEEN["armed"] = prev_armed
+    # v6.48: release a fake ACTIVE slot that is in restart grace (no streamlink)
+    fake_u = "selftestgrace"
+    with LOCK:
+        prev_fake = ACTIVE.pop(fake_u, None)
+        ACTIVE[fake_u] = {"proc": None, "file": "", "want": True, "gen": 987654,
+                          "retrying": True, "starting": False, "supervised": True,
+                          "graceUntil": time.time() + 300}
+    try:
+        res, st = release_restart_grace(fake_u, "self-test: Helix offline 150s")
+        assert st == 200 and res.get("ok") and res.get("released"), res
+        with LOCK:
+            r = ACTIVE[fake_u]
+            assert r.get("graceRelease") is True and float(r.get("graceUntil") or 0) == 0.0
+        assert grace_release_reason(fake_u, 987654) == "self-test: Helix offline 150s"
+        assert grace_release_reason(fake_u, 1) is None  # other generation untouched
+        t0 = time.time()
+        assert interruptible_backoff(fake_u, 987654, 30) is True
+        assert time.time() - t0 < 2, "interruptible_backoff did not wake on graceRelease"
+        res2, _ = release_restart_grace(fake_u, "again")
+        assert res2.get("already") is True
+        entry = [a for a in status_payload()["active"] if a["username"] == fake_u][0]
+        assert entry["graceReleased"] is True and entry["graceUntil"] == 0.0
+        with LOCK:
+            clear_grace_release_locked(ACTIVE[fake_u])
+            ACTIVE[fake_u]["graceUntil"] = time.time() - 1  # grace over → refuse
+        res3, st3 = release_restart_grace(fake_u, "late")
+        assert st3 == 400 and not res3.get("ok"), res3
+        with LOCK:
+            ACTIVE[fake_u]["graceUntil"] = time.time() + 300
+            ACTIVE[fake_u]["retrying"] = False  # recording again → refuse
+        res4, _ = release_restart_grace(fake_u, "live")
+        assert not res4.get("ok"), res4
+        res5, st5 = release_restart_grace("nobodyhere_xyz", "x")
+        assert st5 == 400 and not res5.get("ok")
+        res6, st6 = release_restart_grace("bad name!", "x")
+        assert st6 == 400 and not res6.get("ok")
+    finally:
+        with LOCK:
+            ACTIVE.pop(fake_u, None)
+            if prev_fake is not None:
+                ACTIVE[fake_u] = prev_fake
+    assert "graceOfflineSecs" in health_payload()
     # v6.47: status_file_snapshot exposes local mirror + driveOk keys
     with STATUS_FILE_LOCK:
         prev_sf = dict(STATUS_FILE)
@@ -2723,6 +2858,9 @@ def health_payload():
         # v6.24: install hint for HTML sticky banner / Convert / History "Need demucs"
         "demucsHint": None if demucs_available() else "pip install demucs (first run downloads models)",
         "voiceQuality": voice_quality_snapshot(),  # v6.45 Fast (ffmpeg) / Better (demucs)
+        # v6.48: page ends restart grace after Helix says offline this long (0 = never early)
+        "graceOfflineSecs": GRACE_OFFLINE_SECS,
+        "restartGraceSecs": RESTART_GRACE_SECS,
         "recordingsDir": str(REC_DIR),
         "active": active,
         "lastErrors": last_errors,
@@ -2773,6 +2911,8 @@ def status_payload():
                 "sessionSegments": list(rec.get("sessionSegments") or []),
                 # v6.42: >0 while waiting through a stream restart (epoch secs)
                 "graceUntil": float(rec.get("graceUntil") or 0.0),
+                # v6.48: page released the wait (Helix offline long enough); finalizing
+                "graceReleased": bool(rec.get("graceRelease")),
             }
             peak = rec.get("peak")
             level = rec.get("level")
@@ -7871,6 +8011,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 reap_locked()
                 result = stop_one_locked(username)
             self.send_json(result, status=200 if result.get("ok") else 400)
+            return
+        if path == "/api/grace/release":  # v6.48: {username, reason?}
+            body = self.read_json()
+            body = body if isinstance(body, dict) else {}
+            payload, status = release_restart_grace(body.get("username"), body.get("reason"))
+            self.send_json(payload, status=status)
             return
         if path == "/api/stop-all":
             with LOCK:

@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.47</span>
+    <span class="badge">v6.48</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -841,6 +841,7 @@ function markHelperDown(wasOk){
   helper.statusFile=null; // v6.41
   helper.driveAccess=null; // v6.47
   helper.autoUpdate=null; // v6.43
+  helper.graceOfflineSecs=null; // v6.48
   helperOkSince=0; // v6.43
   // v6.24: hide demucs sticky while helper is down (not the same as demucs missing)
   helperDemucsMissingNotified=false;
@@ -1423,6 +1424,7 @@ function pingHelperAndStatus(){
       helper.statusFile=(d.statusFile && typeof d.statusFile==='object')?d.statusFile:null; // v6.41
       helper.driveAccess=(d.driveAccess && typeof d.driveAccess==='object')?d.driveAccess:null; // v6.47
       helper.autoUpdate=(d.autoUpdate && typeof d.autoUpdate==='object')?d.autoUpdate:null; // v6.43
+      helper.graceOfflineSecs=(typeof d.graceOfflineSecs==='number' && isFinite(d.graceOfflineSecs))?d.graceOfflineSecs:null; // v6.48
       { const sf=helper.statusFile; const da=helper.driveAccess;
         const sig=sf?[sf.enabled,sf.lastWrittenAt,sf.error,sf.localLastWrittenAt,sf.localError,(da&&da.ok),(da&&da.kind),Math.floor(Date.now()/60000)].join('|'):'';
         if(sig!==statusFileSig){ statusFileSig=sig; try{ renderPipelineBox(); }catch(e){} } }
@@ -2943,7 +2945,9 @@ function applyLiveStatus(s, data){
       const gUntil=Number(hjOff.graceUntil||0)*1000;
       if(hjOff.retrying && gUntil>Date.now()){
         const t=new Date(gUntil).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
-        flashOk(`📴 ${s.username} went offline — helper keeps watching for a restart until ${t}.`);
+        const early=helperGraceReleaseSupported() && graceOfflineThresholdSecs()>0
+          ? ` (ends sooner if Twitch still says offline after ~${Math.round(graceOfflineThresholdSecs()/30)/2} min)` : ''; // v6.48
+        flashOk(`📴 ${s.username} went offline — helper keeps watching for a restart until ${t}${early}.`);
       }else{
         flashOk(`📴 ${s.username} went offline — stopping helper recording.`);
         stopRec(s.username, 'helper');
@@ -2956,7 +2960,59 @@ function applyLiveStatus(s, data){
       startP=Promise.allSettled([startP, homeP]).then(function(){});
     }
   }
+  maybeReleaseRestartGrace(s, isLive); // v6.48
   return startP;
+}
+
+/* v6.48: end the v6.42 stream-restart wait early once Helix confirms offline.
+ * While the helper is waiting through a possible restart (retrying && graceUntil in the
+ * future) the page still never calls stopRec. It only counts how long Helix has said the
+ * streamer is offline during that wait (s.graceOfflineSince). Once that reaches
+ * GRACE_OFFLINE_RELEASE_SECS (helper /api/health.graceOfflineSecs wins — env
+ * TWITCH_RECORDER_GRACE_OFFLINE_SECS on the helper; 0 = never early) it POSTs
+ * /api/grace/release once, and the helper finalizes the session (seamless join → voice
+ * removal → split → Drive) right away instead of at the 8-minute deadline. Real restarts
+ * come back within that window (Helix live again or the helper re-establishes) and reset it.
+ * Page closed / stale → no Helix signal → the full 8 minutes still applies. */
+const GRACE_OFFLINE_RELEASE_SECS=150;   // default sustained-offline window (~2.5 min)
+const GRACE_OFFLINE_MAX_GAP_MS=120000;  // Helix confirmations further apart than this restart the window
+const GRACE_RELEASE_RETRY_MS=60000;     // re-POST at most once a minute if a release failed
+function graceOfflineThresholdSecs(){
+  const v=helper.graceOfflineSecs;
+  return (typeof v==='number' && isFinite(v) && v>=0) ? v : GRACE_OFFLINE_RELEASE_SECS;
+}
+function helperGraceReleaseSupported(){ return !!(helper.ok && helper.version && !helperVerLt(helper.version,'6.48')); }
+function helperGraceEntry(s){
+  const a=(helper.active||[]).find(x=>x && x.username===s.username);
+  if(!a || a.graceReleased) return null;
+  const gUntil=Number(a.graceUntil||0)*1000;
+  return (a.retrying && gUntil>Date.now()) ? a : null;
+}
+function resetGraceOffline(s){ s.graceOfflineSince=0; s.graceOfflineLastAt=0; s.graceReleaseSentAt=0; }
+function maybeReleaseRestartGrace(s, isLive){
+  // Live again / not in grace / helper slot gone → clear the offline timer.
+  const a=(!isLive && helperReady()) ? helperGraceEntry(s) : null;
+  if(!a){ if(s.graceOfflineSince||s.graceReleaseSentAt) resetGraceOffline(s); return; }
+  const thr=graceOfflineThresholdSecs();
+  if(!(thr>0) || !helperGraceReleaseSupported()) return;
+  const now=Date.now();
+  if(!s.graceOfflineSince || (s.graceOfflineLastAt && now-s.graceOfflineLastAt>GRACE_OFFLINE_MAX_GAP_MS)){
+    s.graceOfflineSince=now; s.graceReleaseSentAt=0;
+  }
+  s.graceOfflineLastAt=now;
+  if(now-s.graceOfflineSince < thr*1000) return; // keep protecting a quick restart
+  if(s.graceReleaseSentAt && now-s.graceReleaseSentAt < GRACE_RELEASE_RETRY_MS) return; // dedupe
+  s.graceReleaseSentAt=now;
+  const secs=Math.round((now-s.graceOfflineSince)/1000);
+  const user=s.username;
+  helperFetch('/api/grace/release', {username:user, reason:`Twitch has said offline for ${secs}s`}, 4000).then(function(d){
+    if(d && d.ok && d.released){
+      if(!d.already) flashOk(`📴 ${user}: offline confirmed — ending restart wait so voice removal / Drive can start.`);
+      pingHelperAndStatus().catch(function(){});
+    }else{
+      console.warn('grace release for '+user+' not applied:', d && d.error);
+    }
+  }).catch(function(e){ console.warn('grace release failed for '+user, e); });
 }
 
 async function pollAll(){
