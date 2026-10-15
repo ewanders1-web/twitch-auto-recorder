@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.48</span>
+    <span class="badge">v6.49</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -315,6 +315,9 @@
           </label>
           <label title="v6.43: the helper checks GitHub ~2 min after it starts and then every ~3 hours. When a newer version is out it installs it and restarts itself — but only when nothing is recording (or waiting through a stream restart), removing voice, splitting, joining or sending to Drive, and it has been idle a few minutes. A broken download is never installed and the previous files are kept in .update-backup. Helpers older than v6.43 need one last Check for updates → Install update; with this on, this page does that for them automatically once when they are idle." style="margin-left:1rem">
             <input type="checkbox" id="autoUpdateToggle" checked onchange="saveAutoUpdateToggle()"> Install helper updates automatically when idle
+          </label>
+          <label title="v6.49: if this page is closed, Chrome crashes, the tab is discarded, or the computer reboots and only the helper comes back, the helper still watches whoever you left Auto-Rec armed for (persisted under ~/TwitchRecordings/.solo-watch.json) and starts recording when they go live — same path as when this page starts them (supervisor, restart grace, voice removal → Drive). Turn off to require this page open. Needs helper v6.49+." style="margin-left:1rem">
+            <input type="checkbox" id="soloWatchToggle" checked onchange="saveSoloWatchToggle()"> Keep recording armed streamers if this page is closed
           </label>
         </div>
       </div>
@@ -545,9 +548,9 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.47'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.49'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
-let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, statusToDrive:true, autoUpdate:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
+let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, statusToDrive:true, autoUpdate:true, soloWatch:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
@@ -681,6 +684,7 @@ function persist(){
       keepAwakeArmed: cfg.keepAwakeArmed===true, // v6.40
       statusToDrive: cfg.statusToDrive!==false, // v6.41
       autoUpdate: cfg.autoUpdate!==false, // v6.43
+      soloWatch: cfg.soloWatch!==false, // v6.49
       homeStreamer: String(cfg.homeStreamer||'').toLowerCase(),
       returnHomeAfterSet: cfg.returnHomeAfterSet!==false,
       // v6.35: Google Drive card (same persist key)
@@ -728,6 +732,7 @@ function restoreSettings(){
     cfg.keepAwakeArmed=data.keepAwakeArmed===true; // v6.40 opt-in
     cfg.statusToDrive=data.statusToDrive!==false; // v6.41 default on
     cfg.autoUpdate=data.autoUpdate!==false; // v6.43 default on
+    cfg.soloWatch=data.soloWatch!==false; // v6.49 default on
     // v6.25: home streamer + return after guest/DJ set
     cfg.homeStreamer=data.homeStreamer?String(data.homeStreamer).toLowerCase():'';
     if(typeof data.returnHomeAfterSet==='boolean') cfg.returnHomeAfterSet=data.returnHomeAfterSet;
@@ -842,6 +847,7 @@ function markHelperDown(wasOk){
   helper.driveAccess=null; // v6.47
   helper.autoUpdate=null; // v6.43
   helper.graceOfflineSecs=null; // v6.48
+  helper.soloWatch=null; // v6.49
   helperOkSince=0; // v6.43
   // v6.24: hide demucs sticky while helper is down (not the same as demucs missing)
   helperDemucsMissingNotified=false;
@@ -1425,6 +1431,7 @@ function pingHelperAndStatus(){
       helper.driveAccess=(d.driveAccess && typeof d.driveAccess==='object')?d.driveAccess:null; // v6.47
       helper.autoUpdate=(d.autoUpdate && typeof d.autoUpdate==='object')?d.autoUpdate:null; // v6.43
       helper.graceOfflineSecs=(typeof d.graceOfflineSecs==='number' && isFinite(d.graceOfflineSecs))?d.graceOfflineSecs:null; // v6.48
+      helper.soloWatch=(d.soloWatch && typeof d.soloWatch==='object')?d.soloWatch:null; // v6.49
       { const sf=helper.statusFile; const da=helper.driveAccess;
         const sig=sf?[sf.enabled,sf.lastWrittenAt,sf.error,sf.localLastWrittenAt,sf.localError,(da&&da.ok),(da&&da.kind),Math.floor(Date.now()/60000)].join('|'):'';
         if(sig!==statusFileSig){ statusFileSig=sig; try{ renderPipelineBox(); }catch(e){} } }
@@ -1475,6 +1482,7 @@ function pingHelperAndStatus(){
     if(st && st.lastErrors && typeof st.lastErrors==='object') helper.lastErrors=st.lastErrors;
   }catch(e){ helper.active=[]; }
   noticeHelperMidStream();
+  noticeHelperSoloStarted(); // v6.49
   updateHelperBar();
   updatePendingRestartBanner();
   updateStatusUI();
@@ -5058,6 +5066,7 @@ function pipelinePrefsBody(){
     keepAwake:cfg.keepAwake!==false, keepAwakeArmed:cfg.keepAwakeArmed===true, // v6.40
     statusToDrive:cfg.statusToDrive!==false, // v6.41
     autoUpdate:cfg.autoUpdate!==false, // v6.43
+    soloWatch:cfg.soloWatch!==false, // v6.49
     voiceQuality:normVoiceQuality(cfg.voiceQuality)}; // v6.45
 }
 async function syncPipelinePrefs(force){
@@ -5347,6 +5356,42 @@ function saveAutoUpdateToggle(){
   flashOk(msg);
   setTimeout(function(){ pingHelperAndStatus().catch(function(){}); }, 1500);
 }
+
+// v6.49: helper keeps watching armed streamers when this page is closed
+let helperSoloStartedNotified = new Set(); // usernames we already flashed "Helper started … while closed"
+function initSoloWatchToggle(){
+  const el=document.getElementById('soloWatchToggle');
+  if(el) el.checked=cfg.soloWatch!==false;
+}
+function saveSoloWatchToggle(){
+  const el=document.getElementById('soloWatchToggle');
+  cfg.soloWatch=el?!!el.checked:true;
+  persist();
+  syncPipelinePrefs(true);
+  let msg=cfg.soloWatch
+    ? 'If this page is closed, the helper will keep watching whoever you left Auto-Rec armed for and start recording when they go live.'
+    : 'Solo watch off — the helper will not start new recordings while this page is closed (restart grace for an already-recording streamer is unchanged).';
+  if(helper.ok && helper.version && helperVerLt(helper.version,'6.49')) msg+=' Needs helper v6.49 — Check for updates → Install update.';
+  flashOk(msg);
+  setTimeout(function(){ pingHelperAndStatus().catch(function(){}); }, 500);
+}
+function noticeHelperSoloStarted(){
+  // One-time flash when we see a recording the helper started while this page was closed.
+  if(!helper.ok || !Array.isArray(helper.active)) return;
+  helper.active.forEach(function(a){
+    if(!a || !a.username) return;
+    if(String(a.startedBy||'')!=='helper') return;
+    const u=String(a.username).toLowerCase();
+    if(helperSoloStartedNotified.has(u)) return;
+    helperSoloStartedNotified.add(u);
+    flashOk('Helper started '+a.username+' while this page was closed');
+    fireNotify('tar-solo-'+u, 'Helper started '+a.username, 'Recording began while the recorder page was closed');
+  });
+  // Drop remembered names that are no longer active so a later solo-start can flash again
+  const live=new Set((helper.active||[]).map(function(a){ return a && String(a.username||'').toLowerCase(); }).filter(Boolean));
+  Array.from(helperSoloStartedNotified).forEach(function(u){ if(!live.has(u)) helperSoloStartedNotified.delete(u); });
+}
+
 function auClock(ts){
   if(!ts) return '';
   try{ return new Date(Number(ts)*1000).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}); }catch(e){ return ''; }
@@ -5436,8 +5481,10 @@ function keepAwakeBit(){
 }
 function healthPath(){
   // v6.40: heartbeat which streamers have Auto-Rec on (helper ignores unless "while armed" is on)
+  // v6.49: soloWatch=0|1 so the helper keeps (or stops) watching when this page closes
   const armed=streamers.filter(function(s){ return s && s.autoRec; }).map(function(s){ return s.username; });
-  return '/api/health?armed='+encodeURIComponent(armed.join(','));
+  const sw=cfg.soloWatch!==false?'1':'0';
+  return '/api/health?armed='+encodeURIComponent(armed.join(','))+'&soloWatch='+sw;
 }
 function saveDriveOrigToggle(){
   const el=document.getElementById('driveOrigToggle');
@@ -5658,6 +5705,7 @@ initDriveOrigToggle();
 initKeepAwakeToggle(); // v6.40
 initStatusFileToggle(); // v6.41
 initAutoUpdateToggle(); // v6.43
+initSoloWatchToggle(); // v6.49
 initDriveCard();
 updateHomeStreamerUI();
 renderStreamers();

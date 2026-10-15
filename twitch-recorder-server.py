@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.48"
+HELPER_VERSION = "6.49"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -65,6 +65,21 @@ RESTART_GRACE_BACKOFFS = (15, 20, 30)  # once normal retries are used up; caps a
 # v6.46: same window as status-file recorderPageOpen — after this, the page is gone
 # and restart_grace_applies treats the helper as running alone.
 PAGE_HEARTBEAT_STALE_SECS = float(os.environ.get("TWITCH_RECORDER_PAGE_STALE_SECS") or 120)
+# v6.49: when the recorder page is closed/stale, the helper itself polls whether
+# persisted Auto-Rec armed streamers are live and starts recording (same path as /api/record).
+# Env: TWITCH_RECORDER_SOLO_WATCH_SECS (default 60; 0 disables). Startup delay gives the page
+# a chance to reconnect after a reboot before the helper starts watching alone.
+try:
+    SOLO_WATCH_SECS = max(0.0, float(os.environ.get("TWITCH_RECORDER_SOLO_WATCH_SECS") or 60))
+except ValueError:
+    SOLO_WATCH_SECS = 60.0
+try:
+    SOLO_WATCH_STARTUP_DELAY_SECS = max(0.0, float(os.environ.get("TWITCH_RECORDER_SOLO_WATCH_STARTUP_SECS") or 75))
+except ValueError:
+    SOLO_WATCH_STARTUP_DELAY_SECS = 75.0
+# Public Twitch web Client-ID (same family streamlink uses) — no user credentials needed.
+TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
+TWITCH_GQL_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 # v6.48: the recorder page ends the restart grace early (POST /api/grace/release) once Twitch
 # Helix has said the streamer is offline for this long while the helper is waiting. Real restarts
 # usually come back within a minute or two; a normal stream end then reaches voice removal /
@@ -1880,7 +1895,7 @@ def watch_and_resume(username, quality, gen, proc):
 
 
 
-def start_record(username, quality):
+def start_record(username, quality, started_by=None):
     sl = which_streamlink()
     if not sl:
         err = "streamlink not found — install with: pip install streamlink"
@@ -1892,6 +1907,9 @@ def start_record(username, quality):
         set_last_error(username, disk_err)
         log(f"refuse record {username}: {disk_err}")
         return {"ok": False, "error": disk_err}
+    by = (str(started_by).strip().lower() if started_by else "page") or "page"
+    if by not in ("page", "helper"):
+        by = "page"
     with LOCK:
         reap_locked()
         if username in ACTIVE:
@@ -1904,6 +1922,7 @@ def start_record(username, quality):
                 "already": True,
                 "retrying": bool(rec.get("retrying") or rec.get("starting")),
                 "lastError": LAST_ERROR.get(username),
+                "startedBy": rec.get("startedBy") or "page",
             }
         gen = GEN.get(username, 0) + 1
         GEN[username] = gen
@@ -1929,6 +1948,7 @@ def start_record(username, quality):
             "peak_at": 0.0,
             "peak_busy": False,
             "_bps_path": "",
+            "startedBy": by,  # v6.49: "helper" when solo-watch started this
         }
     REC_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK:
@@ -1947,6 +1967,7 @@ def start_record(username, quality):
         "pid": None,
         "retrying": True,
         "lastError": LAST_ERROR.get(username),
+        "startedBy": by,
     }
 
 
@@ -2806,6 +2827,93 @@ def self_test():
         with STATUS_FILE_LOCK:
             STATUS_FILE.clear()
             STATUS_FILE.update(prev_sf)
+    # v6.49: solo-watch persistence + stale/fresh decision (no network)
+    import tempfile as _tmp_sw
+    prev_rec2 = REC_DIR
+    with SOLO_WATCH_LOCK:
+        prev_sw = {
+            "enabled": SOLO_WATCH.get("enabled"),
+            "users": dict(SOLO_WATCH.get("users") or {}),
+            "active": SOLO_WATCH.get("active"),
+            "lastCheckAt": SOLO_WATCH.get("lastCheckAt"),
+            "lastError": SOLO_WATCH.get("lastError"),
+            "startedByHelper": list(SOLO_WATCH.get("startedByHelper") or []),
+            "loggedWatching": SOLO_WATCH.get("loggedWatching"),
+        }
+    with STATUS_FILE_LOCK:
+        prev_page = {"at": PAGE_SEEN.get("at"), "armed": list(PAGE_SEEN.get("armed") or [])}
+    try:
+        with _tmp_sw.TemporaryDirectory(prefix="tar-solo-") as td:
+            REC_DIR = Path(td)
+            with SOLO_WATCH_LOCK:
+                SOLO_WATCH["enabled"] = True
+                SOLO_WATCH["users"] = {}
+                SOLO_WATCH["active"] = False
+                SOLO_WATCH["startedByHelper"] = []
+            # persist + reload
+            solo_watch_set_armed_users(["whistleface", "SweetDeeSauce"], explicit_empty=False)
+            solo_watch_remember_options("whistleface", quality="best", after_stream=True, send_original=False)
+            assert _solo_watch_path().is_file(), "solo-watch json not written"
+            with SOLO_WATCH_LOCK:
+                SOLO_WATCH["users"] = {}
+            solo_watch_load()
+            with SOLO_WATCH_LOCK:
+                assert "whistleface" in SOLO_WATCH["users"]
+                assert SOLO_WATCH["users"]["whistleface"]["quality"] == "best"
+                assert SOLO_WATCH["users"]["whistleface"]["sendOriginal"] is False
+                assert "sweetdeesauce" in SOLO_WATCH["users"]
+            # empty armed clears
+            solo_watch_set_armed_users([], explicit_empty=True)
+            with SOLO_WATCH_LOCK:
+                assert SOLO_WATCH["users"] == {}
+            solo_watch_set_armed_users(["whistleface"], explicit_empty=False)
+            # decision: fresh page open → not run
+            with STATUS_FILE_LOCK:
+                PAGE_SEEN["at"] = time.time()
+                PAGE_SEEN["armed"] = ["whistleface"]
+            ok, why = solo_watch_should_run(now=time.time(), helper_started_at=time.time() - 999)
+            assert ok is False and why == "page-open", (ok, why)
+            # stale page + armed → run
+            with STATUS_FILE_LOCK:
+                PAGE_SEEN["at"] = time.time() - max(float(PAGE_HEARTBEAT_STALE_SECS), 1) - 5
+            ok, why = solo_watch_should_run(now=time.time(), helper_started_at=time.time() - 999)
+            assert ok is True and why == "page-closed", (ok, why)
+            # disabled → not run
+            solo_watch_set_enabled(False, save=True)
+            ok, why = solo_watch_should_run(now=time.time(), helper_started_at=time.time() - 999)
+            assert ok is False and why == "disabled", (ok, why)
+            solo_watch_set_enabled(True, save=True)
+            # never seen + within startup delay → not run
+            with STATUS_FILE_LOCK:
+                PAGE_SEEN["at"] = 0.0
+            ok, why = solo_watch_should_run(now=time.time(), helper_started_at=time.time())
+            assert ok is False and why == "startup-delay", (ok, why)
+            # never seen + past startup delay → run
+            ok, why = solo_watch_should_run(
+                now=time.time(),
+                helper_started_at=time.time() - max(float(SOLO_WATCH_STARTUP_DELAY_SECS), 1) - 5,
+            )
+            assert ok is True and why == "page-closed", (ok, why)
+            # no armed → not run
+            solo_watch_set_armed_users([], explicit_empty=True)
+            ok, why = solo_watch_should_run(
+                now=time.time(),
+                helper_started_at=time.time() - 999,
+            )
+            assert ok is False and why == "no-armed", (ok, why)
+            snap = solo_watch_snapshot()
+            assert "enabled" in snap and "users" in snap and "active" in snap
+            assert "startedByHelper" in snap and "lastCheckAt" in snap
+            assert "soloWatch" in health_payload()
+            assert page_heartbeat_is_stale(time.time()) is True  # PAGE_SEEN.at == 0
+    finally:
+        REC_DIR = prev_rec2
+        with SOLO_WATCH_LOCK:
+            SOLO_WATCH.clear()
+            SOLO_WATCH.update(prev_sw)
+        with STATUS_FILE_LOCK:
+            PAGE_SEEN["at"] = prev_page["at"]
+            PAGE_SEEN["armed"] = prev_page["armed"]
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -2880,6 +2988,7 @@ def health_payload():
         "statusFile": status_file_snapshot(),  # v6.41
         "driveAccess": drive_access_snapshot(),  # v6.47: sticky banner when FDA/Drive blocks
         "autoUpdate": auto_update_snapshot(),  # v6.43
+        "soloWatch": solo_watch_snapshot(),  # v6.49
         "seamlessJobs": seamless_jobs_for_health(),
         "updateRepo": f"https://github.com/{UPDATE_REPO}",
         # v6.29: last orphan temp cleanup (UI one-shot flash when non-zero after reconnect)
@@ -2913,6 +3022,8 @@ def status_payload():
                 "graceUntil": float(rec.get("graceUntil") or 0.0),
                 # v6.48: page released the wait (Helix offline long enough); finalizing
                 "graceReleased": bool(rec.get("graceRelease")),
+                # v6.49: "helper" when solo-watch started this while the page was closed
+                "startedBy": rec.get("startedBy") or "page",
             }
             peak = rec.get("peak")
             level = rec.get("level")
@@ -5841,6 +5952,8 @@ def _pipeline_load():
         PIPELINE["statusToDrive"] = data.get("statusToDrive") is not False
         # v6.43: install helper updates automatically when idle (default on)
         PIPELINE["autoUpdate"] = data.get("autoUpdate") is not False
+        # v6.49: mirror of solo-watch enabled (authoritative copy is .solo-watch.json)
+        PIPELINE["soloWatch"] = data.get("soloWatch") is not False
         # v6.45: voice-removal quality (auto = Better when demucs installed, else Fast)
         PIPELINE["voiceQuality"] = _norm_voice_quality(data.get("voiceQuality")) or "auto"
         # v6.44: after-stream jobs that were queued/running when the helper last stopped
@@ -6656,6 +6769,15 @@ def api_pipeline_prefs(body):
                 STATUS_FILE_WAKE.set()
             PIPELINE["autoUpdate"] = on
             changed = True
+        if "soloWatch" in body:  # v6.49: keep watching when page closed
+            # Persist on SOLO_WATCH (dedicated file); also mirror into PIPELINE for status dumps
+            on = bool(body.get("soloWatch"))
+            PIPELINE["soloWatch"] = on
+            changed = True
+            try:
+                solo_watch_set_enabled(on, save=True)
+            except Exception as e:
+                log(f"solo watch pref failed: {e}")
         ousers = body.get("origUsers")
         if isinstance(ousers, dict):
             for k, v in ousers.items():
@@ -7306,6 +7428,417 @@ STATUS_FILE = {"lastWrittenAt": 0.0, "lastAttemptAt": 0.0, "folder": None, "txtP
 PAGE_SEEN = {"at": 0.0, "armed": []}
 HELPER_STARTED_AT = time.time()
 
+# ─── v6.49: HELPER SOLO-WATCH WHEN THE RECORDER PAGE IS CLOSED ─────────
+# Persist the last Auto-Rec armed list (+ per-streamer /api/record options) so a reboot
+# or closed Chrome tab does not leave the helper idle while an armed streamer goes live.
+def _solo_watch_path():
+    return REC_DIR / ".solo-watch.json"
+
+SOLO_WATCH_LOCK = threading.Lock()
+SOLO_WATCH = {
+    "enabled": True,  # default on; older pages that never send the toggle stay on
+    "users": {},  # username -> {quality, afterStream, sendOriginal}
+    "active": False,  # True while the background loop considers the page gone
+    "lastCheckAt": 0.0,
+    "lastError": None,
+    "startedByHelper": [],  # usernames this process started via solo-watch (still ACTIVE)
+    "loggedWatching": False,
+}
+SOLO_WATCH_WAKE = threading.Event()
+
+
+def _solo_default_opts(username=None):
+    u = (username or "").lower()
+    with PIPELINE_LOCK:
+        after = bool(PIPELINE.get("enabled", True)) and bool(PIPELINE.get("users", {}).get(u, True))
+        send_o = bool(PIPELINE.get("origEnabled", True)) and bool(
+            (PIPELINE.get("origUsers") or {}).get(u, True)
+        )
+    return {"quality": "audio_only", "afterStream": after, "sendOriginal": send_o}
+
+
+def _solo_normalize_opts(opts, username=None):
+    base = _solo_default_opts(username)
+    if not isinstance(opts, dict):
+        return base
+    q = opts.get("quality")
+    base["quality"] = q if q in ("audio_only", "best") else "audio_only"
+    if "afterStream" in opts:
+        base["afterStream"] = bool(opts.get("afterStream"))
+    if "sendOriginal" in opts:
+        base["sendOriginal"] = bool(opts.get("sendOriginal"))
+    return base
+
+
+def solo_watch_load():
+    """Load ~/TwitchRecordings/.solo-watch.json (armed list + options + enabled)."""
+    try:
+        data = json.loads(_solo_watch_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    users = {}
+    raw_users = data.get("users") if isinstance(data.get("users"), dict) else {}
+    for k, v in raw_users.items():
+        u = safe_username(k)
+        if not u:
+            continue
+        users[u] = _solo_normalize_opts(v if isinstance(v, dict) else {}, u)
+        if len(users) >= 50:
+            break
+    with SOLO_WATCH_LOCK:
+        # missing key = default on (older pages / first run)
+        SOLO_WATCH["enabled"] = data.get("enabled") is not False
+        SOLO_WATCH["users"] = users
+    if users:
+        log(f"solo watch: loaded {len(users)} armed streamer(s) from disk — "
+            + ", ".join(list(users.keys())[:8]) + ("…" if len(users) > 8 else ""))
+
+
+def solo_watch_save_locked():
+    """Caller holds SOLO_WATCH_LOCK. Atomic temp+rename like .drive-pipeline.json."""
+    blob = json.dumps({
+        "enabled": bool(SOLO_WATCH.get("enabled", True)),
+        "users": dict(SOLO_WATCH.get("users") or {}),
+        "updatedAt": time.time(),
+    }, indent=1).encode("utf-8")
+    try:
+        REC_DIR.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(_solo_watch_path(), blob)
+    except Exception as e:
+        log(f"solo watch state write failed: {e}")
+
+
+def solo_watch_set_enabled(on, save=True):
+    on = bool(on)
+    with SOLO_WATCH_LOCK:
+        if SOLO_WATCH.get("enabled") is on:
+            return False
+        SOLO_WATCH["enabled"] = on
+        if save:
+            solo_watch_save_locked()
+    log(f"solo watch: {'on' if on else 'OFF'} (keep recording armed streamers if the page is closed)")
+    SOLO_WATCH_WAKE.set()
+    STATUS_FILE_WAKE.set()
+    return True
+
+
+def solo_watch_remember_options(username, quality=None, after_stream=None, send_original=None):
+    """Remember last /api/record options for a streamer (used when the page is gone).
+
+    Only updates (or adds) when the streamer is already in the persisted armed list or
+    the latest page heartbeat lists them as Auto-Rec armed — a manual Start on someone
+    not armed must not enroll them for solo-watch.
+    """
+    u = safe_username(username)
+    if not u:
+        return
+    with STATUS_FILE_LOCK:
+        page_armed = [str(a).lower() for a in (PAGE_SEEN.get("armed") or [])]
+    with SOLO_WATCH_LOCK:
+        users = dict(SOLO_WATCH.get("users") or {})
+        if u not in users and u not in page_armed:
+            return
+        cur = dict(users.get(u) or _solo_default_opts(u))
+        if quality in ("audio_only", "best"):
+            cur["quality"] = quality
+        if after_stream is not None:
+            cur["afterStream"] = bool(after_stream)
+        if send_original is not None:
+            cur["sendOriginal"] = bool(send_original)
+        users[u] = cur
+        SOLO_WATCH["users"] = users
+        solo_watch_save_locked()
+
+
+def solo_watch_set_armed_users(usernames, explicit_empty=False):
+    """Update persisted armed list from a fresh page heartbeat.
+
+    Non-empty list replaces the set of users (options kept when already known).
+    Explicit empty (page said armed= with nobody) clears the list — user turned Auto-Rec off.
+    """
+    cleaned = []
+    for part in usernames or []:
+        u = safe_username(part)
+        if u and u not in cleaned:
+            cleaned.append(u)
+        if len(cleaned) >= 50:
+            break
+    with SOLO_WATCH_LOCK:
+        prev = dict(SOLO_WATCH.get("users") or {})
+        if not cleaned and explicit_empty:
+            if not prev:
+                return False
+            SOLO_WATCH["users"] = {}
+            solo_watch_save_locked()
+            changed = True
+        elif cleaned:
+            next_users = {}
+            for u in cleaned:
+                next_users[u] = dict(prev.get(u) or _solo_default_opts(u))
+            if next_users == prev:
+                return False
+            SOLO_WATCH["users"] = next_users
+            solo_watch_save_locked()
+            changed = True
+        else:
+            return False
+    if changed:
+        SOLO_WATCH_WAKE.set()
+        STATUS_FILE_WAKE.set()
+    return changed
+
+
+def page_heartbeat_is_stale(now=None):
+    """True when no fresh page heartbeat (never seen, or older than PAGE_HEARTBEAT_STALE_SECS)."""
+    now = time.time() if now is None else now
+    with STATUS_FILE_LOCK:
+        seen_at = float(PAGE_SEEN.get("at") or 0.0)
+    if not seen_at:
+        return True
+    try:
+        stale = float(PAGE_HEARTBEAT_STALE_SECS)
+    except (TypeError, ValueError):
+        stale = 120.0
+    if stale <= 0:
+        return False
+    return (now - seen_at) >= stale
+
+
+def solo_watch_should_run(now=None, helper_started_at=None):
+    """Decision logic for the background loop (no network). Self-test covers this.
+
+    Active when: enabled, interval > 0, page heartbeat stale (or never seen), a persisted
+    armed list exists, and the startup delay has elapsed (so a rebooting page can reconnect).
+    """
+    now = time.time() if now is None else now
+    started = HELPER_STARTED_AT if helper_started_at is None else float(helper_started_at)
+    with SOLO_WATCH_LOCK:
+        enabled = SOLO_WATCH.get("enabled") is not False
+        users = list((SOLO_WATCH.get("users") or {}).keys())
+    if not enabled:
+        return False, "disabled"
+    if SOLO_WATCH_SECS <= 0:
+        return False, "env-off"
+    if not users:
+        return False, "no-armed"
+    if (now - started) < SOLO_WATCH_STARTUP_DELAY_SECS:
+        # Only gate on startup delay when the page has never reported in (reboot race).
+        with STATUS_FILE_LOCK:
+            seen_at = float(PAGE_SEEN.get("at") or 0.0)
+        if not seen_at:
+            return False, "startup-delay"
+    if not page_heartbeat_is_stale(now):
+        return False, "page-open"
+    return True, "page-closed"
+
+
+def solo_watch_snapshot():
+    with SOLO_WATCH_LOCK:
+        users = sorted((SOLO_WATCH.get("users") or {}).keys())
+        started = list(SOLO_WATCH.get("startedByHelper") or [])
+        return {
+            "enabled": SOLO_WATCH.get("enabled") is not False,
+            "active": bool(SOLO_WATCH.get("active")),
+            "users": users,
+            "lastCheckAt": float(SOLO_WATCH.get("lastCheckAt") or 0.0) or None,
+            "lastError": SOLO_WATCH.get("lastError"),
+            "startedByHelper": started,
+            "intervalSecs": SOLO_WATCH_SECS,
+            "startupDelaySecs": SOLO_WATCH_STARTUP_DELAY_SECS,
+        }
+
+
+def twitch_gql_is_live(username):
+    """Lightweight live check via Twitch public GQL (no user credentials). Returns True/False.
+    Raises on transport/parse errors so the caller can back off."""
+    u = safe_username(username)
+    if not u:
+        return False
+    body = json.dumps({
+        "query": (
+            "query($login:String!){ user(login:$login){ id login stream { id type } } }"
+        ),
+        "variables": {"login": u},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        TWITCH_GQL_URL,
+        data=body,
+        headers={
+            "Client-ID": TWITCH_GQL_CLIENT_ID,
+            "Content-Type": "application/json",
+            "User-Agent": f"TwitchAutoRecorder/{HELPER_VERSION}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise RuntimeError("gql: unexpected response")
+    if data.get("errors"):
+        # Soft: treat GraphQL errors as not-live rather than crashing the loop
+        err0 = data["errors"][0] if isinstance(data["errors"], list) and data["errors"] else {}
+        msg = (err0.get("message") if isinstance(err0, dict) else None) or "gql error"
+        raise RuntimeError(f"gql: {msg}")
+    user = ((data.get("data") or {}).get("user") if isinstance(data.get("data"), dict) else None)
+    if not user:
+        return False
+    stream = user.get("stream") if isinstance(user, dict) else None
+    return bool(stream and (stream.get("id") or stream.get("type")))
+
+
+def twitch_streamlink_is_live(username):
+    """Fallback live probe: streamlink --json (no credentials). True/False; raises on hard fail."""
+    u = safe_username(username)
+    sl = which_streamlink()
+    if not u or not sl:
+        return False
+    try:
+        r = subprocess.run(
+            [sl, "--json", f"https://twitch.tv/{u}"],
+            capture_output=True, text=True, timeout=45,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError("streamlink probe timed out") from e
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "")[:200].lower()
+        if any(h in err for h in ("no playable streams", "no streams found", "is offline", "offline")):
+            return False
+        raise RuntimeError(f"streamlink probe failed (exit {r.returncode})")
+    try:
+        data = json.loads(r.stdout or "{}")
+    except ValueError as e:
+        raise RuntimeError("streamlink --json parse failed") from e
+    streams = data.get("streams") if isinstance(data, dict) else None
+    return bool(streams)
+
+
+def streamer_is_live_public(username):
+    """Prefer GQL; fall back to streamlink --json. Returns (live:bool, method:str)."""
+    try:
+        return bool(twitch_gql_is_live(username)), "gql"
+    except Exception as gql_err:
+        try:
+            return bool(twitch_streamlink_is_live(username)), "streamlink"
+        except Exception as sl_err:
+            raise RuntimeError(f"gql: {gql_err}; streamlink: {sl_err}") from sl_err
+
+
+def _solo_already_busy(username):
+    """True if recording / starting / in restart grace — never double-start."""
+    u = (username or "").lower()
+    with LOCK:
+        reap_locked()
+        rec = ACTIVE.get(u)
+        if not rec:
+            return False
+        if rec.get("want"):
+            return True
+        if float(rec.get("graceUntil") or 0) > time.time():
+            return True
+        return True  # any ACTIVE slot for this user
+
+
+def solo_watch_start_user(username, opts):
+    """Start via the same path as /api/record (supervisor, pipeline prefs, dedupe)."""
+    u = safe_username(username)
+    if not u:
+        return None
+    opts = _solo_normalize_opts(opts, u)
+    # Mirror page /api/record: stamp pipeline prefs before start
+    set_pipeline_user_pref(u, bool(opts.get("afterStream")))
+    set_original_user_pref(u, bool(opts.get("sendOriginal")))
+    result = start_record(u, opts.get("quality") or "audio_only", started_by="helper")
+    if result.get("ok") and not result.get("already"):
+        with SOLO_WATCH_LOCK:
+            started = list(SOLO_WATCH.get("startedByHelper") or [])
+            if u not in started:
+                started.append(u)
+            SOLO_WATCH["startedByHelper"] = started
+        STATUS_FILE_WAKE.set()
+        log(f"solo watch: {u} live — starting recording")
+    return result
+
+
+def solo_watch_prune_started():
+    with LOCK:
+        active = set(ACTIVE.keys())
+    with SOLO_WATCH_LOCK:
+        started = [u for u in (SOLO_WATCH.get("startedByHelper") or []) if u in active]
+        SOLO_WATCH["startedByHelper"] = started
+
+
+def solo_watch_tick():
+    """One solo-watch cycle. Quiet on errors (backoff via lastError)."""
+    solo_watch_prune_started()
+    now = time.time()
+    should, reason = solo_watch_should_run(now)
+    with SOLO_WATCH_LOCK:
+        was_active = bool(SOLO_WATCH.get("active"))
+        SOLO_WATCH["active"] = bool(should)
+        users = dict(SOLO_WATCH.get("users") or {})
+        if should and not was_active:
+            names = ", ".join(sorted(users.keys())[:8])
+            more = "…" if len(users) > 8 else ""
+            log(f"solo watch: page closed — watching {names}{more}")
+            SOLO_WATCH["loggedWatching"] = True
+        elif not should and was_active:
+            log(f"solo watch: idle ({reason})")
+            SOLO_WATCH["loggedWatching"] = False
+    if not should:
+        return
+    SOLO_WATCH_WAKE.clear()
+    err = None
+    for u, opts in list(users.items()):
+        if _solo_already_busy(u):
+            continue
+        try:
+            live, method = streamer_is_live_public(u)
+            with SOLO_WATCH_LOCK:
+                SOLO_WATCH["lastCheckAt"] = time.time()
+                SOLO_WATCH["lastError"] = None
+            if not live:
+                continue
+            log(f"solo watch: {u} live ({method}) — starting recording")
+            solo_watch_start_user(u, opts)
+        except Exception as e:
+            err = str(e)[:240]
+            with SOLO_WATCH_LOCK:
+                SOLO_WATCH["lastCheckAt"] = time.time()
+                # Don't spam: only log when the error text changes
+                prev = SOLO_WATCH.get("lastError")
+                SOLO_WATCH["lastError"] = err
+            if err != prev:
+                log(f"solo watch: live-check failed for {u}: {err}")
+            # Back off the rest of this tick on transport errors
+            break
+    STATUS_FILE_WAKE.set()
+
+
+def solo_watch_loop():
+    """Background: every SOLO_WATCH_SECS when the page is gone, check armed streamers."""
+    # Startup delay before first decision (page reconnect race after reboot)
+    deadline = time.time() + SOLO_WATCH_STARTUP_DELAY_SECS
+    while time.time() < deadline:
+        SOLO_WATCH_WAKE.wait(timeout=min(5.0, max(0.5, deadline - time.time())))
+        SOLO_WATCH_WAKE.clear()
+        # If the page already heartbeated, no need to sit out the full delay for "page-open"
+        with STATUS_FILE_LOCK:
+            if float(PAGE_SEEN.get("at") or 0.0):
+                break
+    while True:
+        try:
+            solo_watch_tick()
+        except Exception as e:
+            log(f"solo watch: tick error: {e}")
+            with SOLO_WATCH_LOCK:
+                SOLO_WATCH["lastError"] = str(e)[:240]
+        interval = SOLO_WATCH_SECS if SOLO_WATCH_SECS > 0 else 60.0
+        SOLO_WATCH_WAKE.wait(timeout=max(5.0, interval))
+        SOLO_WATCH_WAKE.clear()
+
 
 def status_file_enabled():
     with PIPELINE_LOCK:
@@ -7324,8 +7857,14 @@ def note_page_seen(raw_armed):
         changed = users != PAGE_SEEN.get("armed")
         PAGE_SEEN["at"] = time.time()
         PAGE_SEEN["armed"] = users
+    # v6.49: persist armed list for solo-watch (empty = user cleared Auto-Rec — clear disk too)
+    try:
+        solo_watch_set_armed_users(users, explicit_empty=True)
+    except Exception as e:
+        log(f"solo watch armed sync failed: {e}")
     if changed:
         STATUS_FILE_WAKE.set()
+        SOLO_WATCH_WAKE.set()
 
 
 def _iso_local(ts):
@@ -7356,9 +7895,10 @@ def _status_change_sig():
     with STATUS_FILE_LOCK:
         armed = tuple(PAGE_SEEN.get("armed") or [])
     au = auto_update_snapshot()  # v6.43
+    sw = solo_watch_snapshot()  # v6.49
     return repr((active, errs, dels, origs, int(q.get("running") or 0), int(q.get("waiting") or 0),
                  armed, pending_restart_needed(), au.get("enabled"), au.get("state"), au.get("lastError"),
-                 au.get("remoteVersion")))
+                 au.get("remoteVersion"), sw.get("enabled"), sw.get("active"), tuple(sw.get("users") or [])))
 
 
 def _drive_access_kind(err):
@@ -7505,6 +8045,8 @@ def build_status_doc(now=None):
                        "lastAppliedVersion": au.get("lastAppliedVersion"),
                        "lastAppliedAt": _iso_local(au.get("lastAppliedAt"))},
         "recentRecordings": recent,
+        # v6.49: helper watching armed streamers while the recorder page is closed
+        "soloWatch": solo_watch_snapshot(),
     }
     # v6.47: local mirror path + Drive write error so the local JSON is useful when Drive is blocked
     local_folder, local_txt, _local_js = status_local_paths()
@@ -7550,8 +8092,18 @@ def render_status_text(doc):
         L.append("Recorder page: open; Auto-Rec armed for " + (", ".join(armed) if armed else "nobody"))
     else:
         seen = doc.get("recorderPageLastSeen")
-        L.append("Recorder page: NOT open" + (f" (last seen {seen})" if seen else "") +
-                 " — Auto-Rec only starts recordings while the page is open")
+        sw = doc.get("soloWatch") or {}
+        sw_users = sw.get("users") or []
+        if sw.get("enabled") is not False and sw_users:
+            who = ", ".join(sw_users[:8]) + ("…" if len(sw_users) > 8 else "")
+            L.append("Recorder page: NOT open" + (f" (last seen {seen})" if seen else "") +
+                     f" — helper watching {who} on its own")
+        elif sw.get("enabled") is False:
+            L.append("Recorder page: NOT open" + (f" (last seen {seen})" if seen else "") +
+                     " — solo watch OFF (Auto-Rec will not start without the page)")
+        else:
+            L.append("Recorder page: NOT open" + (f" (last seen {seen})" if seen else "") +
+                     " — no armed streamers persisted for solo watch")
     rec = doc.get("recording") or []
     if rec:
         for r in rec:
@@ -7878,11 +8430,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             # v6.40: ?armed=a,b — page heartbeat of Auto-Rec streamers (keep-awake while armed)
+            # v6.49: ?soloWatch=0|1 — Settings toggle; persisted so it works with the page closed
             try:
                 q = urllib.parse.parse_qs(parsed.query or "", keep_blank_values=True)
                 if "armed" in q:
                     note_armed_heartbeat(q.get("armed", [""])[0])
                     note_page_seen(q.get("armed", [""])[0])  # v6.41 status file
+                if "soloWatch" in q:
+                    raw_sw = (q.get("soloWatch") or ["1"])[0]
+                    on = str(raw_sw).strip().lower() not in ("0", "false", "off", "no")
+                    solo_watch_set_enabled(on, save=True)
             except Exception as e:
                 log(f"armed heartbeat parse failed: {e}")
             self.send_json(health_payload())
@@ -7998,7 +8555,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 set_pipeline_user_pref(username, bool(body.get("afterStream")))
             if "sendOriginal" in body:  # v6.38: per-streamer "send original to Drive" pref
                 set_original_user_pref(username, bool(body.get("sendOriginal")))
-            result = start_record(username, quality)
+            # v6.49: remember start options so solo-watch can reuse them with the page closed
+            try:
+                solo_watch_remember_options(
+                    username,
+                    quality=quality if quality in ("audio_only", "best") else "audio_only",
+                    after_stream=body.get("afterStream") if "afterStream" in body else None,
+                    send_original=body.get("sendOriginal") if "sendOriginal" in body else None,
+                )
+            except Exception as e:
+                log(f"solo watch remember options failed: {e}")
+            result = start_record(username, quality, started_by="page")
             self.send_json(result, status=200 if result.get("ok") else 400)
             return
         if path == "/api/stop":
@@ -8197,6 +8764,12 @@ def main():
     threading.Thread(target=keep_awake_loop, daemon=True, name="keep-awake").start()
     # v6.41: write <Drive target>/Recorder status/<computer>.txt + .json every few minutes
     threading.Thread(target=status_file_loop, daemon=True, name="status-file").start()
+    # v6.49: keep watching armed streamers when the recorder page is closed
+    try:
+        solo_watch_load()
+    except Exception as e:
+        log(f"solo watch load failed: {e}")
+    threading.Thread(target=solo_watch_loop, daemon=True, name="solo-watch").start()
     httpd = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
     # v6.43: unattended GitHub update check (~2 min after start, then every ~3 h; installs when idle)
     threading.Thread(target=auto_update_loop, daemon=True, name="auto-update").start()
@@ -8223,6 +8796,13 @@ def main():
     else:
         log(f"auto-update: {'on' if auto_update_enabled() else 'OFF (Settings)'} — first GitHub check in "
             f"{int(AUTO_UPDATE_FIRST_SECS)}s, then every {AUTO_UPDATE_EVERY_SECS / 3600:g} h; installs only when idle")
+    sw = solo_watch_snapshot()
+    if SOLO_WATCH_SECS <= 0:
+        log("solo watch: disabled by TWITCH_RECORDER_SOLO_WATCH_SECS=0")
+    else:
+        log(f"solo watch: {'on' if sw.get('enabled') else 'OFF'} — when the page is closed, check armed "
+            f"streamers every {int(SOLO_WATCH_SECS)}s"
+            + (f" (persisted: {', '.join(sw.get('users') or [])})" if sw.get("users") else " (no armed list yet)"))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
