@@ -67,7 +67,7 @@
   .drive-pipe-box{margin-top:.6rem;padding:.55rem .65rem;border:1px solid rgba(147,197,253,.25);border-radius:8px;background:rgba(59,130,246,.06);font-size:.78rem;}
   .drive-pipe-box .dp-row{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin:.2rem 0;}
   .dp-badge{display:inline-block;font-size:.68rem;padding:.05rem .4rem;border-radius:999px;margin-left:.3rem;white-space:nowrap;}
-  .dp-badge.sent{background:rgba(16,185,129,.18);color:#6ee7b7;}
+  .dp-badge.sent,.dp-badge.covered{background:rgba(16,185,129,.18);color:#6ee7b7;}
   .dp-badge.waiting,.dp-badge.sending{background:rgba(251,191,36,.15);color:#fcd34d;}
   .dp-badge.error{background:rgba(239,68,68,.18);color:#fca5a5;}
   /* v6.35: Google Drive card */
@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.49</span>
+    <span class="badge">v6.50</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -318,6 +318,9 @@
           </label>
           <label title="v6.49: if this page is closed, Chrome crashes, the tab is discarded, or the computer reboots and only the helper comes back, the helper still watches whoever you left Auto-Rec armed for (persisted under ~/TwitchRecordings/.solo-watch.json) and starts recording when they go live — same path as when this page starts them (supervisor, restart grace, voice removal → Drive). Turn off to require this page open. Needs helper v6.49+." style="margin-left:1rem">
             <input type="checkbox" id="soloWatchToggle" checked onchange="saveSoloWatchToggle()"> Keep recording armed streamers if this page is closed
+          </label>
+          <label title="v6.50: when the same stream is recorded on more than one computer (e.g. the Mac and the PC as backups), only one of them sends its music-only parts to Drive. Each computer that sends leaves a small note in Recorder status/Sent parts/ in your Drive target; another computer that finds a complete set there for the same streamer and time — at least as long as its own recording — skips the voice removal and the duplicate parts (History shows &quot;In Drive from &lt;computer&gt;&quot;). If its own recording is longer (the other one missed part of the stream) it still sends. Originals still go to Drive from every computer; Re-split for Drive always sends. Every computer needs helper v6.50+ for this to work." style="margin-left:1rem">
+            <input type="checkbox" id="oneCopyToggle" checked onchange="saveOneCopyToggle()"> Only one computer sends each stream's parts to Drive
           </label>
         </div>
       </div>
@@ -548,9 +551,9 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.49'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.50'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
-let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, statusToDrive:true, autoUpdate:true, soloWatch:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
+let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, statusToDrive:true, autoUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
@@ -685,6 +688,7 @@ function persist(){
       statusToDrive: cfg.statusToDrive!==false, // v6.41
       autoUpdate: cfg.autoUpdate!==false, // v6.43
       soloWatch: cfg.soloWatch!==false, // v6.49
+      oneCopy: cfg.oneCopy!==false, // v6.50
       homeStreamer: String(cfg.homeStreamer||'').toLowerCase(),
       returnHomeAfterSet: cfg.returnHomeAfterSet!==false,
       // v6.35: Google Drive card (same persist key)
@@ -733,6 +737,7 @@ function restoreSettings(){
     cfg.statusToDrive=data.statusToDrive!==false; // v6.41 default on
     cfg.autoUpdate=data.autoUpdate!==false; // v6.43 default on
     cfg.soloWatch=data.soloWatch!==false; // v6.49 default on
+    cfg.oneCopy=data.oneCopy!==false; // v6.50 default on
     // v6.25: home streamer + return after guest/DJ set
     cfg.homeStreamer=data.homeStreamer?String(data.homeStreamer).toLowerCase():'';
     if(typeof data.returnHomeAfterSet==='boolean') cfg.returnHomeAfterSet=data.returnHomeAfterSet;
@@ -4248,7 +4253,7 @@ function renderHist(){
         drivePipeBtns+='<span class="btn btn-gray btn-sm">Splitting…</span>';
       }else if(musicFile && (isMusicRow || !findSiblingExportRow(musicFile))){
         const bEsc=driveEsc(base).replace(/&#39;/g,"\\'");
-        if(dv && dv.status!=='sent') drivePipeBtns+='<button class="btn btn-purple btn-sm" onclick="pipelineSendNow(\''+bEsc+'\')" title="Copy the parts into Google Drive now">Send to Drive now</button>';
+        if(dv && dv.status!=='sent' && dv.status!=='covered') drivePipeBtns+='<button class="btn btn-purple btn-sm" onclick="pipelineSendNow(\''+bEsc+'\')" title="Copy the parts into Google Drive now">Send to Drive now</button>';
         drivePipeBtns+='<button class="btn btn-gray btn-sm" onclick="pipelineSplitName(\''+driveEsc(musicFile).replace(/&#39;/g,"\\'")+'\')" title="Cut '+driveEsc(musicFile)+' into equal parts under 50 MB (partNofM.ogg) and send them to Drive">'+(dv?'Re-split for Drive':'Split for Drive')+'</button>';
       }
     }
@@ -5067,6 +5072,7 @@ function pipelinePrefsBody(){
     statusToDrive:cfg.statusToDrive!==false, // v6.41
     autoUpdate:cfg.autoUpdate!==false, // v6.43
     soloWatch:cfg.soloWatch!==false, // v6.49
+    oneCopy:cfg.oneCopy!==false, // v6.50
     voiceQuality:normVoiceQuality(cfg.voiceQuality)}; // v6.45
 }
 async function syncPipelinePrefs(force){
@@ -5112,6 +5118,12 @@ function pipelineBadgeHtml(dv){
     tip='In '+(dv.target||'Google Drive')+(dv.sentAt?(' · '+driveDate(dv.sentAt)):'');
     if(dv.localPartsCleared){ txt+=' · local parts cleared'; tip+=' · local Drive parts cleared (Re-split for Drive can recreate)'; }
   }
+  else if(st==='covered'){ // v6.50: another computer already sent this stream
+    const cb=dv.coveredBy||{};
+    const cn=Number(cb.parts||0);
+    txt='☁ In Drive from '+(cb.computer||'another computer')+(cn?(' ('+cn+' part'+(cn===1?'':'s')+')'):'');
+    tip=(dv.note||'Another computer already sent this stream')+(cb.base?(' · their parts: '+cb.base+'-music-part…'):'')+' · Re-split for Drive sends this computer\'s copy anyway';
+  }
   else if(st==='sending'){ txt='⇪ Sending to Drive…'; tip=dv.target||''; }
   else if(st==='error'){ txt='⚠ Drive send failed'; tip=dv.error||'error'; }
   else { txt='⏳ Waiting for Drive ('+n+' part'+pl+' ready)'; tip=(dv.note||'Waiting for Google Drive for Desktop')+' — parts are in ~/TwitchRecordings/Drive parts/'+(dv.base||''); }
@@ -5138,6 +5150,10 @@ function applyPipelineFromHealth(d){
     }else if(dv.status==='waiting' && !prev){
       flashOk('⏳ '+driveEsc(dv.base)+': '+n+' parts ready — waiting for Google Drive for Desktop');
       fireNotify('tar-dp-'+dv.base, 'Parts ready (waiting for Drive)', dv.base+' — '+n+' parts in ~/TwitchRecordings/Drive parts');
+    }else if(dv.status==='covered' && (!prev || prev.status!=='covered')){ // v6.50
+      const cb=dv.coveredBy||{};
+      flashOk('☁ '+driveEsc(dv.base)+': already in Drive from '+driveEsc(cb.computer||'another computer')+' — skipped the duplicate');
+      fireNotify('tar-dp-'+dv.base, 'Already in Drive', dv.base+' — '+(cb.computer||'another computer')+' sent this stream ('+(cb.parts||0)+' parts); skipped the duplicate');
     }else if(dv.status==='error' && (!prev || prev.status!=='error')){
       flashErr('Drive send failed ('+driveEsc(dv.base)+'): '+driveEsc(dv.error||'unknown'));
       fireNotify('tar-dp-'+dv.base, 'Drive send failed', dv.error||'');
@@ -5355,6 +5371,23 @@ function saveAutoUpdateToggle(){
   if(cfg.autoUpdate && helper.ok && helper.version && helperVerLt(helper.version,'6.43')) msg+=' This helper (v'+helper.version+') is too old to update itself; this page will install the update once when it is idle (or click Check for updates → Install update now).';
   flashOk(msg);
   setTimeout(function(){ pingHelperAndStatus().catch(function(){}); }, 1500);
+}
+
+// v6.50: only one computer (of Mac / PC / rig recording the same stream) sends its parts to Drive
+function initOneCopyToggle(){
+  const el=document.getElementById('oneCopyToggle');
+  if(el) el.checked=cfg.oneCopy!==false;
+}
+function saveOneCopyToggle(){
+  const el=document.getElementById('oneCopyToggle');
+  cfg.oneCopy=el?!!el.checked:true;
+  persist();
+  syncPipelinePrefs(true);
+  let msg=cfg.oneCopy
+    ? 'One copy per stream: if another computer already sent this stream\'s parts to Drive, this computer skips its duplicate (it still sends if its own recording is longer).'
+    : 'One copy per stream off — this computer removes the voice and sends its own parts for every stream, even when another computer already did.';
+  if(helper.ok && helper.version && helperVerLt(helper.version,'6.50')) msg+=' Needs helper v6.50 — Check for updates → Install update.';
+  flashOk(msg);
 }
 
 // v6.49: helper keeps watching armed streamers when this page is closed
@@ -5706,6 +5739,7 @@ initKeepAwakeToggle(); // v6.40
 initStatusFileToggle(); // v6.41
 initAutoUpdateToggle(); // v6.43
 initSoloWatchToggle(); // v6.49
+initOneCopyToggle(); // v6.50
 initDriveCard();
 updateHomeStreamerUI();
 renderStreamers();

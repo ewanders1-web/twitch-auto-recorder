@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.49"
+HELPER_VERSION = "6.50"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -2914,6 +2914,51 @@ def self_test():
         with STATUS_FILE_LOCK:
             PAGE_SEEN["at"] = prev_page["at"]
             PAGE_SEEN["armed"] = prev_page["armed"]
+    # v6.50: one copy per stream — manifest matching (temp folder, no Drive needed)
+    import tempfile as _tmp_oc
+    with _tmp_oc.TemporaryDirectory(prefix="tar-onecopy-") as td:
+        tgt = Path(td)
+        u, st0 = parse_recording_stamp("whistleface-Fri-2026-10-16T19-02-13-music-part1of7.ogg")
+        assert u == "whistleface" and st0, (u, st0)
+        assert parse_recording_stamp("not-a-recording.ogg") == (None, None)
+        assert find_other_copy(str(tgt), u, st0, 4 * 3600) == (None, None)
+        md = _sent_manifest_dir(tgt)
+        md.mkdir(parents=True)
+        other = "whistleface-Fri-2026-10-16T19-02-41"
+        parts = []
+        for i in range(1, 3):
+            nm = f"{other}-music-part{i}of2.ogg"
+            (tgt / nm).write_bytes(b"x" * (100 + i))
+            parts.append({"name": nm, "size": 100 + i})
+        doc = {"kind": "twitch-recorder-sent-parts", "v": 1, "computer": "OtherBox-SelfTest",
+               "base": other, "username": "whistleface", "startEpoch": st0 + 28,
+               "durationSecs": 4 * 3600 - 60, "state": "sent", "parts": parts, "updatedAt": time.time()}
+        (md / f"{other}__OtherBox-SelfTest.json").write_text(json.dumps(doc), encoding="utf-8")
+        k, _d = find_other_copy(str(tgt), "whistleface", st0, 4 * 3600)
+        assert k == "sent", k
+        # ours is much longer (other missed ~40 min) → still send ours
+        assert find_other_copy(str(tgt), "whistleface", st0, 4 * 3600 + 2400)[0] is None
+        # different streamer / different day → not covered
+        assert find_other_copy(str(tgt), "sweetdeesauce", st0, 4 * 3600)[0] is None
+        assert find_other_copy(str(tgt), "whistleface", st0 + 2 * 86400, 4 * 3600)[0] is None
+        # a part removed from Drive → not covered
+        (tgt / parts[1]["name"]).unlink()
+        assert find_other_copy(str(tgt), "whistleface", st0, 4 * 3600)[0] is None
+        # fresh "sending" claim → wait; stale claim → ignore
+        doc["state"] = "sending"
+        (md / f"{other}__OtherBox-SelfTest.json").write_text(json.dumps(doc), encoding="utf-8")
+        assert find_other_copy(str(tgt), "whistleface", st0, 4 * 3600)[0] == "sending"
+        assert find_other_copy(str(tgt), "whistleface", st0, 4 * 3600,
+                               now=time.time() + ONE_COPY_CLAIM_STALE_SECS + 5)[0] is None
+        # our own manifest never covers us
+        assert write_sent_manifest(str(tgt), "whistleface-Fri-2026-10-16T19-02-13", "sent",
+                                   parts=[{"name": parts[0]["name"], "size": parts[0]["size"]}],
+                                   duration=5 * 3600)
+        assert (md / f"whistleface-Fri-2026-10-16T19-02-13__{computer_name()}.json").is_file()
+        doc["state"] = "error"
+        (md / f"{other}__OtherBox-SelfTest.json").write_text(json.dumps(doc), encoding="utf-8")
+        assert find_other_copy(str(tgt), "whistleface", st0, 4 * 3600)[0] is None
+        assert _covered_note({"computer": "PC", "parts": [1, 2], "durationSecs": 600}).startswith("Already in Drive from PC")
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -2932,6 +2977,8 @@ def _pipeline_health_summary():
         "computer": computer_name(),
         "waiting": sum(1 for d in dels if d.get("status") == "waiting"),
         "errors": sum(1 for d in dels if d.get("status") == "error"),
+        "covered": sum(1 for d in dels if d.get("status") == "covered"),  # v6.50
+        "oneCopy": one_copy_enabled(),  # v6.50
         "sending": bool(DELIVERY_STATE.get("busy")),
         "driveFound": bool(detect_drive_roots()),
     }
@@ -5954,6 +6001,8 @@ def _pipeline_load():
         PIPELINE["autoUpdate"] = data.get("autoUpdate") is not False
         # v6.49: mirror of solo-watch enabled (authoritative copy is .solo-watch.json)
         PIPELINE["soloWatch"] = data.get("soloWatch") is not False
+        # v6.50: only one computer sends each stream's parts to Drive (default on)
+        PIPELINE["oneCopy"] = data.get("oneCopy") is not False
         # v6.45: voice-removal quality (auto = Better when demucs installed, else Fast)
         PIPELINE["voiceQuality"] = _norm_voice_quality(data.get("voiceQuality")) or "auto"
         # v6.44: after-stream jobs that were queued/running when the helper last stopped
@@ -6386,6 +6435,8 @@ def _sync_jobs_with_delivery(base, snap):
         msg = f"{n} parts ready — Drive send failed: {snap.get('error')}"
     elif st == "waiting":
         msg = f"Waiting for Drive ({n} part{pl} ready)"
+    elif st == "covered":  # v6.50
+        msg = snap.get("note") or "Already in Drive from another computer — skipped the duplicate"
     else:
         return
     with MUSIC_JOBS_LOCK:
@@ -6526,7 +6577,8 @@ def deliver_one(base):
             return None
         d = dict(d)
     # v6.37: already sent (local parts may already be cleared) — do not re-copy
-    if d.get("status") == "sent":
+    # v6.50: covered = another computer already put this stream in Drive
+    if d.get("status") in ("sent", "covered"):
         return d
     roots = detect_drive_roots()
     if not roots:
@@ -6540,9 +6592,25 @@ def deliver_one(base):
         target, err = None, f"cannot create target folder: {e}"
     if err or not target:
         return _delivery_update(base, status="error", error=err or "no target", lastAttempt=time.time())
+    # v6.50: one copy per stream across computers (manual Split for Drive always sends)
+    one_copy = one_copy_enabled()
+    cov_user, cov_start = parse_recording_stamp(base)
+    cov_dur = float(d.get("partSecs") or 0) * len(d.get("parts") or [])
+    if one_copy and d.get("source") == "stream":
+        kind, doc = find_other_copy(target, cov_user, cov_start, cov_dur)
+        if kind == "sent":
+            return mark_delivery_covered(base, doc, target)
+        if kind == "sending":
+            return _delivery_update(
+                base, status="waiting", error=None, target=target, lastAttempt=time.time(),
+                note=(f"{doc.get('computer') or 'Another computer'} is sending this stream to Drive right now — "
+                      "checking again in a minute (this computer sends its own parts if that doesn't finish)"))
     _delivery_update(base, status="sending", error=None, target=target, lastAttempt=time.time(), note=None)
+    if one_copy:
+        write_sent_manifest(target, base, "sending", duration=cov_dur, user=cov_user, start=cov_start)
     DELIVERY_STATE["busy"] = True
     DELIVERY_STATE["base"] = base
+    placed = []
     try:
         for nm in d.get("parts") or []:
             src = Path(d["partsDir"]) / nm
@@ -6550,9 +6618,15 @@ def deliver_one(base):
                 raise RuntimeError(f"local part missing ({nm}) — use Split for Drive again")
             # v6.38: same name+size already in Drive → skip; different size → <name>-<Computer>
             # (a manual Re-split from this computer may replace its own earlier parts)
-            place_in_drive(src, Path(target), nm, allow_replace=(d.get("source") == "manual"))
+            dest, _act = place_in_drive(src, Path(target), nm, allow_replace=(d.get("source") == "manual"))
+            try:
+                placed.append({"name": Path(dest).name, "size": int(src.stat().st_size)})
+            except OSError:
+                placed.append({"name": Path(dest).name, "size": -1})
         # Mark sent first so a crash mid-clear does not leave status=waiting with missing parts
         snap = _delivery_update(base, status="sent", sentAt=time.time(), target=target, error=None)
+        if one_copy:  # v6.50: tell the other computers this stream is in Drive
+            write_sent_manifest(target, base, "sent", parts=placed, duration=cov_dur, user=cov_user, start=cov_start)
         log(f"drive delivery sent base={base} parts={len(d.get('parts') or [])} → {target}")
         # v6.37: free local Drive parts after successful send (full -music.ogg kept)
         freed = clear_local_drive_parts(base)
@@ -6565,6 +6639,8 @@ def deliver_one(base):
     except Exception as e:
         log(f"drive delivery error base={base}: {e}")
         msg = drive_permission_message() if isinstance(e, PermissionError) else (str(e) or type(e).__name__)
+        if one_copy:  # v6.50: drop our "sending" claim so other computers don't wait on it
+            write_sent_manifest(target, base, "error", parts=placed, duration=cov_dur, user=cov_user, start=cov_start)
         return _delivery_update(base, status="error", error=msg)
     finally:
         DELIVERY_STATE["busy"] = False
@@ -6593,6 +6669,9 @@ def cleanup_drive_target_partials(target, reason="tick"):
         status_dir = root / STATUS_SUBDIR  # v6.41
         if status_dir.is_dir():
             dirs.append(status_dir)
+            sent_dir = status_dir / SENT_MANIFEST_SUBDIR  # v6.50
+            if sent_dir.is_dir():
+                dirs.append(sent_dir)
     except OSError as e:
         log(f"drive target partial cleanup ({reason}): Originals check skipped: {e}")
     now = time.time()
@@ -6697,7 +6776,7 @@ def deliveries_snapshot(limit=60):
             out.append({k: d.get(k) for k in (
                 "base", "musicName", "parts", "sizes", "partSecs", "status", "target",
                 "sentAt", "error", "note", "source", "createdAt", "updatedAt",
-                "localPartsCleared")})
+                "localPartsCleared", "coveredBy")})
     return out
 
 
@@ -6710,7 +6789,8 @@ def pipeline_status_payload():
                  "origUsers": dict(PIPELINE.get("origUsers") or {}),
                  "statusToDrive": PIPELINE.get("statusToDrive", True) is not False,
                  "autoUpdate": PIPELINE.get("autoUpdate", True) is not False,  # v6.43
-                 "voiceQuality": _norm_voice_quality(PIPELINE.get("voiceQuality")) or "auto"}  # v6.45
+                 "voiceQuality": _norm_voice_quality(PIPELINE.get("voiceQuality")) or "auto",  # v6.45
+                 "oneCopy": PIPELINE.get("oneCopy", True) is not False}  # v6.50
     return {
         "ok": True, "driveFound": bool(roots), "prefs": prefs,
         "resolvedTarget": target, "targetKind": kind, "targetError": err,
@@ -6722,6 +6802,7 @@ def pipeline_status_payload():
         "computer": computer_name(),
         "statusFile": status_file_snapshot(),  # v6.41
         "voiceQuality": voice_quality_snapshot(),  # v6.45
+        "oneCopy": one_copy_enabled(),  # v6.50
     }
 
 
@@ -6768,6 +6849,13 @@ def api_pipeline_prefs(body):
                 AUTO_UPDATE_WAKE.set()
                 STATUS_FILE_WAKE.set()
             PIPELINE["autoUpdate"] = on
+            changed = True
+        if "oneCopy" in body:  # v6.50: only one computer sends each stream to Drive
+            on = bool(body.get("oneCopy"))
+            if PIPELINE.get("oneCopy", True) is not on:
+                log(f"one-copy pref: {'on' if on else 'off'}")
+                STATUS_FILE_WAKE.set()
+            PIPELINE["oneCopy"] = on
             changed = True
         if "soloWatch" in body:  # v6.49: keep watching when page closed
             # Persist on SOLO_WATCH (dedicated file); also mirror into PIPELINE for status dumps
@@ -6829,6 +6917,8 @@ def _split_and_deliver(job_id, music_path, source, progress, pct=95):
             msg += " · local parts cleared"
     elif st == "error":
         msg = f"{len(names)} parts ready — Drive send failed: {snap.get('error')}"
+    elif st == "covered":  # v6.50
+        msg = snap.get("note") or "Already in Drive from another computer — skipped the duplicate"
     else:
         msg = f"Waiting for Drive ({len(names)} part{'s' if len(names) != 1 else ''} ready)"
     return base, names, part_secs, st, msg
@@ -6865,6 +6955,17 @@ def pipeline_worker(job_id):
             if lead >= 1.0:
                 note += f" · leading silence {lead:.0f}s (info only)"
             _set_music_job(job_id, info=note, duration=total)
+            # v6.50: another computer already sent this stream's parts → skip hours of voice removal
+            cov = one_copy_precheck(_job_get(job_id, "username"), paths[0].name, total)
+            if cov:
+                doc, cov_target = cov
+                cbase = music_base_stem(paths[0].name)
+                snap = register_covered_delivery(cbase, doc, cov_target)
+                cmsg = (snap or {}).get("note") or "Already in Drive from another computer — skipped"
+                _set_music_job(job_id, status="done", phase="done", progress=cmsg, progressPct=100,
+                               deliveryStatus="covered", base=cbase, error=None, finishedAt=time.time())
+                log(f"pipeline skipped job={job_id}: {cmsg}")
+                return
             # Disk-low pause (Auto): wait while under diskWarn instead of starting demucs.
             paused = False
             while disk_status().get("diskWarn"):
@@ -7165,6 +7266,214 @@ def place_in_drive(src, dest_dir, name, allow_replace=False):
     dest = dest_dir / _host_variant(name)
     atomic_copy(src, dest)
     return dest, "replaced"
+
+
+# ─── v6.50: ONE COPY PER STREAM ACROSS COMPUTERS ─────────────────────────────
+# The same stream is recorded on several computers as a backup (Mac, PC, Twitch rig). Each used to
+# remove the voice and send its own full set of parts, so Drive got two or three sets (the later ones
+# as …-<Computer>.ogg). Now a computer that sends a stream's parts also drops a small manifest in
+# <Drive target>/Recorder status/Sent parts/<base>__<computer>.json ("sending" while copying, "sent"
+# with the exact Drive names + sizes when done). Before voice removal, and again right before sending,
+# a computer reads those manifests: when another computer already has a complete set in Drive for the
+# same streamer and overlapping time that is at least as long as ours (within max(3 min, 2 %)), this
+# computer skips the duplicate (status "covered"). A shorter set — that computer missed part of the
+# stream — never blocks a longer one, a missing/renamed part file means "not covered", and a fresh
+# "sending" claim just makes us wait (it goes stale after 30 min). Manual Split for Drive always
+# sends. Originals → Drive are unchanged. Settings toggle oneCopy (default on); env
+# TWITCH_RECORDER_ONE_COPY=0 hard-off.
+SENT_MANIFEST_SUBDIR = "Sent parts"
+ONE_COPY_CLAIM_STALE_SECS = float(os.environ.get("TWITCH_RECORDER_ONE_COPY_CLAIM_SECS") or 1800)
+ONE_COPY_TOL_SECS = float(os.environ.get("TWITCH_RECORDER_ONE_COPY_TOL_SECS") or 180)
+ONE_COPY_ENV_OFF = (os.environ.get("TWITCH_RECORDER_ONE_COPY") or "").strip() == "0"
+_REC_STAMP_RE = _re_drive.compile(
+    r"^(?P<user>[a-z0-9_]+)-(?:[A-Za-z]{3}-)?(?P<d>\d{4}-\d{2}-\d{2})T(?P<t>\d{2}-\d{2}-\d{2})")
+
+
+def one_copy_enabled():
+    if ONE_COPY_ENV_OFF:
+        return False
+    with PIPELINE_LOCK:
+        return PIPELINE.get("oneCopy", True) is not False
+
+
+def parse_recording_stamp(name):
+    """(username, start epoch) from username-Wkd-YYYY-MM-DDTHH-MM-SS…; (None, None) if not ours."""
+    m = _REC_STAMP_RE.match(os.path.basename(str(name or "")))
+    if not m:
+        return None, None
+    try:
+        st = time.strptime(m.group("d") + " " + m.group("t"), "%Y-%m-%d %H-%M-%S")
+        return m.group("user"), float(time.mktime(st))
+    except (ValueError, OverflowError):
+        return m.group("user"), None
+
+
+def _sent_manifest_dir(target):
+    return Path(target) / STATUS_SUBDIR / SENT_MANIFEST_SUBDIR
+
+
+def write_sent_manifest(target, base, state, parts=None, duration=None, user=None, start=None):
+    """Write <target>/Recorder status/Sent parts/<base>__<computer>.json. Soft: never raises."""
+    try:
+        if user is None or start is None:
+            u2, s2 = parse_recording_stamp(base)
+            user = user or u2
+            start = start if start is not None else s2
+        doc = {"kind": "twitch-recorder-sent-parts", "v": 1, "helperVersion": HELPER_VERSION,
+               "computer": computer_name(), "base": base, "username": user, "startEpoch": start,
+               "startedAt": _iso_local(start) if start else None,
+               "durationSecs": round(float(duration or 0), 1), "state": state,
+               "parts": list(parts or []), "updatedAt": time.time()}
+        d = _sent_manifest_dir(target)
+        d.mkdir(parents=True, exist_ok=True)
+        _status_atomic_write(d / f"{base}__{computer_name()}.json",
+                             json.dumps(doc, indent=1).encode("utf-8"))
+        return True
+    except Exception as e:
+        log(f"one-copy: manifest write failed base={base}: {e}")
+        return False
+
+
+def _read_sent_manifests(target):
+    out = []
+    d = _sent_manifest_dir(target)
+    try:
+        if not d.is_dir():
+            return out
+        for p in d.glob("*.json"):
+            if p.name.startswith("."):
+                continue
+            try:
+                doc = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(doc, dict) and doc.get("kind") == "twitch-recorder-sent-parts":
+                out.append(doc)
+    except OSError as e:
+        log(f"one-copy: cannot read {d}: {e}")
+    return out
+
+
+def _manifest_parts_present(target, doc):
+    """Every part the other computer listed is still in the target with the same size."""
+    parts = doc.get("parts") or []
+    if not parts:
+        return False
+    for p in parts:
+        if not isinstance(p, dict):
+            return False
+        nm = os.path.basename(str(p.get("name") or ""))
+        if not nm or nm in (".", ".."):
+            return False
+        try:
+            if (Path(target) / nm).stat().st_size != int(p.get("size")):
+                return False
+        except (OSError, TypeError, ValueError):
+            return False
+    return True
+
+
+def find_other_copy(target, user, start, duration, now=None):
+    """('sent', doc) when another computer's complete set in Drive covers this stream,
+    ('sending', doc) when another computer is sending one right now, else (None, None)."""
+    try:
+        duration = float(duration or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if not target or not user or not start or duration <= 0:
+        return None, None
+    now = time.time() if now is None else now
+    me = computer_name().lower()
+    tol = max(ONE_COPY_TOL_SECS, 0.02 * duration)
+    sending = (None, None)
+    for doc in _read_sent_manifests(target):
+        if str(doc.get("computer") or "").lower() == me:
+            continue
+        if str(doc.get("username") or "").lower() != str(user).lower():
+            continue
+        try:
+            o_start = float(doc.get("startEpoch"))
+            o_dur = float(doc.get("durationSecs"))
+        except (TypeError, ValueError):
+            continue
+        if o_dur + tol < duration:
+            continue  # theirs is shorter (missed part of the stream) — ours is worth sending
+        overlap = min(start + duration, o_start + o_dur) - max(start, o_start)
+        if overlap < 0.5 * duration:
+            continue  # a different broadcast
+        st = doc.get("state")
+        if st == "sent" and _manifest_parts_present(target, doc):
+            return "sent", doc
+        if st == "sending" and now - float(doc.get("updatedAt") or 0) < ONE_COPY_CLAIM_STALE_SECS:
+            sending = ("sending", doc)
+    return sending
+
+
+def _covered_note(doc):
+    comp = doc.get("computer") or "another computer"
+    n = len(doc.get("parts") or [])
+    mins = float(doc.get("durationSecs") or 0) / 60
+    return (f"Already in Drive from {comp} ({n} part{'s' if n != 1 else ''}, {mins:.0f} min) — "
+            "skipped the duplicate")
+
+
+def _covered_by(doc):
+    return {"computer": doc.get("computer"), "base": doc.get("base"),
+            "parts": len(doc.get("parts") or []), "durationSecs": doc.get("durationSecs"),
+            "partNames": [p.get("name") for p in (doc.get("parts") or []) if isinstance(p, dict)][:40]}
+
+
+def mark_delivery_covered(base, doc, target):
+    note = _covered_note(doc)
+    snap = _delivery_update(base, status="covered", coveredBy=_covered_by(doc), note=note,
+                            target=target, error=None, lastAttempt=time.time())
+    log(f"one-copy: {base} already in Drive from {doc.get('computer')} ({doc.get('base')}) — not sending duplicate parts")
+    freed = clear_local_drive_parts(base)  # full -music.ogg is kept; Re-split for Drive can send anyway
+    snap = _delivery_update(base, localPartsCleared=True, partsDir=None) or snap
+    if freed:
+        log(f"one-copy: cleared local parts base={base} freed={freed} bytes")
+    STATUS_FILE_WAKE.set()
+    return snap
+
+
+def register_covered_delivery(base, doc, target):
+    """Pre-voice-removal skip: record a delivery entry so History / status file show why."""
+    now = time.time()
+    with PIPELINE_LOCK:
+        prev = PIPELINE["deliveries"].get(base)
+        if prev and prev.get("status") in ("sent", "sending"):
+            return dict(prev)
+        PIPELINE["deliveries"][base] = {
+            "base": base, "musicName": None, "partsDir": None, "parts": [], "sizes": [], "partSecs": 0,
+            "status": "covered", "target": target, "sentAt": None, "error": None,
+            "note": _covered_note(doc), "coveredBy": _covered_by(doc), "source": "stream",
+            "createdAt": now, "updatedAt": now, "lastAttempt": now, "localPartsCleared": True,
+        }
+        snap = dict(PIPELINE["deliveries"][base])
+    _pipeline_save()
+    STATUS_FILE_WAKE.set()
+    return snap
+
+
+def one_copy_precheck(username, first_name, duration):
+    """Before voice removal: (doc, target) when another computer already sent this stream."""
+    if not one_copy_enabled():
+        return None
+    try:
+        roots = detect_drive_roots()
+        if not roots:
+            return None
+        target, _kind, err = resolve_delivery_target(roots, create=False)
+        if err or not target:
+            return None
+        u, start = parse_recording_stamp(first_name)
+        user = (username or u or "").lower()
+        kind, doc = find_other_copy(target, user, start, duration)
+        if kind == "sent":
+            return doc, target
+    except Exception as e:
+        log(f"one-copy precheck skipped: {e}")
+    return None
 
 
 def original_enabled_for(username):
@@ -8021,6 +8330,8 @@ def build_status_doc(now=None):
             "targetError": terr,
             "autoSend": pipe_on,
             "sendOriginals": orig_on,
+            "oneCopyPerStream": one_copy_enabled(),  # v6.50
+            "partsSkippedAsDuplicate": sum(1 for d in all_dels if d.get("status") == "covered"),
             "partsWaiting": sum(1 for d in all_dels if d.get("status") == "waiting"),
             "partsSending": sum(1 for d in all_dels if d.get("status") == "sending"),
             "partsErrors": sum(1 for d in all_dels if d.get("status") == "error"),
@@ -8138,6 +8449,10 @@ def render_status_text(doc):
         L.append(line)
     L.append(f"Drive sends: {d.get('partsWaiting', 0)} part sets waiting, {d.get('partsErrors', 0)} failed;"
              f" {d.get('originalsWaiting', 0)} originals waiting, {d.get('originalsErrors', 0)} failed")
+    if "oneCopyPerStream" in d:  # v6.50
+        L.append("One copy per stream: " + (
+            "on — this computer skips voice removal / parts when another computer already sent that stream"
+            if d.get("oneCopyPerStream") else "OFF — this computer sends its own parts for every stream"))
     for x in d.get("recentDeliveries") or []:
         line = f"  parts {x['base']}: {x['status']}"
         if x.get("sentAt"):
