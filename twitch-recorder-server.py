@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.50"
+HELPER_VERSION = "6.51"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -281,8 +281,43 @@ def append_finished_segment_locked(rec, path):
         segs.append(name)
 
 
+# v6.51: a log line must never break the work it describes. On Windows, when the helper's output
+# goes to a file or pipe (Start-Process / Task Scheduler / a launcher capturing it, or the auto-update
+# self-test), Python writes it in the old Windows code page (cp1252) and raises on characters that
+# page doesn't have (e.g. "→"). The success lines for Drive sends contain "→", so every part set and
+# original that reached Drive was then marked "error" ('charmap' codec can't encode …), local parts were
+# never cleared and the one-copy note said "error". A closed console / dead pipe raises OSError the same
+# way. log() now falls back to an escaped copy of the line, or drops it, and never raises.
+LOG_WRITE_ERRORS = [0]  # v6.51: lines that could not be written as-is (shown in /api/health.logWriteErrors)
+
+
+def _harden_stdio():
+    """v6.51: unknown characters become \\uXXXX instead of raising (stdout and stderr). Never raises."""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        try:
+            if stream is not None and hasattr(stream, "reconfigure"):
+                stream.reconfigure(errors="backslashreplace")
+        except Exception:
+            pass
+
+
 def log(msg):
-    print(f"[recorder] {msg}", flush=True)
+    line = f"[recorder] {msg}"
+    try:
+        print(line, flush=True)
+        return
+    except UnicodeEncodeError:
+        pass
+    except Exception:  # stdout closed / broken pipe / no console — never stop the caller
+        LOG_WRITE_ERRORS[0] += 1
+        return
+    LOG_WRITE_ERRORS[0] += 1
+    try:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(line.encode(enc, "backslashreplace").decode(enc, "replace"), flush=True)
+    except Exception:
+        pass
 
 
 def safe_username(raw):
@@ -2959,8 +2994,95 @@ def self_test():
         (md / f"{other}__OtherBox-SelfTest.json").write_text(json.dumps(doc), encoding="utf-8")
         assert find_other_copy(str(tgt), "whistleface", st0, 4 * 3600)[0] is None
         assert _covered_note({"computer": "PC", "parts": [1, 2], "durationSecs": 600}).startswith("Already in Drive from PC")
+    _self_test_cp1252_sends()  # v6.51
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
+
+
+def _self_test_cp1252_sends():
+    """v6.51: with Windows-style cp1252 (strict) output, log() must not raise and a finished Drive send
+    (parts + original) must stay "sent". Temp recordings dir + temp fake Drive; real state untouched."""
+    import io as _io
+    import tempfile as _tmp51
+    global REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE
+    real_out = sys.stdout
+    # 1) log() on a cp1252 stream and on a closed stream
+    buf = _io.BytesIO()
+    sys.stdout = _io.TextIOWrapper(buf, encoding="cp1252", errors="strict", write_through=True)
+    try:
+        log("self-test arrow → done")
+        sys.stdout.flush()
+        assert b"\\u2192" in buf.getvalue(), buf.getvalue()
+        dead = _io.TextIOWrapper(_io.BytesIO(), encoding="utf-8")
+        dead.close()
+        sys.stdout = dead
+        log("self-test closed stdout")  # must not raise
+    finally:
+        sys.stdout = real_out
+    # 2) a full parts + original send while stdout is cp1252
+    saved = {k: (os.environ.get(k)) for k in ("TWITCH_RECORDER_CLOUDSTORAGE", "TWITCH_RECORDER_DRIVE_VOLUMES")}
+    prev_g = (REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE)
+    with PIPELINE_LOCK:
+        prev_p = {k: (json.loads(json.dumps(PIPELINE.get(k))) if k in PIPELINE else None)
+                  for k in ("deliveries", "originals", "target", "oneCopy")}
+    try:
+        with _tmp51.TemporaryDirectory(prefix="tar-cp1252-") as td:
+            td = Path(td)
+            REC_DIR = td / "rec"
+            DRIVE_PARTS_DIR = REC_DIR / "Drive parts"
+            PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
+            my_drive = td / "CloudStorage" / "GoogleDrive-selftest@example.com" / "My Drive"
+            tgt = my_drive / "Twitch"
+            tgt.mkdir(parents=True)
+            REC_DIR.mkdir(parents=True)
+            os.environ["TWITCH_RECORDER_CLOUDSTORAGE"] = str(td / "CloudStorage")
+            os.environ["TWITCH_RECORDER_DRIVE_VOLUMES"] = ""
+            base = "selftestcp-Mon-2026-10-19T19-00-00"
+            pdir = DRIVE_PARTS_DIR / base
+            pdir.mkdir(parents=True)
+            names = [f"{base}-music-part{i}of2.ogg" for i in (1, 2)]
+            for nm in names:
+                (pdir / nm).write_bytes(b"o" * 300)
+            orig = f"{base}.ogg"
+            (REC_DIR / orig).write_bytes(b"r" * 9000)
+            with PIPELINE_LOCK:
+                PIPELINE["deliveries"] = {}
+                PIPELINE["originals"] = {}
+                PIPELINE["target"] = os.path.realpath(str(tgt))
+                PIPELINE["oneCopy"] = True
+            register_delivery(base, f"{base}-music.ogg", pdir, names, 600.0, "stream")
+            register_original(orig, "selftestcp", "stream")
+            buf2 = _io.BytesIO()
+            sys.stdout = _io.TextIOWrapper(buf2, encoding="cp1252", errors="strict", write_through=True)
+            try:
+                snap = deliver_one(base) or {}
+                osnap = deliver_original(orig) or {}
+            finally:
+                sys.stdout = real_out
+            assert snap.get("status") == "sent", snap
+            assert snap.get("localPartsCleared") is True and not pdir.exists(), snap
+            assert all((Path(PIPELINE["target"]) / nm).is_file() for nm in names)
+            if one_copy_enabled():  # TWITCH_RECORDER_ONE_COPY=0 writes no note
+                man = json.loads((_sent_manifest_dir(PIPELINE["target"]) / f"{base}__{computer_name()}.json")
+                                 .read_text(encoding="utf-8"))
+                assert man.get("state") == "sent", man
+            assert osnap.get("status") == "sent", osnap
+            assert (Path(PIPELINE["target"]) / ORIGINALS_SUBDIR / orig).is_file()
+            assert (REC_DIR / orig).is_file()  # local original kept
+    finally:
+        sys.stdout = real_out
+        REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE = prev_g
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        with PIPELINE_LOCK:
+            for k, v in prev_p.items():
+                if v is None:
+                    PIPELINE.pop(k, None)
+                else:
+                    PIPELINE[k] = v
 
 
 def _pipeline_health_summary():
@@ -3036,6 +3158,9 @@ def health_payload():
         "driveAccess": drive_access_snapshot(),  # v6.47: sticky banner when FDA/Drive blocks
         "autoUpdate": auto_update_snapshot(),  # v6.43
         "soloWatch": solo_watch_snapshot(),  # v6.49
+        # v6.51: log lines the console/log file couldn't take as-is (Windows code page, closed pipe)
+        "logWriteErrors": int(LOG_WRITE_ERRORS[0]),
+        "logEncoding": str(getattr(sys.stdout, "encoding", None) or ""),
         "seamlessJobs": seamless_jobs_for_health(),
         "updateRepo": f"https://github.com/{UPDATE_REPO}",
         # v6.29: last orphan temp cleanup (UI one-shot flash when non-zero after reconnect)
@@ -3233,6 +3358,7 @@ def _remux_instrumental(wav_path, dest_path):
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8", errors="replace",  # v6.51: not the Windows code page
                 timeout=600,
             )
             if r.returncode == 0 and out.is_file() and out.stat().st_size > 0:
@@ -5045,7 +5171,7 @@ def probe_media(path):
         [fp, "-v", "error", "-show_entries",
          "format=duration,format_name:stream=codec_type,codec_name",
          "-of", "json", str(path)],
-        capture_output=True, text=True, timeout=180,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,  # v6.51
     )
     try:
         data = json.loads(r.stdout or "{}")
@@ -5078,7 +5204,7 @@ def detect_leading_silence(path, max_scan=900):
         r = subprocess.run(
             [ff, "-nostdin", "-hide_banner", "-t", str(max_scan), "-i", str(path),
              "-vn", "-af", "silencedetect=noise=-50dB:d=2", "-f", "null", "-"],
-            capture_output=True, text=True, timeout=600,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600,  # v6.51
         )
     except (OSError, subprocess.TimeoutExpired):
         return 0.0
@@ -5329,7 +5455,7 @@ def _audio_channels(path):
         r = subprocess.run(
             [fp, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=channels",
              "-of", "default=nw=1:nk=1", str(path)],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,  # v6.51
         )
         return int((r.stdout or "").strip().splitlines()[0])
     except Exception:
@@ -6301,7 +6427,8 @@ def split_music_for_drive(job_id, src, progress=None):
             if job_id:
                 rc, tail = _job_run_proc(job_id, cmd, timeout=3 * 3600)
             else:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=3 * 3600)
+                r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", timeout=3 * 3600)  # v6.51
                 rc, tail = r.returncode, (r.stderr or "")
             if rc != 0:
                 raise RuntimeError(f"ffmpeg split failed: {tail[-400:]}")
@@ -6612,36 +6739,41 @@ def deliver_one(base):
     DELIVERY_STATE["base"] = base
     placed = []
     try:
-        for nm in d.get("parts") or []:
-            src = Path(d["partsDir"]) / nm
-            if not src.is_file():
-                raise RuntimeError(f"local part missing ({nm}) — use Split for Drive again")
-            # v6.38: same name+size already in Drive → skip; different size → <name>-<Computer>
-            # (a manual Re-split from this computer may replace its own earlier parts)
-            dest, _act = place_in_drive(src, Path(target), nm, allow_replace=(d.get("source") == "manual"))
-            try:
-                placed.append({"name": Path(dest).name, "size": int(src.stat().st_size)})
-            except OSError:
-                placed.append({"name": Path(dest).name, "size": -1})
-        # Mark sent first so a crash mid-clear does not leave status=waiting with missing parts
+        try:
+            for nm in d.get("parts") or []:
+                src = Path(d["partsDir"]) / nm
+                if not src.is_file():
+                    raise RuntimeError(f"local part missing ({nm}) — use Split for Drive again")
+                # v6.38: same name+size already in Drive → skip; different size → <name>-<Computer>
+                # (a manual Re-split from this computer may replace its own earlier parts)
+                dest, _act = place_in_drive(src, Path(target), nm, allow_replace=(d.get("source") == "manual"))
+                try:
+                    placed.append({"name": Path(dest).name, "size": int(src.stat().st_size)})
+                except OSError:
+                    placed.append({"name": Path(dest).name, "size": -1})
+        except Exception as e:
+            log(f"drive delivery error base={base}: {e}")
+            msg = drive_permission_message() if isinstance(e, PermissionError) else (str(e) or type(e).__name__)
+            if one_copy:  # v6.50: drop our "sending" claim so other computers don't wait on it
+                write_sent_manifest(target, base, "error", parts=placed, duration=cov_dur, user=cov_user, start=cov_start)
+            return _delivery_update(base, status="error", error=msg)
+        # Every part is in Drive. Mark sent first so a crash mid-clear does not leave status=waiting
+        # with missing parts; v6.51: nothing after this point may turn a finished send into "error".
         snap = _delivery_update(base, status="sent", sentAt=time.time(), target=target, error=None)
-        if one_copy:  # v6.50: tell the other computers this stream is in Drive
-            write_sent_manifest(target, base, "sent", parts=placed, duration=cov_dur, user=cov_user, start=cov_start)
-        log(f"drive delivery sent base={base} parts={len(d.get('parts') or [])} → {target}")
-        # v6.37: free local Drive parts after successful send (full -music.ogg kept)
-        freed = clear_local_drive_parts(base)
-        snap = _delivery_update(
-            base, status="sent", localPartsCleared=True, partsDir=None,
-        ) or snap
-        if freed:
-            log(f"drive parts post-send cleared base={base} freed={freed} bytes")
+        try:
+            if one_copy:  # v6.50: tell the other computers this stream is in Drive
+                write_sent_manifest(target, base, "sent", parts=placed, duration=cov_dur, user=cov_user, start=cov_start)
+            log(f"drive delivery sent base={base} parts={len(d.get('parts') or [])} → {target}")
+            # v6.37: free local Drive parts after successful send (full -music.ogg kept)
+            freed = clear_local_drive_parts(base)
+            snap = _delivery_update(
+                base, status="sent", localPartsCleared=True, partsDir=None,
+            ) or snap
+            if freed:
+                log(f"drive parts post-send cleared base={base} freed={freed} bytes")
+        except Exception as e:
+            log(f"drive delivery base={base}: sent, but tidy-up after the send failed: {e}")
         return snap
-    except Exception as e:
-        log(f"drive delivery error base={base}: {e}")
-        msg = drive_permission_message() if isinstance(e, PermissionError) else (str(e) or type(e).__name__)
-        if one_copy:  # v6.50: drop our "sending" claim so other computers don't wait on it
-            write_sent_manifest(target, base, "error", parts=placed, duration=cov_dur, user=cov_user, start=cov_start)
-        return _delivery_update(base, status="error", error=msg)
     finally:
         DELIVERY_STATE["busy"] = False
         DELIVERY_STATE["base"] = None
@@ -7587,15 +7719,18 @@ def deliver_original(name):
     DELIVERY_STATE["busy"] = True
     DELIVERY_STATE["base"] = Path(name).stem
     try:
-        dest, action = place_in_drive(src, dest_dir, name)
+        try:
+            dest, action = place_in_drive(src, dest_dir, name)
+            size = src.stat().st_size
+        except Exception as e:
+            log(f"drive original error {name}: {e}")
+            msg = drive_permission_message() if isinstance(e, PermissionError) else (str(e) or type(e).__name__)
+            return _orig_update(name, status="error", error=msg)
+        # v6.51: the copy is in Drive — a failing log line can no longer mark it "error"
         snap = _orig_update(name, status="sent", sentAt=time.time(), dest=str(dest), action=action,
-                            size=src.stat().st_size, error=None)
+                            size=size, error=None)
         log(f"drive original {action}: {name} → {dest}")
         return snap
-    except Exception as e:
-        log(f"drive original error {name}: {e}")
-        msg = drive_permission_message() if isinstance(e, PermissionError) else (str(e) or type(e).__name__)
-        return _orig_update(name, status="error", error=msg)
     finally:
         DELIVERY_STATE["busy"] = False
         DELIVERY_STATE["base"] = None
@@ -8007,7 +8142,7 @@ def twitch_streamlink_is_live(username):
     try:
         r = subprocess.run(
             [sl, "--json", f"https://twitch.tv/{u}"],
-            capture_output=True, text=True, timeout=45,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=45,  # v6.51
         )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError("streamlink probe timed out") from e
@@ -9130,6 +9265,7 @@ def main():
 
 
 if __name__ == "__main__":
+    _harden_stdio()  # v6.51: Windows cp1252 output can't make log lines raise
     if "--self-test" in sys.argv[1:]:  # v6.43: used by apply_update before swapping in a download
         sys.exit(self_test())
     main()
