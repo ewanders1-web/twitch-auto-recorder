@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.51"
+HELPER_VERSION = "6.52"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -2757,6 +2757,85 @@ def api_update_auto(body):
     return {"ok": True, "autoUpdate": auto_update_snapshot()}, 200
 
 
+def _self_test_go_live_schedule():
+    """v6.52: learned go-live windows from filenames, wrap past midnight, armed gating."""
+    import tempfile as _tmp_gl
+    global REC_DIR, PIPELINE_FILE
+    prev_rec = REC_DIR
+    prev_pf = PIPELINE_FILE
+    with PIPELINE_LOCK:
+        prev_hist = dict(PIPELINE.get("goLiveHistory") or {})
+        prev_sched = PIPELINE.get("keepAwakeSchedule", True)
+    with STATUS_FILE_LOCK:
+        prev_page = dict(PAGE_SEEN)
+    prev_cache = dict(KA_SCHED_CACHE)
+    try:
+        with _tmp_gl.TemporaryDirectory(prefix="tar-golive-") as td:
+            REC_DIR = Path(td)
+            PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"  # never touch the real prefs file
+            with PIPELINE_LOCK:
+                PIPELINE["goLiveHistory"] = {}
+                PIPELINE["keepAwakeSchedule"] = True
+            now = time.time()
+            # three past Fridays ~6:49-7:05 PM, one 1:10 AM restart segment (belongs to Friday night),
+            # one lone Tuesday (not enough samples)
+            fri = datetime.datetime.fromtimestamp(now).replace(hour=12, minute=0, second=0, microsecond=0)
+            while fri.weekday() != 4:
+                fri -= datetime.timedelta(days=1)
+            for wk, (h, m) in enumerate(((18, 49), (19, 5), (18, 55))):
+                d = fri - datetime.timedelta(days=7 * (wk + 1))
+                t = d.replace(hour=h, minute=m)
+                (REC_DIR / f"whistleface-{t.strftime('%a-%Y-%m-%dT%H-%M-%S')}.ogg").write_bytes(b"x" * KA_SCHED_MIN_BYTES)
+            late = (fri - datetime.timedelta(days=6)).replace(hour=1, minute=10)  # Sat 1:10 AM
+            (REC_DIR / f"whistleface-{late.strftime('%a-%Y-%m-%dT%H-%M-%S')}.ogg").write_bytes(b"x" * KA_SCHED_MIN_BYTES)
+            (REC_DIR / f"whistleface-{late.strftime('%a-%Y-%m-%dT%H-%M-%S')}-music.ogg").write_bytes(b"x" * KA_SCHED_MIN_BYTES)
+            tue = (fri - datetime.timedelta(days=10)).replace(hour=15)
+            (REC_DIR / f"whistleface-{tue.strftime('%a-%Y-%m-%dT%H-%M-%S')}.ogg").write_bytes(b"x" * KA_SCHED_MIN_BYTES)
+            (REC_DIR / "whistleface-Fri-2026-01-02T18-00-00.ogg").write_bytes(b"x")  # tiny crumb / too old
+            starts = go_live_starts(now, force=True)
+            assert len(starts.get("whistleface") or []) == 5, starts
+            wins = learned_go_live_windows(["whistleface"], starts=starts, now=now)
+            assert [w["weekdayName"] for w in wins] == ["Fri"], wins
+            w = wins[0]
+            assert w["samples"] == 3 and w["typical"] == "6:55 PM", w
+            assert w["from"] == "4:49 PM" and w["to"] == "8:35 PM", w
+            in_win = fri.replace(hour=17, minute=30).timestamp()
+            out_win = fri.replace(hour=13, minute=0).timestamp()
+            assert _window_bounds_now(w, in_win) and not _window_bounds_now(w, out_win)
+            # history persisted so deleted files still count
+            for f in list(REC_DIR.iterdir()):
+                f.unlink()
+            assert len(go_live_starts(now, force=True).get("whistleface") or []) == 5
+            # armed gating: fresh page heartbeat with whistleface armed → reason; not armed → none
+            with STATUS_FILE_LOCK:
+                PAGE_SEEN["at"] = in_win
+                PAGE_SEEN["armed"] = ["whistleface"]
+            r = keep_awake_schedule_reason(in_win)
+            assert r and "whistleface usually goes live Fri" in r, r
+            assert keep_awake_schedule_reason(out_win) is None
+            with STATUS_FILE_LOCK:
+                PAGE_SEEN["armed"] = ["sweetdeesauce"]
+            assert keep_awake_schedule_reason(in_win) is None
+            with STATUS_FILE_LOCK:
+                PAGE_SEEN["armed"] = ["whistleface"]
+            with PIPELINE_LOCK:
+                PIPELINE["keepAwakeSchedule"] = False
+            assert keep_awake_schedule_reason(in_win) is None
+            snap = keep_awake_schedule_snapshot(in_win)
+            assert snap["enabled"] is False and snap["windows"], snap
+    finally:
+        REC_DIR = prev_rec
+        PIPELINE_FILE = prev_pf
+        with PIPELINE_LOCK:
+            PIPELINE["goLiveHistory"] = prev_hist
+            PIPELINE["keepAwakeSchedule"] = prev_sched
+        with STATUS_FILE_LOCK:
+            PAGE_SEEN.clear()
+            PAGE_SEEN.update(prev_page)
+        KA_SCHED_CACHE.clear()
+        KA_SCHED_CACHE.update(prev_cache)
+
+
 def self_test():
     """v6.43: `python twitch-recorder-server.py --self-test` — exercise the module without binding
     the port or starting threads (used by apply_update before swapping in a download)."""
@@ -2995,6 +3074,7 @@ def self_test():
         assert find_other_copy(str(tgt), "whistleface", st0, 4 * 3600)[0] is None
         assert _covered_note({"computer": "PC", "parts": [1, 2], "durationSecs": 600}).startswith("Already in Drive from PC")
     _self_test_cp1252_sends()  # v6.51
+    _self_test_go_live_schedule()  # v6.52
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -6080,7 +6160,8 @@ PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
 PIPELINE_LOCK = threading.RLock()
 PIPELINE = {"enabled": True, "users": {}, "target": "", "deliveries": {},
             "origEnabled": True, "origUsers": {}, "originals": {},  # v6.38 originals
-            "keepAwake": True, "keepAwakeArmed": False}  # v6.40 keep computer awake
+            "keepAwake": True, "keepAwakeArmed": False,  # v6.40 keep computer awake
+            "keepAwakeSchedule": True, "goLiveHistory": {}}  # v6.52 stay awake before usual go-live
 DELIVERY_WAKE = threading.Event()
 DELIVERY_STATE = {"busy": False, "force": set(), "base": None}  # v6.37: base while mid-copy
 # v6.39: stale Drive .{name}.partial-{hex} under Auto-send target (+ Originals/)
@@ -6121,6 +6202,12 @@ def _pipeline_load():
         # v6.40: keep-awake prefs (default: on while recording/processing; armed hold opt-in)
         PIPELINE["keepAwake"] = data.get("keepAwake") is not False
         PIPELINE["keepAwakeArmed"] = data.get("keepAwakeArmed") is True
+        # v6.52: stay awake ahead of armed streamers' usual go-live times (default on)
+        PIPELINE["keepAwakeSchedule"] = data.get("keepAwakeSchedule") is not False
+        glh = data.get("goLiveHistory") if isinstance(data.get("goLiveHistory"), dict) else {}
+        PIPELINE["goLiveHistory"] = {
+            str(k).lower(): sorted({float(x) for x in v if isinstance(x, (int, float))})[-KA_SCHED_KEEP:]
+            for k, v in glh.items() if isinstance(v, list) and safe_username(str(k).lower())}
         # v6.41: post this computer's status file into Drive (default on)
         PIPELINE["statusToDrive"] = data.get("statusToDrive") is not False
         # v6.43: install helper updates automatically when idle (default on)
@@ -6238,7 +6325,184 @@ def keep_awake_desired(now=None):
         at = float(KEEP_AWAKE.get("armedAt") or 0.0)
     if armed_on and users and now - at < KEEP_AWAKE_ARMED_HOLD_SECS:
         return "Auto-Rec armed for " + ", ".join(users[:4]) + ("…" if len(users) > 4 else "")
+    try:  # v6.52: usual go-live window for an armed streamer (learned from past recordings)
+        return keep_awake_schedule_reason(now)
+    except Exception as e:
+        log(f"keep-awake schedule check failed: {e}")
+        return None
+
+
+# ─── v6.52: STAY AWAKE BEFORE ARMED STREAMERS' USUAL GO-LIVE TIMES ─────
+# Keep-awake (v6.40) only held sleep off once a recording had started, or — opt-in — while the
+# page was open with Auto-Rec armed. A Mac/PC left alone in the afternoon idle-slept before the
+# evening stream and missed it entirely (solo-watch can't run on a sleeping computer). The helper
+# already knows when each streamer usually goes live: every recording is named
+# <user>-<Wkd>-YYYY-MM-DDTHH-MM-SS. From the last 8 weeks of recordings (plus a small history kept
+# in .drive-pipeline.json so deleted files still count) it learns, per armed streamer and weekday,
+# the usual first go-live time; on a weekday with at least 2 past streams it holds sleep off from
+# ~2 h before the earliest usual start until ~1.5 h after the latest one. Starts before 5 AM count
+# toward the previous evening's stream. Recording itself then takes over the hold. Only streamers
+# that are Auto-Rec armed (fresh page heartbeat, else the persisted solo-watch list) count.
+# Toggle keepAwakeSchedule (default on); env TWITCH_RECORDER_KEEP_AWAKE_SCHEDULE=0 hard-off.
+KEEP_AWAKE_SCHEDULE_ENV_OFF = (os.environ.get("TWITCH_RECORDER_KEEP_AWAKE_SCHEDULE") or "").strip().lower() in (
+    "0", "off", "false", "no")
+KA_SCHED_LEAD_MINS = int(os.environ.get("TWITCH_RECORDER_KEEP_AWAKE_LEAD_MINS") or 120)
+KA_SCHED_TAIL_MINS = int(os.environ.get("TWITCH_RECORDER_KEEP_AWAKE_TAIL_MINS") or 90)
+KA_SCHED_LOOKBACK_DAYS = 56
+KA_SCHED_MIN_DAYS = 2
+KA_SCHED_MAX_SPREAD_MINS = 240  # starts scattered wider than this → use the median start only
+KA_SCHED_DAY_SHIFT_MINS = 300  # a 1 AM start belongs to the previous evening's stream
+KA_SCHED_CACHE_SECS = 600
+KA_SCHED_MIN_BYTES = 1_000_000  # skip failed-establish crumbs
+KA_SCHED_KEEP = 60
+KA_SCHED_CACHE = {"at": 0.0, "starts": {}}
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def keep_awake_schedule_enabled():
+    if KEEP_AWAKE_SCHEDULE_ENV_OFF:
+        return False
+    with PIPELINE_LOCK:
+        return PIPELINE.get("keepAwake", True) is not False and PIPELINE.get("keepAwakeSchedule", True) is not False
+
+
+def go_live_starts(now=None, force=False):
+    """{user: [start epochs]} from recording filenames in REC_DIR + persisted history (cached)."""
+    now = time.time() if now is None else now
+    if not force and KA_SCHED_CACHE["at"] and now - KA_SCHED_CACHE["at"] < KA_SCHED_CACHE_SECS:
+        return KA_SCHED_CACHE["starts"]
+    cutoff = now - KA_SCHED_LOOKBACK_DAYS * 86400
+    found = {}
+    try:
+        entries = list(os.scandir(REC_DIR))
+    except OSError:
+        entries = []
+    for e in entries:
+        if e.name.startswith("."):
+            continue
+        try:
+            if not e.is_file() or e.stat().st_size < KA_SCHED_MIN_BYTES:
+                continue
+        except OSError:
+            continue
+        user, st = parse_recording_stamp(e.name)
+        if user and st and cutoff <= st <= now + 60:
+            found.setdefault(user, set()).add(float(int(st // 60) * 60))
+    changed = False
+    with PIPELINE_LOCK:
+        hist = PIPELINE.setdefault("goLiveHistory", {})
+        for user in set(found) | set(hist):
+            old = {float(x) for x in hist.get(user) or []}
+            merged = sorted(x for x in (old | found.get(user, set())) if x >= cutoff)[-KA_SCHED_KEEP:]
+            if merged != sorted(old):
+                changed = True
+            if merged:
+                hist[user] = merged
+            else:
+                hist.pop(user, None)
+        starts = {u: list(v) for u, v in hist.items()}
+    if changed:
+        _pipeline_save()
+    KA_SCHED_CACHE["at"] = now
+    KA_SCHED_CACHE["starts"] = starts
+    return starts
+
+
+def _stream_day(ts):
+    """(date of the stream evening, minutes since that evening's shifted midnight)."""
+    dt = datetime.datetime.fromtimestamp(ts) - datetime.timedelta(minutes=KA_SCHED_DAY_SHIFT_MINS)
+    return dt.date(), dt.hour * 60 + dt.minute
+
+
+def _clock_label(shifted_min):
+    m = int(shifted_min + KA_SCHED_DAY_SHIFT_MINS) % 1440
+    h, mm = divmod(m, 60)
+    return f"{(h % 12) or 12}:{mm:02d} {'AM' if h < 12 else 'PM'}"
+
+
+def learned_go_live_windows(users, starts=None, now=None):
+    """[{username, weekday, fromMin, toMin, typical, samples}] for weekdays with ≥2 past streams."""
+    now = time.time() if now is None else now
+    starts = go_live_starts(now) if starts is None else starts
+    out = []
+    for user in users:
+        first = {}  # stream day -> earliest start minute (shifted)
+        for ts in starts.get(user) or []:
+            day, mins = _stream_day(ts)
+            if day not in first or mins < first[day]:
+                first[day] = mins
+        by_wd = {}
+        for day, mins in first.items():
+            by_wd.setdefault(day.weekday(), []).append(mins)
+        for wd, mins in sorted(by_wd.items()):
+            if len(mins) < KA_SCHED_MIN_DAYS:
+                continue
+            mins.sort()
+            med = mins[len(mins) // 2]
+            lo, hi = mins[0], mins[-1]
+            if hi - lo > KA_SCHED_MAX_SPREAD_MINS:
+                lo = hi = med
+            out.append({"username": user, "weekday": wd, "weekdayName": _WEEKDAYS[wd],
+                        "fromMin": lo - KA_SCHED_LEAD_MINS, "toMin": hi + KA_SCHED_TAIL_MINS,
+                        "from": _clock_label(lo - KA_SCHED_LEAD_MINS),
+                        "to": _clock_label(hi + KA_SCHED_TAIL_MINS),
+                        "typical": _clock_label(med), "samples": len(mins)})
+    return out
+
+
+def _window_bounds_now(w, now):
+    """(start, end) epochs of the occurrence of window w that contains now, else None."""
+    today, _m = _stream_day(now)
+    for off in (-1, 0, 1):
+        day = today + datetime.timedelta(days=off)
+        if day.weekday() != w["weekday"]:
+            continue
+        base = datetime.datetime.combine(day, datetime.time()) + datetime.timedelta(minutes=KA_SCHED_DAY_SHIFT_MINS)
+        start = (base + datetime.timedelta(minutes=w["fromMin"])).timestamp()
+        end = (base + datetime.timedelta(minutes=w["toMin"])).timestamp()
+        if start <= now <= end:
+            return start, end
     return None
+
+
+def keep_awake_armed_users(now=None):
+    """Auto-Rec armed streamers: the fresh page heartbeat, else the persisted solo-watch list."""
+    now = time.time() if now is None else now
+    with STATUS_FILE_LOCK:
+        at = float(PAGE_SEEN.get("at") or 0.0)
+        page_armed = list(PAGE_SEEN.get("armed") or [])
+    if at and now - at <= PAGE_HEARTBEAT_STALE_SECS:
+        return page_armed
+    with SOLO_WATCH_LOCK:
+        return list((SOLO_WATCH.get("users") or {}).keys())
+
+
+def keep_awake_schedule_reason(now=None):
+    now = time.time() if now is None else now
+    if not keep_awake_schedule_enabled():
+        return None
+    users = keep_awake_armed_users(now)
+    if not users:
+        return None
+    for w in learned_go_live_windows(users, now=now):
+        if _window_bounds_now(w, now):
+            return (f"{w['username']} usually goes live {w['weekdayName']} ~{w['typical']} "
+                    f"— staying awake {w['from']}–{w['to']}")
+    return None
+
+
+def keep_awake_schedule_snapshot(now=None):
+    now = time.time() if now is None else now
+    users = keep_awake_armed_users(now)
+    try:
+        wins = learned_go_live_windows(users, now=now) if users else []
+    except Exception as e:
+        return {"enabled": keep_awake_schedule_enabled(), "error": str(e), "windows": []}
+    return {"enabled": keep_awake_schedule_enabled(), "envOff": KEEP_AWAKE_SCHEDULE_ENV_OFF,
+            "leadMins": KA_SCHED_LEAD_MINS, "tailMins": KA_SCHED_TAIL_MINS, "armedUsers": users,
+            "windows": [{k: w[k] for k in ("username", "weekdayName", "from", "to", "typical", "samples")}
+                        for w in wins],
+            "activeNow": bool(any(_window_bounds_now(w, now) for w in wins))}
 
 
 def _keep_awake_cmd(method):
@@ -6354,6 +6618,8 @@ def keep_awake_snapshot():
             "since": KEEP_AWAKE.get("since"),
             "error": KEEP_AWAKE.get("error"),
             "armedUsers": list(KEEP_AWAKE.get("armedUsers") or []),
+            "scheduleEnabled": keep_awake_schedule_enabled(),  # v6.52
+            "schedule": keep_awake_schedule_snapshot(),
         }
 
 
@@ -6961,6 +7227,10 @@ def api_pipeline_prefs(body):
             KEEP_AWAKE_WAKE.set()
         if "keepAwakeArmed" in body:  # v6.40
             PIPELINE["keepAwakeArmed"] = bool(body.get("keepAwakeArmed"))
+            changed = True
+            KEEP_AWAKE_WAKE.set()
+        if "keepAwakeSchedule" in body:  # v6.52
+            PIPELINE["keepAwakeSchedule"] = bool(body.get("keepAwakeSchedule"))
             changed = True
             KEEP_AWAKE_WAKE.set()
         if "statusToDrive" in body:  # v6.41
@@ -8482,7 +8752,11 @@ def build_status_doc(now=None):
                 "error": _short(o.get("error"), 300) or None} for o in origs],
         },
         "keepAwake": {"active": bool(ka.get("active")), "reason": ka.get("reason"),
-                      "supported": bool(ka.get("supported")), "error": ka.get("error")},
+                      "supported": bool(ka.get("supported")), "error": ka.get("error"),
+                      # v6.52: learned go-live windows (ready check can see them)
+                      "scheduleEnabled": bool(ka.get("scheduleEnabled")),
+                      "goLiveWindows": [f"{w['username']} {w['weekdayName']} {w['from']}–{w['to']}"
+                                        for w in ((ka.get("schedule") or {}).get("windows") or [])]},
         # v6.43: unattended helper updates (ready check can see on/off, last check, last error)
         "autoUpdate": {"enabled": au.get("enabled"), "state": au.get("state"),
                        "lastCheckAt": _iso_local(au.get("lastCheckAt")), "lastResult": au.get("lastResult"),
@@ -8634,6 +8908,10 @@ def render_status_text(doc):
         L.append(f"Keeping the computer awake: {ka.get('reason')}")
     elif ka.get("error"):
         L.append(f"Keep awake problem: {ka.get('error')}")
+    if ka.get("goLiveWindows"):  # v6.52
+        L.append("Stays awake before usual go-live: " + "; ".join(ka["goLiveWindows"]))
+    elif ka.get("scheduleEnabled") is False:
+        L.append("Stay awake before usual go-live times: OFF")
     rr = doc.get("recentRecordings") or []
     if rr:
         L.append("Recent files in TwitchRecordings:")
