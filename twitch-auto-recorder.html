@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.52</span>
+    <span class="badge">v6.53</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -554,7 +554,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.52'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.53'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -562,6 +562,7 @@ let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
 let musicJobsNotified = new Set(); // jobIds already fireNotify'd for done/error (health spam safe)
 let orphanTempsFlashedKey = ''; // v6.29: one soft flash per orphan cleanup summary
+let recoverFlashedAt = 0; // v6.53: newest cut-off-recording recovery already flashed
 let autoMusicQueued = new Set(); // basenames already auto-queued this session (dedupe mid-stream + stop)
 let helperDemucsMissingNotified = false; // v6.24: one-shot demucs-missing flash/notify per episode
 let helperDriveAccessBlockedNotified = false; // v6.47: one-shot Drive-access flash/notify per blocked episode
@@ -1472,6 +1473,7 @@ function pingHelperAndStatus(){
       noticeHelperDemucs();
       noticeHelperDriveAccess(); // v6.47
       noticeOrphanTempsCleared(wasOk);
+      noticeRecoveredSessions(d.recoveredSessions); // v6.53
       updatePendingRestartBanner();
       updateDemucsUi();
       if(Array.isArray(d.musicJobs)) applyMusicJobsFromHealth(d.musicJobs);
@@ -2035,6 +2037,18 @@ function updateDemucsUi(){
     _demucsUiPrev=sig;
     try{ renderHist(); }catch(e){}
   }
+}
+// v6.53: helper recovered a recording a crash / reboot cut off (joined to the new one or finalized)
+function noticeRecoveredSessions(rs){
+  if(!rs || typeof rs!=='object' || !Array.isArray(rs.recent) || !rs.recent.length) return;
+  const x=rs.recent[rs.recent.length-1];
+  const at=Number(x && x.at)||0;
+  if(!at || at<=recoverFlashedAt) return;
+  recoverFlashedAt=at;
+  const t=document.createElement('span');
+  const n=Array.isArray(x.segments)?x.segments.length:0;
+  t.textContent='Recovered '+(x.username||'a')+' recording cut off by a helper/computer restart ('+n+' segment'+(n===1?'':'s')+'): '+(x.action||'')+(x.detail?(' — '+x.detail):'');
+  flashOk(t.innerHTML);
 }
 function noticeOrphanTempsCleared(wasOk){
   // v6.29: one soft flash per orphan cleanup summary (startup reconnect or diskWarn pass)

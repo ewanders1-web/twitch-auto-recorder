@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.52"
+HELPER_VERSION = "6.53"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -210,18 +210,22 @@ def basename_of(path):
     return Path(path).name
 
 
-def remember_session_segments(username, segments):
+def remember_session_segments(username, segments, reason="stream-end"):
     """Stash finished segment basenames after stop/give-up for POST /api/seamless {username}.
 
     Safe to call while holding LOCK (does not re-enter LOCK).
     """
     segs = [s for s in (segments or []) if s and isinstance(s, str)]
+    try:  # v6.53: session ended normally in this process — nothing to recover after a restart
+        live_session_forget(username, segs)
+    except Exception as e:
+        log(f"live-session forget failed for {username}: {e}")
     if not segs:
         return
     RECENT_SESSIONS[username] = {"segments": list(segs), "at": time.time()}
     # v6.36: recording finalized → remove voice → split → send to Drive (if enabled)
     try:
-        _on_session_finalized(username, segs)
+        _on_session_finalized(username, segs, reason=reason)
     except Exception as e:
         log(f"pipeline trigger failed for {username}: {e}")
 
@@ -1581,6 +1585,7 @@ def record_supervisor(username, quality, gen):
                 terminate_proc(proc)
                 return
             log(f"recording {username} pid={proc.pid} -> {out}")
+            live_session_touch(username, gen)  # v6.53: crash/reboot can't orphan this session
             # Keep ownership: watch for mid-stream death and auto-resume.
             watch_and_resume(username, quality, gen, proc)
             return
@@ -1882,6 +1887,7 @@ def watch_and_resume(username, quality, gen, proc):
                             rec["sessionStartedAt"] = started
                 log(f"recording {username} (segment resume) pid={new_proc.pid} -> {out}"
                     + (f" after {int(time.time() - seg_ended_at)}s restart wait" if grace_idx else ""))
+                live_session_touch(username, gen)  # v6.53
                 proc = new_proc
                 resume_idx = 0
                 grace_idx = 0
@@ -1986,8 +1992,16 @@ def start_record(username, quality, started_by=None):
             "startedBy": by,  # v6.49: "helper" when solo-watch started this
         }
     REC_DIR.mkdir(parents=True, exist_ok=True)
+    try:  # v6.53: segments a crash/reboot cut off from this same broadcast join this session
+        claimed = claim_orphan_segments(username)
+    except Exception as e:
+        claimed = []
+        log(f"orphan claim failed for {username}: {e}")
     with LOCK:
         gen = ACTIVE[username]["gen"]
+        if claimed:
+            cur = ACTIVE[username].setdefault("sessionSegments", [])
+            ACTIVE[username]["sessionSegments"] = [c for c in claimed if c not in cur] + cur
     t = threading.Thread(
         target=record_supervisor,
         args=(username, quality, gen),
@@ -3075,6 +3089,7 @@ def self_test():
         assert _covered_note({"computer": "PC", "parts": [1, 2], "durationSecs": 600}).startswith("Already in Drive from PC")
     _self_test_cp1252_sends()  # v6.51
     _self_test_go_live_schedule()  # v6.52
+    _self_test_orphan_recovery()  # v6.53
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -3238,6 +3253,7 @@ def health_payload():
         "driveAccess": drive_access_snapshot(),  # v6.47: sticky banner when FDA/Drive blocks
         "autoUpdate": auto_update_snapshot(),  # v6.43
         "soloWatch": solo_watch_snapshot(),  # v6.49
+        "recoveredSessions": recovery_snapshot(),  # v6.53
         # v6.51: log lines the console/log file couldn't take as-is (Windows code page, closed pipe)
         "logWriteErrors": int(LOG_WRITE_ERRORS[0]),
         "logEncoding": str(getattr(sys.stdout, "encoding", None) or ""),
@@ -6218,6 +6234,10 @@ def _pipeline_load():
         PIPELINE["oneCopy"] = data.get("oneCopy") is not False
         # v6.45: voice-removal quality (auto = Better when demucs installed, else Fast)
         PIPELINE["voiceQuality"] = _norm_voice_quality(data.get("voiceQuality")) or "auto"
+        # v6.53: recording sessions in progress (a crash/reboot leaves them here → recovered)
+        lsd = data.get("liveSessions") if isinstance(data.get("liveSessions"), dict) else {}
+        PIPELINE["liveSessions"] = {str(k).lower(): v for k, v in lsd.items()
+                                    if isinstance(v, dict) and isinstance(v.get("segments"), list)}
         # v6.44: after-stream jobs that were queued/running when the helper last stopped
         pj = data.get("pendingJobs") if isinstance(data.get("pendingJobs"), dict) else {}
         PIPELINE["pendingJobs"] = {str(k): v for k, v in pj.items()
@@ -6414,7 +6434,9 @@ def _stream_day(ts):
     return dt.date(), dt.hour * 60 + dt.minute
 
 
-def _clock_label(shifted_min):
+def _sched_clock_label(shifted_min):
+    """v6.53: renamed — as `_clock_label` it replaced the restart-grace clock helper of the same
+    name, so "helper keeps trying until …" showed a meaningless time."""
     m = int(shifted_min + KA_SCHED_DAY_SHIFT_MINS) % 1440
     h, mm = divmod(m, 60)
     return f"{(h % 12) or 12}:{mm:02d} {'AM' if h < 12 else 'PM'}"
@@ -6444,9 +6466,9 @@ def learned_go_live_windows(users, starts=None, now=None):
                 lo = hi = med
             out.append({"username": user, "weekday": wd, "weekdayName": _WEEKDAYS[wd],
                         "fromMin": lo - KA_SCHED_LEAD_MINS, "toMin": hi + KA_SCHED_TAIL_MINS,
-                        "from": _clock_label(lo - KA_SCHED_LEAD_MINS),
-                        "to": _clock_label(hi + KA_SCHED_TAIL_MINS),
-                        "typical": _clock_label(med), "samples": len(mins)})
+                        "from": _sched_clock_label(lo - KA_SCHED_LEAD_MINS),
+                        "to": _sched_clock_label(hi + KA_SCHED_TAIL_MINS),
+                        "typical": _sched_clock_label(med), "samples": len(mins)})
     return out
 
 
@@ -7556,7 +7578,7 @@ def start_stream_pipeline(username, segments, redo=False, reason="stream-end"):
     return jid, None
 
 
-def _on_session_finalized(username, segments):
+def _on_session_finalized(username, segments, reason="stream-end"):
     """Called from remember_session_segments (maybe holding LOCK) — never blocks."""
     segs = [s for s in (segments or []) if s]
     if not segs or not (pipeline_enabled_for(username) or original_enabled_for(username)):
@@ -7576,11 +7598,321 @@ def _on_session_finalized(username, segments):
         # 2) then remove voice → split → parts to Drive (the job waits for the originals)
         if not pipeline_enabled_for(username):
             return
-        jid, err = start_stream_pipeline(username, segs)
+        jid, err = start_stream_pipeline(username, segs, reason=reason)
         if err and not jid:
             log(f"pipeline not started for {username}: {err}")
 
     threading.Thread(target=run, daemon=True, name=f"pipeline-trigger-{username}").start()
+
+
+# ─── v6.53: RECOVER RECORDINGS CUT OFF BY A HELPER CRASH / REBOOT / POWER LOSS ─────
+# The after-stream steps (original → Drive, voice removal, ~35-min parts → Drive) only started when
+# a recording session ended *inside the same helper process* (v6.44 only resumes jobs that had
+# already been queued). If the helper was killed, crashed, or the computer rebooted / lost power /
+# was force-restarted for Windows updates mid-stream, the segments recorded so far were never
+# processed or sent — and when Auto-Rec / solo-watch picked the still-live stream back up, the new
+# session's parts only covered the part after the restart. Now every established segment is noted
+# in .drive-pipeline.json (liveSessions); a normal end clears it. On the next start:
+#   • if the same streamer is recorded again within ~1 h of the cut-off segment's last write, the
+#     old segments are put in front of the new session, so the parts cover the whole broadcast;
+#   • otherwise, ~5 min after start (time for the page / solo-watch to reconnect), the cut-off
+#     segments are finalized on their own — original + voice removal + parts to Drive as usual.
+# Files still being written (a surviving streamlink) are waited on, never merged mid-write.
+# Nothing is deleted. Entries older than 3 days, or whose files are gone / already processed, drop.
+LIVE_RECOVER_DELAY_SECS = _env_secs("TWITCH_RECORDER_RECOVER_DELAY_SECS", 300, 0)
+LIVE_RECOVER_MERGE_GAP_SECS = _env_secs("TWITCH_RECORDER_RECOVER_MERGE_GAP_SECS", 3600, 0)
+LIVE_RECOVER_QUIET_SECS = _env_secs("TWITCH_RECORDER_RECOVER_QUIET_SECS", 120, 0)
+LIVE_RECOVER_MAX_AGE_SECS = _env_secs("TWITCH_RECORDER_RECOVER_MAX_AGE_SECS", 3 * 86400, 60)
+LIVE_RECOVER_TICK_SECS = _env_secs("TWITCH_RECORDER_RECOVER_TICK_SECS", 30, 1)
+LIVE_RECOVER_LOG = []  # last few recover actions (shown in /api/health.recoveredSessions)
+ORPHAN_SESSIONS = {}  # username -> entry from the previous process (claimed / finalized here)
+ORPHAN_LOCK = threading.Lock()
+MY_RUN_ID = f"{os.getpid()}-{int(time.time())}"
+
+
+def _live_note(action, username, segs, detail=""):
+    LIVE_RECOVER_LOG.append({"at": time.time(), "action": action, "username": username,
+                             "segments": list(segs)[:20], "detail": detail})
+    del LIVE_RECOVER_LOG[:-10]
+    log(f"recover: {action} {username} {list(segs)}" + (f" — {detail}" if detail else ""))
+    STATUS_FILE_WAKE.set()
+
+
+def live_session_touch(username, gen):
+    """Persist this session's segments (finished + current) so a crash can't orphan them."""
+    try:
+        with LOCK:
+            rec = ACTIVE.get(username)
+            if not rec or rec.get("gen") != gen:
+                return
+            names = [n for n in (rec.get("sessionSegments") or []) if n]
+            cur = basename_of(rec.get("file") or "")
+            if cur and cur not in names:
+                names.append(cur)
+            started = rec.get("sessionStartedAt") or ""
+        names = [n for n in names if not is_music_export_name(n) and not is_seamless_export_name(n)]
+        if not names:
+            return
+        with PIPELINE_LOCK:
+            ls = PIPELINE.setdefault("liveSessions", {})
+            ls[username] = {"segments": names, "run": MY_RUN_ID, "gen": gen,
+                            "sessionStartedAt": started, "updatedAt": time.time()}
+        _pipeline_save()
+    except Exception as e:
+        log(f"live-session note failed for {username}: {e}")
+
+
+def live_session_forget(username, segs):
+    """Session finalized normally. May run while LOCK is held → save on a side thread."""
+    def run():
+        with PIPELINE_LOCK:
+            ls = PIPELINE.get("liveSessions") or {}
+            ent = ls.get(username)
+            if not ent or ent.get("run") != MY_RUN_ID:
+                return
+            if segs and not (set(ent.get("segments") or []) & set(segs)):
+                return  # a newer session for this streamer already took the slot
+            ls.pop(username, None)
+        _pipeline_save()
+    threading.Thread(target=run, daemon=True, name=f"live-forget-{username}").start()
+
+
+def load_orphan_sessions():
+    """Startup (after _pipeline_load): sessions a previous helper process never finished."""
+    with PIPELINE_LOCK:
+        ls = PIPELINE.get("liveSessions") if isinstance(PIPELINE.get("liveSessions"), dict) else {}
+        found = {str(u).lower(): dict(e) for u, e in ls.items()
+                 if isinstance(e, dict) and e.get("run") != MY_RUN_ID and safe_username(str(u).lower())
+                 and isinstance(e.get("segments"), list)}
+    with ORPHAN_LOCK:
+        ORPHAN_SESSIONS.clear()
+        ORPHAN_SESSIONS.update(found)
+    if found:
+        log(f"recover: {len(found)} recording session(s) were cut off when the helper last stopped — "
+            + ", ".join(f"{u} ({len(e['segments'])} segment(s))" for u, e in found.items()))
+    return list(found)
+
+
+def _orphan_drop_persisted(username, ent):
+    with PIPELINE_LOCK:
+        ls = PIPELINE.get("liveSessions") or {}
+        cur = ls.get(username)
+        if cur and cur.get("run") == ent.get("run"):
+            ls.pop(username, None)
+    _pipeline_save()
+
+
+def _orphan_files(ent):
+    """[(name, size, mtime)] of the orphan's segments still on disk (crumbs skipped)."""
+    out = []
+    for n in ent.get("segments") or []:
+        n = basename_of(n)
+        if not n or is_music_export_name(n) or is_seamless_export_name(n):
+            continue
+        try:
+            st = (REC_DIR / n).stat()
+        except OSError:
+            continue
+        if st.st_size > SCRUB_MAX_BYTES:
+            out.append((n, int(st.st_size), float(st.st_mtime)))
+    return out
+
+
+def _orphan_already_handled(username, names):
+    if not names:
+        return "no segments on disk"
+    first = names[0]
+    if first in PIPELINE_SEEN:
+        return "already queued"
+    with PIPELINE_LOCK:
+        if first in (PIPELINE.get("pendingJobs") or {}):
+            return "already queued"
+        if music_base_stem(first) in (PIPELINE.get("deliveries") or {}):
+            return "already processed"
+    with MUSIC_JOBS_LOCK:
+        for job in MUSIC_JOBS.values():
+            if job.get("name") == first or first in (job.get("segments") or []):
+                return "already queued"
+    return None
+
+
+def claim_orphan_segments(username, now=None):
+    """A new session for `username` starts: hand back the cut-off segments of the same broadcast
+    (quiet for LIVE_RECOVER_QUIET_SECS, last write within LIVE_RECOVER_MERGE_GAP_SECS)."""
+    now = time.time() if now is None else now
+    u = (username or "").lower()
+    with ORPHAN_LOCK:
+        ent = ORPHAN_SESSIONS.get(u)
+    if not ent:
+        return []
+    files = _orphan_files(ent)
+    names = [f[0] for f in files]
+    if _orphan_already_handled(u, names):
+        return []
+    last = max(f[2] for f in files)
+    if now - last < LIVE_RECOVER_QUIET_SECS:
+        return []  # still being written (a surviving streamlink) — recovery loop handles it later
+    if now - last > LIVE_RECOVER_MERGE_GAP_SECS:
+        return []  # an older broadcast — finalized on its own by the recovery loop
+    with ORPHAN_LOCK:
+        if ORPHAN_SESSIONS.get(u) is not ent:
+            return []
+        ORPHAN_SESSIONS.pop(u, None)
+    _orphan_drop_persisted(u, ent)
+    _live_note("joined to new recording", u, names,
+               f"cut off {int((now - last) / 60)} min ago; parts will cover the whole stream")
+    return names
+
+
+def recover_orphan_sessions(now=None, uptime=None, finalize=None):
+    """Recovery tick: finalize cut-off sessions nobody picked back up. Returns [(user, action)]."""
+    now = time.time() if now is None else now
+    uptime = (now - HELPER_STARTED_AT) if uptime is None else uptime
+    finalize = finalize or (lambda u, segs: remember_session_segments(
+        u, segs, reason="recovered after helper/computer restart"))
+    done = []
+    with ORPHAN_LOCK:
+        items = list(ORPHAN_SESSIONS.items())
+    for u, ent in items:
+        files = _orphan_files(ent)
+        names = [f[0] for f in files]
+        why = _orphan_already_handled(u, names)
+        last = max((f[2] for f in files), default=0.0)
+        if not why and now - last > LIVE_RECOVER_MAX_AGE_SECS:
+            why = "older than 3 days"
+        if why:
+            with ORPHAN_LOCK:
+                ORPHAN_SESSIONS.pop(u, None)
+            _orphan_drop_persisted(u, ent)
+            log(f"recover: dropping cut-off session {u}: {why}")
+            done.append((u, "dropped"))
+            continue
+        if now - last < LIVE_RECOVER_QUIET_SECS:
+            continue  # still growing — wait
+        if uptime < LIVE_RECOVER_DELAY_SECS:
+            with LOCK:
+                recording_now = u in ACTIVE
+            if not recording_now:
+                continue  # give the page / solo-watch time to pick a still-live stream back up
+        with LOCK:
+            rec = ACTIVE.get(u)
+            active_segs = set(rec.get("sessionSegments") or []) if rec else set()
+        if active_segs & set(names):
+            with ORPHAN_LOCK:
+                ORPHAN_SESSIONS.pop(u, None)
+            _orphan_drop_persisted(u, ent)
+            done.append((u, "joined"))
+            continue
+        with ORPHAN_LOCK:
+            if ORPHAN_SESSIONS.get(u) is not ent:
+                continue
+            ORPHAN_SESSIONS.pop(u, None)
+        _orphan_drop_persisted(u, ent)
+        _live_note("finalized cut-off recording", u, names,
+                   "original + voice removal + parts to Drive (as if the stream had ended normally)")
+        try:
+            finalize(u, names)
+        except Exception as e:
+            log(f"recover: finalize failed for {u}: {e}")
+        done.append((u, "finalized"))
+    return done
+
+
+def orphan_recovery_loop():
+    while True:
+        with ORPHAN_LOCK:
+            pending = bool(ORPHAN_SESSIONS)
+        if not pending:
+            return
+        time.sleep(LIVE_RECOVER_TICK_SECS)
+        try:
+            recover_orphan_sessions()
+        except Exception as e:
+            log(f"recover tick failed: {e}")
+
+
+def recovery_snapshot():
+    with ORPHAN_LOCK:
+        pend = {u: len(e.get("segments") or []) for u, e in ORPHAN_SESSIONS.items()}
+    return {"pending": pend, "recent": [dict(x) for x in LIVE_RECOVER_LOG[-5:]]}
+
+
+def _self_test_orphan_recovery():
+    """v6.53: cut-off sessions are joined to a new recording or finalized on their own."""
+    import tempfile as _tmp_or
+    global REC_DIR, PIPELINE_FILE
+    prev_rec, prev_pf = REC_DIR, PIPELINE_FILE
+    with PIPELINE_LOCK:
+        prev_ls = dict(PIPELINE.get("liveSessions") or {})
+    with ORPHAN_LOCK:
+        prev_or = dict(ORPHAN_SESSIONS)
+    prev_log = list(LIVE_RECOVER_LOG)
+    try:
+        with _tmp_or.TemporaryDirectory(prefix="tar-recover-") as td:
+            REC_DIR = Path(td)
+            PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
+            now = time.time()
+            a = "whistleface-Fri-2026-10-16T19-00-00.ogg"
+            b = "whistleface-Fri-2026-10-16T20-10-00.ogg"
+            for n in (a, b):
+                (REC_DIR / n).write_bytes(b"x" * (SCRUB_MAX_BYTES + 10))
+                os.utime(REC_DIR / n, (now - 600, now - 600))
+            with PIPELINE_LOCK:
+                PIPELINE["liveSessions"] = {
+                    "whistleface": {"segments": [a, b], "run": "old-run", "gen": 1, "updatedAt": now - 900},
+                    "ghostuser": {"segments": ["ghostuser-Fri-2026-10-16T19-00-00.ogg"], "run": "old-run"},
+                    "mine": {"segments": [a], "run": MY_RUN_ID},  # this process — not an orphan
+                }
+            assert sorted(load_orphan_sessions()) == ["ghostuser", "whistleface"]
+            # still being written → no merge
+            os.utime(REC_DIR / b, (now - 30, now - 30))
+            assert claim_orphan_segments("whistleface", now=now) == []
+            os.utime(REC_DIR / b, (now - 600, now - 600))
+            # too long ago for the same broadcast → no merge
+            assert claim_orphan_segments("whistleface", now=now + 2 * 3600) == []
+            # same broadcast → joined in order, persisted entry cleared
+            assert claim_orphan_segments("whistleface", now=now) == [a, b]
+            with PIPELINE_LOCK:
+                assert "whistleface" not in PIPELINE["liveSessions"]
+            assert claim_orphan_segments("whistleface", now=now) == []
+            # finalize path: before the delay nothing happens; after it the session is finalized
+            with ORPHAN_LOCK:
+                ORPHAN_SESSIONS["whistleface"] = {"segments": [a, b], "run": "old-run"}
+            got = []
+            r = recover_orphan_sessions(now=now, uptime=10, finalize=lambda u, s: got.append((u, s)))
+            assert ("ghostuser", "dropped") in r and not got, (r, got)  # files gone → dropped
+            r = recover_orphan_sessions(now=now, uptime=LIVE_RECOVER_DELAY_SECS + 1,
+                                        finalize=lambda u, s: got.append((u, s)))
+            assert got == [("whistleface", [a, b])] and r == [("whistleface", "finalized")], (r, got)
+            assert recovery_snapshot()["pending"] == {}
+            # already processed (delivery exists) → dropped, not re-sent
+            with ORPHAN_LOCK:
+                ORPHAN_SESSIONS["whistleface"] = {"segments": [a], "run": "old-run"}
+            with PIPELINE_LOCK:
+                prev_del = PIPELINE["deliveries"].get(music_base_stem(a))
+                PIPELINE["deliveries"][music_base_stem(a)] = {"status": "sent"}
+            try:
+                got.clear()
+                r = recover_orphan_sessions(now=now, uptime=9999, finalize=lambda u, s: got.append((u, s)))
+                assert r == [("whistleface", "dropped")] and not got, (r, got)
+            finally:
+                with PIPELINE_LOCK:
+                    if prev_del is None:
+                        PIPELINE["deliveries"].pop(music_base_stem(a), None)
+                    else:
+                        PIPELINE["deliveries"][music_base_stem(a)] = prev_del
+        # restart-grace clock label is a wall-clock time again (v6.52 had shadowed it)
+        lbl = _clock_label(time.mktime((2026, 10, 16, 21, 14, 0, 0, 0, -1)))
+        assert lbl == "9:14 PM", lbl
+        assert "until 9:14 PM" in grace_wait_msg("x", time.mktime((2026, 10, 16, 21, 14, 0, 0, 0, -1)), None)
+    finally:
+        REC_DIR, PIPELINE_FILE = prev_rec, prev_pf
+        with PIPELINE_LOCK:
+            PIPELINE["liveSessions"] = prev_ls
+        with ORPHAN_LOCK:
+            ORPHAN_SESSIONS.clear()
+            ORPHAN_SESSIONS.update(prev_or)
+        LIVE_RECOVER_LOG[:] = prev_log
 
 
 def api_pipeline_split(body):
@@ -8751,6 +9083,10 @@ def build_status_doc(now=None):
                 "sentAt": _iso_local(o.get("sentAt")), "note": _short(o.get("note"), 200),
                 "error": _short(o.get("error"), 300) or None} for o in origs],
         },
+        # v6.53: recordings cut off by a helper crash / reboot and what happened to them
+        "recovered": [f"{_iso_local(x.get('at'))} {x.get('username')}: {x.get('action')} "
+                      f"({len(x.get('segments') or [])} segment(s))" for x in LIVE_RECOVER_LOG[-3:]],
+        "recoverPending": sorted(ORPHAN_SESSIONS.keys()),
         "keepAwake": {"active": bool(ka.get("active")), "reason": ka.get("reason"),
                       "supported": bool(ka.get("supported")), "error": ka.get("error"),
                       # v6.52: learned go-live windows (ready check can see them)
@@ -8912,6 +9248,10 @@ def render_status_text(doc):
         L.append("Stays awake before usual go-live: " + "; ".join(ka["goLiveWindows"]))
     elif ka.get("scheduleEnabled") is False:
         L.append("Stay awake before usual go-live times: OFF")
+    if doc.get("recoverPending"):  # v6.53
+        L.append("Cut-off recording waiting to be recovered: " + ", ".join(doc["recoverPending"]))
+    for x in doc.get("recovered") or []:
+        L.append(f"Recovered after restart: {x}")
     rr = doc.get("recentRecordings") or []
     if rr:
         L.append("Recent files in TwitchRecordings:")
@@ -9478,6 +9818,12 @@ def main():
         log(f"drive target partial cleanup startup failed: {e}")
     threading.Thread(target=delivery_loop, daemon=True, name="drive-delivery").start()
     request_delivery(None)
+    # v6.53: recordings a crash / reboot / power loss cut off → join the next session or finalize
+    try:
+        if load_orphan_sessions():
+            threading.Thread(target=orphan_recovery_loop, daemon=True, name="orphan-recovery").start()
+    except Exception as e:
+        log(f"recover load failed: {e}")
 
     # v6.44: re-queue voice-removal/split jobs a crash/reboot/restart interrupted
     def _resume_later():
