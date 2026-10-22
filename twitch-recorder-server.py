@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.53"
+HELPER_VERSION = "6.54"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -1485,6 +1485,40 @@ def set_grace_until(username, gen, until):
             rec["graceUntil"] = float(until or 0.0)
 
 
+def _drop_slot_finalize_claimed_locked(username, gen):
+    """v6.54: record_supervisor drops a slot whose recording never got (re-)established
+    (quick-fail give-up, streamlink won't start, stop/gen race). Caller holds LOCK.
+
+    v6.53 hands a crash/reboot's cut-off segments to the *next* start_record of the same
+    streamer (claim_orphan_segments) and clears their crash note right away. If that new
+    recording then never establishes — Helix still said live for a minute after the stream
+    ended, the stream really did end during the reboot, streamlink is broken — the slot used to
+    be popped without finalizing, so the claimed segments were never sent: no original, no voice
+    removal, no Drive parts, and no note left to recover them on the next start. Now they are
+    finalized here exactly like a normal stream end. Returns the finalized segment names.
+    """
+    rec = ACTIVE.get(username)
+    if not rec or rec.get("gen") != gen:
+        return []
+    try:
+        segs = collect_session_segments_from_rec(rec)
+    except Exception:
+        segs = []
+    ACTIVE.pop(username, None)
+    if not segs:
+        return []
+    try:
+        _live_note("finalized cut-off recording", username, segs,
+                   "the resumed recording never started — original + voice removal + parts to Drive")
+    except Exception:
+        pass
+    remember_session_segments(username, segs, reason=RECOVER_UNSTARTED_REASON)
+    return segs
+
+
+RECOVER_UNSTARTED_REASON = "recovered after helper/computer restart (resumed recording never started)"
+
+
 def record_supervisor(username, quality, gen):
     """Background: spawn streamlink, retry early failures, then mid-stream auto-resume."""
     attempt = 0
@@ -1495,9 +1529,7 @@ def record_supervisor(username, quality, gen):
     while attempt < max_attempts:
         if not still_wanted(username, gen):
             with LOCK:
-                rec = ACTIVE.get(username)
-                if rec and rec.get("gen") == gen:
-                    ACTIVE.pop(username, None)
+                _drop_slot_finalize_claimed_locked(username, gen)
             return
         with LOCK:
             rec = ACTIVE.get(username)
@@ -1518,9 +1550,7 @@ def record_supervisor(username, quality, gen):
             log(err)
             if attempt >= len(RETRY_BACKOFFS):
                 with LOCK:
-                    rec = ACTIVE.get(username)
-                    if rec and rec.get("gen") == gen:
-                        ACTIVE.pop(username, None)
+                    _drop_slot_finalize_claimed_locked(username, gen)
                 return
             backoff = RETRY_BACKOFFS[attempt]
             attempt += 1
@@ -1532,9 +1562,7 @@ def record_supervisor(username, quality, gen):
             log(f"retry {username} in {backoff}s (attempt {attempt})")
             if not interruptible_backoff(username, gen, backoff):
                 with LOCK:
-                    rec = ACTIVE.get(username)
-                    if rec and rec.get("gen") == gen:
-                        ACTIVE.pop(username, None)
+                    _drop_slot_finalize_claimed_locked(username, gen)
                 return
             continue
 
@@ -1544,7 +1572,7 @@ def record_supervisor(username, quality, gen):
             if not rec or rec.get("gen") != gen or not rec.get("want", True):
                 terminate_proc(proc)
                 if rec and rec.get("gen") == gen:
-                    ACTIVE.pop(username, None)
+                    _drop_slot_finalize_claimed_locked(username, gen)
                 return
             rec["proc"] = proc
             rec["file"] = str(out)
@@ -1559,9 +1587,7 @@ def record_supervisor(username, quality, gen):
         if not still_wanted(username, gen):
             terminate_proc(proc)
             with LOCK:
-                rec = ACTIVE.get(username)
-                if rec and rec.get("gen") == gen:
-                    ACTIVE.pop(username, None)
+                _drop_slot_finalize_claimed_locked(username, gen)
             return
         if ok:
             set_last_error(username, None)
@@ -1622,9 +1648,7 @@ def record_supervisor(username, quality, gen):
                 log(f"restart grace {username}: retry in {backoff}s (try {tries + 1}, until {_clock_label(until)})")
                 if not interruptible_backoff(username, gen, backoff):
                     with LOCK:
-                        rec = ACTIVE.get(username)
-                        if rec and rec.get("gen") == gen:
-                            ACTIVE.pop(username, None)
+                        _drop_slot_finalize_claimed_locked(username, gen)
                     return
                 released = grace_release_reason(username, gen)
                 if not released:
@@ -1637,9 +1661,7 @@ def record_supervisor(username, quality, gen):
                 set_last_error(username, f"stopped retrying {username} after {tries} tries over "
                                          f"{int(round((now - first_fail_at) / 60.0))} min — {err}")
             with LOCK:
-                rec = ACTIVE.get(username)
-                if rec and rec.get("gen") == gen:
-                    ACTIVE.pop(username, None)
+                _drop_slot_finalize_claimed_locked(username, gen)
             log(f"gave up on {username} after {tries} attempts")
             return
         backoff = RETRY_BACKOFFS[attempt]
@@ -1656,15 +1678,11 @@ def record_supervisor(username, quality, gen):
         log(f"retry {username} in {backoff}s (attempt {attempt + 1}/{max_attempts})")
         if not interruptible_backoff(username, gen, backoff):
             with LOCK:
-                rec = ACTIVE.get(username)
-                if rec and rec.get("gen") == gen:
-                    ACTIVE.pop(username, None)
+                _drop_slot_finalize_claimed_locked(username, gen)
             return
 
     with LOCK:
-        rec = ACTIVE.get(username)
-        if rec and rec.get("gen") == gen:
-            ACTIVE.pop(username, None)
+        _drop_slot_finalize_claimed_locked(username, gen)
 
 
 def watch_and_resume(username, quality, gen, proc):
@@ -2002,6 +2020,8 @@ def start_record(username, quality, started_by=None):
         if claimed:
             cur = ACTIVE[username].setdefault("sessionSegments", [])
             ACTIVE[username]["sessionSegments"] = [c for c in claimed if c not in cur] + cur
+    if claimed:  # v6.54: re-note them under this run now, so a second crash before the new
+        live_session_touch(username, gen)  # recording establishes can't lose them either
     t = threading.Thread(
         target=record_supervisor,
         args=(username, quality, gen),
@@ -3090,6 +3110,7 @@ def self_test():
     _self_test_cp1252_sends()  # v6.51
     _self_test_go_live_schedule()  # v6.52
     _self_test_orphan_recovery()  # v6.53
+    _self_test_claimed_unstarted()  # v6.54
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -7907,6 +7928,86 @@ def _self_test_orphan_recovery():
         assert "until 9:14 PM" in grace_wait_msg("x", time.mktime((2026, 10, 16, 21, 14, 0, 0, 0, -1)), None)
     finally:
         REC_DIR, PIPELINE_FILE = prev_rec, prev_pf
+        with PIPELINE_LOCK:
+            PIPELINE["liveSessions"] = prev_ls
+        with ORPHAN_LOCK:
+            ORPHAN_SESSIONS.clear()
+            ORPHAN_SESSIONS.update(prev_or)
+        LIVE_RECOVER_LOG[:] = prev_log
+
+
+def _self_test_claimed_unstarted():
+    """v6.54: claimed cut-off segments are finalized when the resumed recording never starts,
+    and are re-noted (liveSessions, this run) as soon as they are claimed."""
+    import tempfile as _tmp_cu
+    global REC_DIR, PIPELINE_FILE, RETRY_BACKOFFS, spawn_streamlink, remember_session_segments
+    prev = (REC_DIR, PIPELINE_FILE, RETRY_BACKOFFS, spawn_streamlink, remember_session_segments)
+    with PIPELINE_LOCK:
+        prev_ls = dict(PIPELINE.get("liveSessions") or {})
+    with ORPHAN_LOCK:
+        prev_or = dict(ORPHAN_SESSIONS)
+    prev_log = list(LIVE_RECOVER_LOG)
+    u = "selftestclaim"
+    got = []
+    try:
+        with _tmp_cu.TemporaryDirectory(prefix="tar-claim-") as td:
+            REC_DIR = Path(td)
+            PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
+            now = time.time()
+            a = f"{u}-Fri-2026-10-23T19-00-00.ogg"
+            (REC_DIR / a).write_bytes(b"x" * (SCRUB_MAX_BYTES + 10))
+            os.utime(REC_DIR / a, (now - 600, now - 600))
+            with ORPHAN_LOCK:
+                ORPHAN_SESSIONS.clear()
+                ORPHAN_SESSIONS[u] = {"segments": [a], "run": "old-run"}
+            with PIPELINE_LOCK:
+                PIPELINE["liveSessions"] = {u: {"segments": [a], "run": "old-run"}}
+
+            def _no_streamlink(cmd):
+                raise OSError("self-test: streamlink unavailable")
+            spawn_streamlink = _no_streamlink
+            RETRY_BACKOFFS = ()  # give up on the first failed start
+            remember_session_segments = lambda user, segs, reason="stream-end": got.append((user, list(segs), reason))
+            with LOCK:
+                ACTIVE.pop(u, None)
+                gen = GEN.get(u, 0) + 1
+                GEN[u] = gen
+                ACTIVE[u] = {"proc": None, "file": "", "want": True, "gen": gen, "starting": True,
+                             "retrying": False, "supervised": False, "sessionSegments": [],
+                             "sessionStartedAt": ""}
+            claimed = claim_orphan_segments(u)
+            assert claimed == [a], claimed
+            with LOCK:
+                ACTIVE[u]["sessionSegments"] = list(claimed)
+            live_session_touch(u, gen)
+            with PIPELINE_LOCK:
+                ent = dict((PIPELINE.get("liveSessions") or {}).get(u) or {})
+            assert ent.get("run") == MY_RUN_ID and ent.get("segments") == [a], ent  # re-noted
+            record_supervisor(u, "audio_only", gen)  # streamlink fails → slot dropped
+            with LOCK:
+                assert u not in ACTIVE
+            assert got == [(u, [a], RECOVER_UNSTARTED_REASON)], got
+            # no claimed segments → plain drop, nothing finalized
+            got.clear()
+            with LOCK:
+                gen = GEN.get(u, 0) + 1
+                GEN[u] = gen
+                ACTIVE[u] = {"proc": None, "file": "", "want": True, "gen": gen, "starting": True,
+                             "retrying": False, "supervised": False, "sessionSegments": []}
+            record_supervisor(u, "audio_only", gen)
+            with LOCK:
+                assert u not in ACTIVE
+            assert got == [], got
+            # a slot of another generation is never touched
+            with LOCK:
+                ACTIVE[u] = {"gen": 99, "sessionSegments": [a]}
+                assert _drop_slot_finalize_claimed_locked(u, 98) == [] and u in ACTIVE
+                ACTIVE.pop(u, None)
+    finally:
+        REC_DIR, PIPELINE_FILE, RETRY_BACKOFFS, spawn_streamlink, remember_session_segments = prev
+        with LOCK:
+            ACTIVE.pop(u, None)
+        LAST_ERROR.pop(u, None) if isinstance(globals().get("LAST_ERROR"), dict) else None
         with PIPELINE_LOCK:
             PIPELINE["liveSessions"] = prev_ls
         with ORPHAN_LOCK:
