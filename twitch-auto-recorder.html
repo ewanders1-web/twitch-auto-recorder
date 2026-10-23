@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.55</span>
+    <span class="badge">v6.56</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -268,6 +268,8 @@
     <div id="pendingRestartBanner" class="alert alert-err hidden" role="status"></div>
     <!-- v6.47: sticky when macOS Full Disk Access / missing Drive blocks status + parts -->
     <div id="driveAccessBanner" class="alert alert-err hidden" role="status"></div>
+    <!-- v6.56: sticky when the local helper can't be reached (not running / crashed) -->
+    <div id="helperDownBanner" class="alert alert-err hidden" role="status"></div>
 
     <!-- live now banners -->
     <div id="liveNowBox"></div>
@@ -557,7 +559,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.55'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.56'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -568,6 +570,7 @@ let orphanTempsFlashedKey = ''; // v6.29: one soft flash per orphan cleanup summ
 let recoverFlashedAt = 0; // v6.53: newest cut-off-recording recovery already flashed
 let autoMusicQueued = new Set(); // basenames already auto-queued this session (dedupe mid-stream + stop)
 let helperDemucsMissingNotified = false; // v6.24: one-shot demucs-missing flash/notify per episode
+let helperDownSince = 0; // v6.56: when the helper first stopped answering (0 = reachable)
 let helperDriveAccessBlockedNotified = false; // v6.47: one-shot Drive-access flash/notify per blocked episode
 let updateCheck = { localVersion:'', remoteVersion:'', updateAvailable:false, checking:false, installing:false }; // v6.25
 
@@ -880,6 +883,8 @@ function markHelperDown(wasOk){
   const driveAccBan=document.getElementById('driveAccessBanner');
   if(driveAccBan){ driveAccBan.classList.add('hidden'); driveAccBan.innerHTML=''; }
   noticeHelperDropped(wasOk);
+  if(!helperDownSince) helperDownSince=Date.now(); // v6.56
+  try{ updateHelperDownBanner(); }catch(e){}
   try{ driveState.status=null; driveState.loaded=false; renderDriveCard(); }catch(e){}
   updateHelperBar();
   updateDemucsUi();
@@ -1036,8 +1041,8 @@ function applyMusicJobsFromHealth(jobs){
         fireNotify('tar-music-'+j.jobId, 'Music ready', j.outputName||j.name||'Music only done');
         if(j.outputName) triggerNamedDownload(j.outputName);
       }else{
-        flashErr('Music only failed: '+(j.error||'unknown'));
-        fireNotify('tar-music-'+j.jobId, 'Music only failed', j.error||j.name||'error');
+        flashErr('Music only failed: '+voiceErrText(j.error));
+        fireNotify('tar-music-'+j.jobId, 'Music only failed', j.error?voiceErrText(j.error):(j.name||'error'));
       }
     }
   })().catch(function(e){ console.warn('musicJobs notify', e); });
@@ -1488,6 +1493,7 @@ function pingHelperAndStatus(){
       applyPipelineFromHealth(d); // v6.36
       if(!helperOkSince) helperOkSince=Date.now(); // v6.43
       renderAutoUpdateLine(); // v6.43
+      helperDownSince=0; try{ updateHelperDownBanner(); }catch(_e){} // v6.56
       try{ noticeStreamlinkUpdate(); }catch(_e){} // v6.55
     }else{
       markHelperDown(wasOk);
@@ -1988,6 +1994,98 @@ function noticeHelperDemucs(){
   flashErr('Auto Music only paused — demucs missing. '+demucsInstallMsg()+', then restart the helper.');
   fireNotify('tar-demucs', 'demucs missing', 'Auto Music only soft-skipped until you pip install demucs and restart the helper');
 }
+// v6.56: Full Disk Access banner — exact path(s), open-settings button, check that confirms access
+const FDA_SETTINGS_URL='x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles';
+let fdaCheckMsg='';
+function fdaBannerHtml(da){
+  const paths=(da && Array.isArray(da.fdaPaths) && da.fdaPaths.length)?da.fdaPaths:(da && da.fdaPath?[da.fdaPath]:[]);
+  const st=(da && da.stuck)||{};
+  const waiting=[(st.originals?st.originals+' original'+(st.originals===1?'':'s'):''),(st.parts?st.parts+' part set'+(st.parts===1?'':'s'):'')].filter(Boolean).join(' and ');
+  let h='❌ <strong>macOS is blocking this helper from Google Drive</strong> (Full Disk Access is off for its Python)'
+    +(waiting?(' — <strong>'+driveEsc(waiting)+'</strong> waiting to go to Drive'):'')+', and the Recorder status file can&#39;t reach Drive. Nothing is lost; it all goes out once access works.'
+    +'<ol style="margin:.4rem 0 .4rem 1.2rem;padding:0">'
+    +'<li><button type="button" class="btn btn-gray btn-sm" onclick="openFdaSettings()">Open Full Disk Access settings</button> (System Settings → Privacy &amp; Security → Full Disk Access)</li>'
+    +'<li>Press <strong>+</strong>, press <strong>⌘⇧G</strong>, paste this path, press Open, and turn it on:<br>';
+  if(paths.length){
+    h+='<code style="user-select:all;word-break:break-all">'+driveEsc(paths[0])+'</code> <button type="button" class="btn btn-gray btn-sm" onclick="copyFdaPath(0)">Copy path</button>';
+    if(paths.length>1) h+='<br><span style="opacity:.85">If it still says blocked, also add </span><code style="user-select:all;word-break:break-all">'+driveEsc(paths[1])+'</code> <button type="button" class="btn btn-gray btn-sm" onclick="copyFdaPath(1)">Copy</button>';
+  }else{
+    h+='the helper&#39;s python3 (update the helper to v6.56 to see the exact path)';
+  }
+  h+='</li><li><button type="button" class="btn btn-gray btn-sm" onclick="driveAccessCheckNow()">I turned it on — check now</button> '
+    +'<span class="muted">(the helper also re-checks every minute and then sends everything waiting, skipping files already in Drive)</span></li></ol>'
+    +'<span class="muted">A local copy of the status file still updates under <code>~/TwitchRecordings/Recorder status/</code>.</span>'
+    +(fdaCheckMsg?('<div style="margin-top:.3rem"><strong>'+driveEsc(fdaCheckMsg)+'</strong></div>'):'');
+  return h;
+}
+function fdaPathsNow(){
+  const da=helper.driveAccess||{};
+  return (Array.isArray(da.fdaPaths) && da.fdaPaths.length)?da.fdaPaths:(da.fdaPath?[da.fdaPath]:[]);
+}
+function copyFdaPath(i){
+  const p=fdaPathsNow()[i||0];
+  if(!p) return;
+  try{ navigator.clipboard.writeText(p).then(function(){ flashOk('Path copied — paste it after ⌘⇧G in the Full Disk Access + dialog.'); }); }
+  catch(e){ flashErr('Copy failed — select the path and copy it by hand.'); }
+}
+async function openFdaSettings(){
+  // Ask the helper to open the pane (and show its python in Finder); fall back to the system URL.
+  let ok=false;
+  try{ const d=await helperFetch('/api/drive/access/open-settings', {}, 4000); ok=!!(d && d.ok); }catch(e){}
+  if(!ok){ try{ window.location.href=FDA_SETTINGS_URL; }catch(e){} }
+}
+async function driveAccessCheckNow(){
+  fdaCheckMsg='Checking…'; try{ noticeHelperDriveAccess(); }catch(e){}
+  let d=null;
+  try{ d=await helperFetch('/api/drive/access/check', {}, 20000); }catch(e){}
+  if(!d || d.error==='bad json' || d.ok===undefined || (d.ok===false && d.kind===undefined)){
+    fdaCheckMsg='This helper cannot run the check yet — it needs v6.56 (installs itself when idle). It keeps retrying every 5 min meanwhile.';
+  }else if(d.ok){
+    const k=d.kicked||{};
+    fdaCheckMsg='';
+    flashOk('✅ Google Drive access works — sending '+((k.originals||0)+' original(s) and '+(k.parts||0)+' part set(s)')+' that were waiting (files already in Drive are skipped).');
+    if(d.access) helper.driveAccess=d.access;
+  }else{
+    fdaCheckMsg=(d.kind==='fda')
+      ? 'Still blocked. Make sure the switch next to the path is ON. If you just turned it on, press Restart helper (macOS sometimes only applies it to a fresh start).'
+      : ('Still not working: '+String(d.error||'unknown'));
+    if(d.access) helper.driveAccess=d.access;
+  }
+  try{ noticeHelperDriveAccess(); }catch(e){}
+  setTimeout(function(){ pingHelperAndStatus().catch(function(){}); }, 1500);
+}
+// v6.56: plain words for voice-removal errors (no raw tracebacks in banners)
+function voiceErrText(e){
+  const t=String(e||'').trim();
+  if(!t) return 'unknown error';
+  if(/appropriate backend|torchcodec|no audio i\/o backend/i.test(t))
+    return 'Voice removal couldn\'t save its audio file (torchaudio has no audio backend on this computer). Helper v6.56 saves it another way — let the helper update (or Check for updates → Install), then Retry.';
+  if(/Traceback|\n/.test(t)){
+    const lines=t.split(/\n/).map(function(x){ return x.trim(); }).filter(Boolean);
+    return (lines[lines.length-1]||t).slice(-300);
+  }
+  return t.length>400?(t.slice(0,400)+'…'):t;
+}
+// v6.56: loud, sticky warning when the helper isn't reachable (not just a one-time drop flash)
+function helperOsHint(){
+  const ua=(navigator.userAgent||'');
+  if(/Windows/i.test(ua)) return 'On Windows: double-click <code>twitch-recorder-server.py</code> in <code>%LOCALAPPDATA%\\TwitchRecorder</code> (or run <code>python twitch-recorder-server.py</code> there) once. From v6.56 the helper adds itself to Startup and a watchdog restarts it if it stops.';
+  if(/Mac/i.test(ua)) return 'On the Mac: use the Relaunch Twitchy Too launcher (or run <code>python3 twitch-recorder-server.py</code> in the helper folder).';
+  return 'Start it with <code>python twitch-recorder-server.py</code>.';
+}
+function updateHelperDownBanner(){
+  const ban=document.getElementById('helperDownBanner');
+  if(!ban) return;
+  const downFor=helperDownSince?(Date.now()-helperDownSince):0;
+  if(helper.ok || !helperDownSince || downFor<20000){ ban.classList.add('hidden'); ban.innerHTML=''; return; }
+  const armed=(typeof streamers!=='undefined' && streamers)?streamers.filter(function(s){ return s && s.autoRec; }).map(function(s){ return s.username; }):[];
+  const mins=Math.round(downFor/60000);
+  ban.innerHTML='⚠️ <strong>The recorder helper isn&#39;t running</strong> on this computer (no answer from 127.0.0.1:8765 for '+(mins>=1?(mins+' min'):'a few seconds')+'). '
+    +'Streams are <strong>not</strong> being recorded by the helper'+(armed.length?(' — armed: '+driveEsc(armed.join(', '))):'')+', and nothing is sent to Drive until it is back. '
+    +helperOsHint();
+  ban.classList.remove('hidden');
+}
+setInterval(function(){ try{ updateHelperDownBanner(); }catch(e){} }, 15000);
 function noticeHelperDriveAccess(){
   // v6.47: sticky banner when Drive status/parts writes are blocked (FDA / missing Drive / other)
   if(!helper.ok) return;
@@ -2006,10 +2104,7 @@ function noticeHelperDriveAccess(){
   const kind=da.kind||'other';
   let body;
   if(kind==='fda'){
-    body='❌ <strong>macOS is blocking Google Drive</strong> (Full Disk Access) — status file and part sends cannot reach Drive. '
-      +'Open <strong>System Settings → Privacy &amp; Security → Full Disk Access</strong>, add the helper&#39;s python3, turn it on. '
-      +'A local copy still updates under <code>~/TwitchRecordings/Recorder status/</code>. '
-      +'<span style="opacity:.85">'+driveEsc(err)+'</span>';
+    body=fdaBannerHtml(da); // v6.56: exact path + settings button + check-now
   }else if(kind==='missing'){
     body='❌ <strong>Google Drive for Desktop not found</strong> — status file and parts wait until Drive is installed/signed in. '
       +'Local status still updates under <code>~/TwitchRecordings/Recorder status/</code>.';
@@ -4244,7 +4339,7 @@ function renderHist(){
       }else{
         const hasMusic=!!musicName;
         const label=hasMusic?'Music ready':'Music only';
-        const errTitle=(mj && mj.status==='error')?String(mj.error||'error').replace(/"/g,'&quot;'):('Export instrumental — '+voiceQualityLabel(effectiveVoiceQuality())+'; native file stays untouched');
+        const errTitle=(mj && mj.status==='error')?voiceErrText(mj.error||'error').replace(/"/g,'&quot;'):('Export instrumental — '+voiceQualityLabel(effectiveVoiceQuality())+'; native file stays untouched');
         musicCtrl=`<label class="music-redo" title="When checked, replace existing -music / -vocals export"><input type="checkbox" data-music-redo="${i}" onchange="syncMusicBtnLabel(${i})"> Redo</label>`
           +`<button class="btn ${hasMusic?'btn-gray':'btn-purple'} btn-sm" data-music-btn="${i}" data-has-music="${hasMusic?'1':'0'}" onclick="startMusicOnly(${i})" title="${errTitle}">${label}</button>`;
       }
@@ -5015,7 +5110,7 @@ function renderDriveJobs(){
     if(active) line+=musicProgressHtml(j, {fallback:'Working…'});
     else if(st==='done' && j.source==='split') line+='<div class="drive-job-sub ok">✓ '+driveEsc(j.progress||'Split done')+'</div>';
     else if(st==='done') line+='<div class="drive-job-sub ok">✓ '+driveEsc(j.already?'Already had music: ':'Saved: ')+driveEsc(j.outputPath||j.outputName||'')+(j.keptSourceName?' · source kept as '+driveEsc(j.keptSourceName):'')+'</div>';
-    else if(st==='error') line+='<div class="drive-job-sub err">✗ '+driveEsc(j.error||'error')+'</div>';
+    else if(st==='error') line+='<div class="drive-job-sub err">✗ '+driveEsc(voiceErrText(j.error||'error'))+'</div>';
     else if(st==='cancelled') line+='<div class="drive-job-sub">Cancelled</div>';
     if(j.info || j.quality) line+='<div class="drive-job-sub">'+driveEsc([j.info, j.quality?('Quality: '+voiceQualityLabel(j.quality)+(j.qualityNote?' — '+j.qualityNote:'')):''].filter(Boolean).join(' · '))+'</div>';
     return line+'</div>';
@@ -5041,8 +5136,8 @@ function applyDriveJobsFromHealth(jobs){
         flashOk('Voice removed: '+driveEsc(j.outputName||j.displayName||'done'));
         fireNotify('tar-drive-'+j.jobId, 'Voice removed', j.outputPath||j.outputName||'');
       }else{
-        flashErr('Remove voice failed ('+driveEsc(j.displayName||'')+'): '+driveEsc(j.error||'unknown'));
-        fireNotify('tar-drive-'+j.jobId, 'Remove voice failed', j.error||'');
+        flashErr('Remove voice failed ('+driveEsc(j.displayName||'')+'): '+driveEsc(voiceErrText(j.error)));
+        fireNotify('tar-drive-'+j.jobId, 'Remove voice failed', voiceErrText(j.error));
       }
     }else if(st==='cancelled') driveJobsNotified.add(j.jobId);
   });

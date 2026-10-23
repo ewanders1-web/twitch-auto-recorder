@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.55"
+HELPER_VERSION = "6.56"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -3690,6 +3690,7 @@ def self_test():
     _self_test_orphan_recovery()  # v6.53
     _self_test_claimed_unstarted()  # v6.54
     _self_test_streamlink_update()  # v6.55
+    _self_test_v656()  # v6.56
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -3853,6 +3854,7 @@ def health_payload():
         "driveAccess": drive_access_snapshot(),  # v6.47: sticky banner when FDA/Drive blocks
         "autoUpdate": auto_update_snapshot(),  # v6.43
         "streamlinkUpdate": streamlink_update_snapshot(),  # v6.55
+        "autostart": autostart_snapshot(),  # v6.56 (Windows only; null elsewhere)
         "soloWatch": solo_watch_snapshot(),  # v6.49
         "recoveredSessions": recovery_snapshot(),  # v6.53
         # v6.51: log lines the console/log file couldn't take as-is (Windows code page, closed pipe)
@@ -4157,10 +4159,7 @@ def _run_demucs(src_path, work_dir, progress_cb):
         progress_cb("Running demucs (two-stems vocals / no_vocals)…", pct=5)
     except TypeError:
         progress_cb("Running demucs (two-stems vocals / no_vocals)…")
-    if demucs == "python -m demucs":
-        cmd = [sys.executable, "-m", "demucs"]
-    else:
-        cmd = [demucs]
+    cmd = demucs_cmd_base()  # v6.56: saves through soundfile/wave if torchaudio has no backend
     cmd += [
         "--two-stems=vocals",
         "-o",
@@ -4263,7 +4262,8 @@ def _run_demucs(src_path, work_dir, progress_cb):
             err = "".join(last_lines).strip()
         if len(err) > 800:
             err = err[-800:]
-        raise RuntimeError(f"demucs failed (exit {rc}): {err or 'unknown'}")
+        log(f"demucs failed (exit {rc}): {err[-400:] or 'unknown'}")
+        raise RuntimeError(friendly_demucs_error(err, "demucs") + f" (exit {rc})")  # v6.56: no raw traceback
     stem = _find_no_vocals(work_dir)
     if not stem:
         raise RuntimeError("demucs finished but no_vocals stem not found")
@@ -5977,7 +5977,7 @@ def chunked_demucs_no_vocals(job_id, src, work, duration, progress, pct_lo=20.0,
     if not chunks:
         raise RuntimeError("ffmpeg split produced no chunks")
     n = len(chunks)
-    base_cmd = _demucs_base_cmd()
+    base_cmd = demucs_cmd_base()  # v6.56
     span = pct_hi - pct_lo
     outs = []
     for i, chunk in enumerate(chunks):
@@ -6020,7 +6020,8 @@ def chunked_demucs_no_vocals(job_id, src, work, duration, progress, pct_lo=20.0,
                 log(f"drive-music job={job_id}: demucs on mps failed — falling back to cpu")
                 progress(f"{label}: MPS failed, retrying on CPU…", None)
         if stem_wav is None:
-            raise RuntimeError(f"demucs failed on chunk {i + 1}/{n}: {last_err or 'unknown'}")
+            log(f"drive-music job={job_id}: demucs failed on chunk {i + 1}/{n}: {last_err or 'unknown'}")
+            raise RuntimeError(friendly_demucs_error(last_err, f"demucs (chunk {i + 1}/{n})"))  # v6.56
         # Keep only no_vocals, as FLAC (saves ~45% disk on 4 h files).
         flac = stems_dir / f"{chunk.stem}.flac"
         rc, tail = _job_run_proc(
@@ -7376,10 +7377,16 @@ def drive_permission_message():
         return ("Windows refused access to the Google Drive folder (permission denied). Make sure Google "
                 "Drive for Desktop is running and signed in, the target folder is not read-only, and no "
                 "file with the same name is open — the helper retries every 5 min.")
-    return ("macOS is blocking the helper from Google Drive (Operation not permitted). "
+    try:  # v6.56: name every path macOS may check (framework Python re-launches Python.app)
+        paths = fda_paths()
+        exe = paths[0]
+        also = (f" (if it stays blocked, also add {paths[1]})" if len(paths) > 1 else "")
+    except Exception:
+        also = ""
+    return ("macOS is blocking the helper from Google Drive (Operation not permitted — Full Disk Access). "
             "Open System Settings → Privacy & Security → Full Disk Access, press +, add "
-            f"{exe} (⌘⇧G to type the path) and turn it on — the helper retries every 5 min "
-            "and sends the waiting parts on its own.")
+            f"{exe} (⌘⇧G to type the path){also} and turn it on — the helper re-checks every minute "
+            "and sends everything waiting on its own.")
 
 
 def _my_drive_dir(root):
@@ -9651,6 +9658,16 @@ def _drive_access_kind(err):
 
 
 def drive_access_snapshot():
+    """v6.56: base snapshot + exact Full Disk Access path(s), settings link and the stuck backlog."""
+    snap = _drive_access_snapshot_base()
+    try:
+        snap.update(drive_access_extra(snap.get("kind")))
+    except Exception as e:
+        snap["extraError"] = str(e)
+    return snap
+
+
+def _drive_access_snapshot_base():
     """Whether Drive status/delivery writes can succeed. Prefer STATUS_FILE.error from
     write_status_file (the real probe); when no error yet, refresh from Drive roots + target."""
     with STATUS_FILE_LOCK:
@@ -10316,6 +10333,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload, status = api_streamlink_update(self.read_json())
             self.send_json(payload, status=status)
             return
+        if path in ("/api/drive/access/check", "/api/drive/access/open-settings"):  # v6.56
+            if not origin_allowed(self.headers.get("Origin")):
+                self.send_json({"ok": False, "error": "origin not allowed"}, status=403)
+                return
+            self.read_json()
+            if path.endswith("/check"):
+                self.send_json(drive_access_recheck("page"))
+            else:
+                self.send_json(open_fda_settings())
+            return
         if path == "/api/restart":
             body = self.read_json()
             force = bool((body or {}).get("force")) if isinstance(body, dict) else False
@@ -10506,6 +10533,639 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json({"ok": False, "error": f"not found: {path}"}, status=404)
 
 
+# ─── v6.56: macOS Full Disk Access for Google Drive (loud failure + auto backlog retry) ──────────
+# Why there is no silent workaround: Google Drive for Desktop on current macOS keeps BOTH stream and
+# mirror mode under ~/Library/CloudStorage (a File Provider folder). macOS only lets a background
+# process such as the LaunchAgent helper's python write there with Full Disk Access; copying via
+# Finder / AppleScript needs a different privacy approval (Automation) that a background helper
+# can't ask for either. So the helper makes the block loud, shows the exact path to add, re-checks
+# on its own once a minute and sends the backlog as soon as the block is lifted.
+FDA_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+DRIVE_ACCESS_PROBE_SECS = max(15, int(os.environ.get("TWITCH_RECORDER_DRIVE_PROBE_SECS") or 60))
+DRIVE_ACCESS_LOCK = threading.Lock()
+DRIVE_ACCESS = {"lastProbeAt": 0.0, "lastProbeOk": None, "lastProbeError": None, "lastProbeKind": None,
+                "blockedSince": 0.0, "restoredAt": 0.0, "lastKick": None}
+
+
+def fda_paths(executable=None, base_prefix=None, exists=None):
+    """Paths to add under Full Disk Access (pure-ish, unit-testable).
+
+    First the real python binary (e.g. …/Python3.framework/Versions/3.9/bin/python3.9); for a
+    framework Python also its Python.app, because that stub re-launches Python.app and macOS may
+    check either one."""
+    exists = exists or os.path.exists
+    exe = os.path.realpath(executable or sys.executable or "python3")
+    out = [exe]
+    pre = base_prefix if base_prefix is not None else getattr(sys, "base_prefix", "") or ""
+    if pre:
+        app = os.path.join(pre, "Resources", "Python.app")
+        if exists(app) and app not in out:
+            out.append(app)
+    return out
+
+
+def drive_stuck_counts():
+    with PIPELINE_LOCK:
+        origs = list((PIPELINE.get("originals") or {}).values())
+        dels = list(PIPELINE["deliveries"].values())
+    return {"originals": sum(1 for d in origs if d.get("status") in ("error", "waiting")),
+            "parts": sum(1 for d in dels if d.get("status") in ("error", "waiting"))}
+
+
+def drive_access_probe():
+    """Really try a write in the Drive target: (ok, error, kind). Leaves nothing behind."""
+    roots = detect_drive_roots()
+    if not roots:
+        return False, "Google Drive for Desktop not found", "missing"
+    try:
+        target, _kind, terr = resolve_delivery_target(roots, create=True)
+        if terr or not target:
+            msg = terr or "Drive target unavailable"
+            return False, msg, _drive_access_kind(msg)
+        probe = Path(target) / f".tar-access-check-{os.getpid()}"
+        probe.write_bytes(b"ok")
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+        return True, None, "ok"
+    except PermissionError:
+        msg = drive_permission_message()
+        return False, msg, _drive_access_kind(msg)
+    except OSError as e:
+        msg = str(e) or type(e).__name__
+        if getattr(e, "errno", None) in (1, 13):  # EPERM / EACCES
+            msg = drive_permission_message()
+        return False, msg, _drive_access_kind(msg)
+
+
+def _drive_blocked_now():
+    """True when the last status write or any stuck original/part failed on a Drive permission block."""
+    with STATUS_FILE_LOCK:
+        err = STATUS_FILE.get("error")
+    if err and _drive_access_kind(err) == "fda":
+        return True
+    with PIPELINE_LOCK:
+        items = list((PIPELINE.get("originals") or {}).values()) + list(PIPELINE["deliveries"].values())
+    return any(d.get("status") == "error" and _drive_access_kind(d.get("error")) == "fda" for d in items)
+
+
+def drive_access_recheck(source="auto"):
+    """Probe Drive now. When it works and something was stuck, clear the old error and send the
+    backlog (place_in_drive skips files already in Drive with the same name+size → no duplicates)."""
+    was_blocked = _drive_blocked_now()
+    ok, err, kind = drive_access_probe()
+    now = time.time()
+    kicked = None
+    with DRIVE_ACCESS_LOCK:
+        prev_ok = DRIVE_ACCESS.get("lastProbeOk")
+        DRIVE_ACCESS.update(lastProbeAt=now, lastProbeOk=ok, lastProbeError=err, lastProbeKind=kind)
+        if not ok and (prev_ok is not False or not DRIVE_ACCESS.get("blockedSince")):
+            DRIVE_ACCESS["blockedSince"] = now
+    if ok:
+        with STATUS_FILE_LOCK:
+            had = STATUS_FILE.get("error")
+            STATUS_FILE["error"] = None
+            if had:
+                STATUS_FILE["lastWrittenAt"] = 0.0  # status loop writes on its next pass
+        stuck = drive_stuck_counts()
+        if was_blocked or had or stuck["originals"] or stuck["parts"]:
+            kicked = dict(stuck)
+            with DRIVE_ACCESS_LOCK:
+                if was_blocked or had:
+                    DRIVE_ACCESS["restoredAt"] = now
+                    DRIVE_ACCESS["blockedSince"] = 0.0
+                DRIVE_ACCESS["lastKick"] = {"at": now, "source": source, **stuck}
+            if was_blocked or had:
+                log(f"drive access OK again ({source}) — retrying {stuck['originals']} original(s) and "
+                    f"{stuck['parts']} part set(s) waiting for Drive")
+            request_delivery(None)
+    elif source != "auto":
+        log(f"drive access check ({source}): still blocked — {err}")
+    return {"ok": ok, "error": err, "kind": kind, "kicked": kicked, "access": drive_access_snapshot()}
+
+
+def drive_access_loop():
+    """Re-check once a minute while Drive is blocked so the backlog goes out minutes after access works."""
+    time.sleep(20)
+    while True:
+        try:
+            if _drive_blocked_now():
+                with DRIVE_ACCESS_LOCK:
+                    last = float(DRIVE_ACCESS.get("lastProbeAt") or 0.0)
+                if time.time() - last >= DRIVE_ACCESS_PROBE_SECS:
+                    drive_access_recheck("auto")
+        except Exception as e:
+            log(f"drive access loop: {e}")
+        time.sleep(15)
+
+
+def drive_access_extra(kind):
+    """Extra fields for /api/health.driveAccess (banner: exact path, settings link, backlog)."""
+    with DRIVE_ACCESS_LOCK:
+        da = dict(DRIVE_ACCESS)
+    out = {"platform": sys.platform, "lastProbeAt": da.get("lastProbeAt") or None,
+           "blockedSince": da.get("blockedSince") or None, "restoredAt": da.get("restoredAt") or None,
+           "lastKick": da.get("lastKick"), "stuck": drive_stuck_counts(),
+           "probeEverySecs": DRIVE_ACCESS_PROBE_SECS}
+    if kind == "fda" or sys.platform == "darwin":
+        paths = fda_paths()
+        out.update(fdaPath=paths[0], fdaPaths=paths, settingsUrl=FDA_SETTINGS_URL)
+    return out
+
+
+def open_fda_settings(reveal=True):
+    """macOS: open Privacy & Security → Full Disk Access and show the python to add in Finder."""
+    if sys.platform != "darwin":
+        return {"ok": False, "error": "Full Disk Access is a macOS setting"}
+    opened = []
+    try:
+        subprocess.Popen(["open", FDA_SETTINGS_URL], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        opened.append("settings")
+        if reveal:
+            subprocess.Popen(["open", "-R", fda_paths()[0]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            opened.append("finder")
+    except OSError as e:
+        return {"ok": False, "error": str(e), "opened": opened}
+    return {"ok": True, "opened": opened, "fdaPaths": fda_paths(), "settingsUrl": FDA_SETTINGS_URL}
+
+
+# ─── v6.56: demucs can save without a torchaudio audio backend ───────────────────────────────────
+# demucs saves vocals.wav / no_vocals.wav with torchaudio.save. On the Mac torchaudio had no backend
+# ("Couldn't find appropriate backend to handle uri …"), newer torchaudio wants TorchCodec. demucs now
+# runs through a tiny launcher that keeps torchaudio.save but falls back to soundfile, then to the
+# standard-library wave writer (16/24-bit / float WAV) — nothing extra to install.
+DEMUCS_SAVE_SHIM = r'''
+import sys
+def _tar_patch():
+    try:
+        import torchaudio as _ta
+    except Exception:
+        return
+    _orig = getattr(_ta, "save", None)
+    _said = []
+    def _wave_write(path, arr, sr, bits, encoding):
+        import wave, numpy as np
+        a = np.asarray(arr, dtype="float32")
+        if a.ndim == 1:
+            a = a[None, :]
+        a = a.T  # frames x channels
+        enc = str(encoding or "").upper()
+        if bits == 24:
+            v = np.ascontiguousarray((np.clip(a, -1.0, 1.0 - 1.0 / 8388608) * 8388608.0).astype("<i4"))
+            raw = v.view("u1").reshape(-1, 4)[:, :3].tobytes()
+            width = 3
+        else:
+            v = np.ascontiguousarray((np.clip(a, -1.0, 1.0 - 1.0 / 32768) * 32768.0).astype("<i2"))
+            raw = v.tobytes()
+            width = 2
+        # (wave can't write float WAV; 16/24-bit PCM is plenty for the instrumental)
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(a.shape[1]); w.setsampwidth(width); w.setframerate(int(sr)); w.writeframes(raw)
+    def _save(uri, src, sample_rate, *a, **kw):
+        err = None
+        if _orig is not None:
+            try:
+                return _orig(uri, src, sample_rate, *a, **kw)
+            except Exception as e:
+                err = e
+        arr = src.detach().cpu().float().numpy() if hasattr(src, "detach") else src
+        bits = kw.get("bits_per_sample"); enc = kw.get("encoding")
+        try:
+            import soundfile as sf
+            sub = "PCM_24" if bits == 24 else ("FLOAT" if "FLOAT" in str(enc or "").upper() else "PCM_16")
+            sf.write(str(uri), arr.T if getattr(arr, "ndim", 1) == 2 else arr, int(sample_rate), subtype=sub)
+            how = "soundfile"
+        except Exception as e2:
+            if not str(uri).lower().endswith(".wav"):
+                raise err or e2
+            _wave_write(uri, arr, sample_rate, bits, enc)
+            how = "wave"
+        if not _said:
+            _said.append(1)
+            sys.stderr.write("[twitch-recorder] torchaudio could not save (%s) - saved with %s instead\n"
+                             % (str(err or "no torchaudio.save").splitlines()[0][:160], how))
+    _ta.save = _save
+_tar_patch()
+from demucs.separate import main as _main
+sys.argv = ["demucs"] + sys.argv[1:]
+_main()
+'''
+_DEMUCS_PY_CACHE = {}
+
+
+def demucs_python(demucs=None):
+    """Interpreter that can import demucs (the demucs script's own Python, else this one), or None."""
+    demucs = demucs if demucs is not None else which_demucs()
+    if not demucs:
+        return None
+    if demucs == "python -m demucs":
+        return sys.executable
+    if demucs in _DEMUCS_PY_CACHE:
+        return _DEMUCS_PY_CACHE[demucs]
+    found = None
+    for py in _sl_python_candidates(demucs):
+        try:
+            r = subprocess.run([py, "-c", "import demucs.separate"], capture_output=True, timeout=120,
+                               stdin=subprocess.DEVNULL, **_no_window_kw())
+            if r.returncode == 0:
+                found = py
+                break
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    _DEMUCS_PY_CACHE[demucs] = found
+    return found
+
+
+def demucs_cmd_base():
+    """[python, -c, shim] when demucs' Python is known (saves through a backend fallback), else the CLI."""
+    d = which_demucs()
+    if not d:
+        raise RuntimeError("demucs not installed — pip install demucs (first run downloads models)")
+    if os.environ.get("TWITCH_RECORDER_DEMUCS_SHIM", "1") != "0":
+        py = demucs_python(d)
+        if py:
+            return [py, "-c", DEMUCS_SAVE_SHIM]
+    return [sys.executable, "-m", "demucs"] if d == "python -m demucs" else [d]
+
+
+def friendly_demucs_error(tail, where="demucs"):
+    """Short, plain message for the page instead of a raw traceback tail."""
+    t = str(tail or "").strip()
+    low = t.lower()
+    if "appropriate backend" in low or "torchcodec" in low or "no audio i/o backend" in low:
+        py = demucs_python() or sys.executable
+        return (f"Voice removal could not save its audio file (torchaudio has no audio backend on this computer). "
+                f"Fix: {py} -m pip install soundfile — then Retry.")
+    if "out of memory" in low or "mps backend out of memory" in low:
+        return f"{where}: ran out of memory — close other apps and Retry (Settings → voice quality Fast uses less)."
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    last = lines[-1] if lines else "unknown error"
+    return f"{where} failed: {last[-300:]}"
+
+
+def _no_window_kw():
+    return {"creationflags": 0x08000000} if os.name == "nt" else {}  # CREATE_NO_WINDOW
+
+
+# ─── v6.56: Windows helper starts on login and is restarted if it stops ──────────────────────────
+# The helper registers itself (no admin needed): a Startup-folder launcher + a per-user Scheduled
+# Task every 5 minutes, both starting "<pythonw> twitch-recorder-server.py --watchdog". The watchdog
+# (one at a time) checks http://127.0.0.1:8765/api/health every 30 s and starts the helper hidden
+# when it has been unreachable twice in a row (backoff up to 5 min if it keeps crashing).
+AUTOSTART_TASK = "TwitchRecorderHelperWatchdog"
+AUTOSTART_STARTUP_NAME = "Twitch Recorder helper.vbs"
+WATCHDOG_LOCK_PORT = int(os.environ.get("TWITCH_RECORDER_WATCHDOG_PORT") or (PORT + 1000))
+WATCHDOG_CHECK_SECS = max(5, int(os.environ.get("TWITCH_RECORDER_WATCHDOG_SECS") or 30))
+AUTOSTART_STATE = {"enabled": None, "startup": None, "task": None, "watchdog": None, "error": None, "checkedAt": 0.0}
+
+
+def autostart_enabled():
+    if os.environ.get("TWITCH_RECORDER_AUTOSTART", "1") == "0":
+        return False
+    with PIPELINE_LOCK:
+        return PIPELINE.get("autostart", True) is not False
+
+
+def windowless_python(exe=None):
+    exe = exe or sys.executable or "python"
+    p = Path(exe)
+    if p.name.lower() == "python.exe":
+        w = p.with_name("pythonw.exe")
+        if w.is_file():
+            return str(w)
+    return str(exe)
+
+
+def autostart_launcher_vbs(pyw, script):
+    """Startup-folder VBScript: start the watchdog hidden (no console window)."""
+    def q(s):
+        return '""' + str(s).replace('"', '') + '""'
+    return ('\' Twitch Auto-Recorder v6.56: start the helper watchdog at login (made by the helper)\r\n'
+            'CreateObject("WScript.Shell").Run "' + q(pyw) + ' ' + q(script) + ' --watchdog", 0, False\r\n')
+
+
+def autostart_task_cmd(pyw, script):
+    tr = f'"{pyw}" "{script}" --watchdog'
+    return ["schtasks", "/Create", "/F", "/TN", AUTOSTART_TASK, "/SC", "MINUTE", "/MO", "5", "/TR", tr]
+
+
+def ensure_windows_autostart(startup_dir=None, run=None, script=None, pyw=None):
+    """Idempotent. Returns AUTOSTART_STATE-like dict. Never raises."""
+    st = {"enabled": autostart_enabled(), "startup": None, "task": None, "error": None, "checkedAt": time.time()}
+    if os.name != "nt" and startup_dir is None:
+        st["error"] = "Windows only"
+        return st
+    if not st["enabled"]:
+        return st
+    script = str(script or Path(__file__).resolve())
+    pyw = pyw or windowless_python()
+    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True, timeout=60, **_no_window_kw()))
+    try:
+        sd = Path(startup_dir) if startup_dir else (Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+                                                     / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup")
+        sd.mkdir(parents=True, exist_ok=True)
+        f = sd / AUTOSTART_STARTUP_NAME
+        body = autostart_launcher_vbs(pyw, script)
+        if not f.is_file() or f.read_text(encoding="utf-8", errors="replace") != body:
+            f.write_text(body, encoding="utf-8")
+            log(f"autostart: Startup launcher written → {f}")
+        st["startup"] = str(f)
+    except Exception as e:
+        st["error"] = f"Startup folder: {e}"
+    try:
+        r = run(autostart_task_cmd(pyw, script))
+        st["task"] = AUTOSTART_TASK if getattr(r, "returncode", 1) == 0 else None
+        if st["task"] is None:
+            st["error"] = (st["error"] + "; " if st["error"] else "") + "Scheduled Task: " + (
+                (getattr(r, "stderr", "") or getattr(r, "stdout", "") or "failed").strip()[:200])
+    except Exception as e:
+        st["error"] = (st["error"] + "; " if st["error"] else "") + f"Scheduled Task: {e}"
+    return st
+
+
+def _helper_alive(timeout=4):
+    try:
+        with urllib.request.urlopen(f"http://{HOST}:{PORT}/api/health", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def start_watchdog_detached():
+    """Start a hidden watchdog next to a running helper (it exits at once if one is already running)."""
+    if os.name != "nt" or not autostart_enabled():
+        return False
+    try:
+        subprocess.Popen([windowless_python(), str(Path(__file__).resolve()), "--watchdog"],
+                         cwd=str(INSTALL_DIR), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True,
+                         creationflags=0x00000008 | 0x00000200 | 0x08000000)  # DETACHED|NEW_GROUP|NO_WINDOW
+        return True
+    except Exception as e:
+        log(f"autostart: could not start watchdog: {e}")
+        return False
+
+
+def watchdog_decide(fails, alive, restarts_recent):
+    """(new_fails, start_now, sleep_secs). Two misses in a row → start; back off if it keeps dying."""
+    if alive:
+        return 0, False, WATCHDOG_CHECK_SECS
+    fails += 1
+    if fails < 2:
+        return fails, False, WATCHDOG_CHECK_SECS
+    backoff = min(300, WATCHDOG_CHECK_SECS * (2 ** max(0, restarts_recent - 1))) if restarts_recent else WATCHDOG_CHECK_SECS
+    return 0, True, max(WATCHDOG_CHECK_SECS, backoff)
+
+
+def watchdog_main(max_loops=None, alive_fn=None, start_fn=None, sleep_fn=None):
+    """--watchdog: single instance (lock port), restarts the helper when it is unreachable."""
+    import socket as _sock
+    lock = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    try:
+        lock.bind(("127.0.0.1", WATCHDOG_LOCK_PORT))
+        lock.listen(1)
+    except OSError:
+        return 0  # another watchdog is already running
+    alive_fn = alive_fn or _helper_alive
+    sleep_fn = sleep_fn or time.sleep
+    logf = INSTALL_DIR / "helper.log"
+
+    def _start():
+        args = [windowless_python(), str(Path(__file__).resolve())]
+        out = open(logf, "ab")
+        try:
+            subprocess.Popen(args, cwd=str(INSTALL_DIR), stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+                             close_fds=True, **({"creationflags": 0x00000008 | 0x00000200 | 0x08000000}
+                                                if os.name == "nt" else {}))
+        finally:
+            out.close()
+    log_starts = start_fn is None  # self-test passes its own start_fn: don't touch the real log
+    start_fn = start_fn or _start
+    fails, starts, loops = 0, [], 0
+    try:
+        sleep_fn(5)
+        while max_loops is None or loops < max_loops:
+            loops += 1
+            now = time.time()
+            starts = [t for t in starts if now - t < 1800]
+            fails, go, wait = watchdog_decide(fails, alive_fn(), len(starts))
+            if go:
+                try:
+                    start_fn()
+                    starts.append(now)
+                    try:
+                        if not log_starts:
+                            raise OSError("self-test")
+                        with open(logf, "a", encoding="utf-8") as fh:
+                            fh.write(f"[watchdog {time.strftime('%Y-%m-%d %H:%M:%S')}] helper unreachable — started it again\n")
+                    except OSError:
+                        pass
+                except Exception:
+                    pass
+            sleep_fn(wait)
+    finally:
+        lock.close()
+    return 0
+
+
+def autostart_loop():
+    """Windows: register login start + watchdog once at start and every 6 h (repairs a deleted entry)."""
+    time.sleep(10)
+    while True:
+        try:
+            st = ensure_windows_autostart()
+            AUTOSTART_STATE.update(st)
+            AUTOSTART_STATE["watchdog"] = start_watchdog_detached()
+            if st.get("error") and st.get("enabled"):
+                log(f"autostart: {st['error']}")
+        except Exception as e:
+            AUTOSTART_STATE["error"] = str(e)
+        time.sleep(6 * 3600)
+
+
+def autostart_snapshot():
+    if os.name != "nt":
+        return None
+    return dict(AUTOSTART_STATE, enabled=autostart_enabled())
+
+
+def _self_test_v656():
+    """v6.56: FDA paths + Drive block → recheck → backlog sent once; demucs save fallback; Windows autostart."""
+    import tempfile as _tmp
+    global REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE
+    # Fix 1a: exact paths for Full Disk Access (CLT Python 3.9 layout)
+    pre = "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9"
+    ps = fda_paths(pre + "/bin/python3.9", pre, exists=lambda p: True)
+    assert ps[0].endswith("/Versions/3.9/bin/python3.9") and ps[1].endswith("/Resources/Python.app"), ps
+    assert _drive_access_kind("macOS is blocking the helper from Google Drive (Operation not permitted)") == "fda"
+    # Fix 1b: blocked Drive → stuck original → access returns → recheck kicks backlog → sent once, no dup
+    saved = {k: os.environ.get(k) for k in ("TWITCH_RECORDER_CLOUDSTORAGE", "TWITCH_RECORDER_DRIVE_VOLUMES")}
+    prev_g = (REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE)
+    with PIPELINE_LOCK:
+        prev_p = {k: (json.loads(json.dumps(PIPELINE.get(k))) if k in PIPELINE else None)
+                  for k in ("deliveries", "originals", "target", "oneCopy")}
+    with STATUS_FILE_LOCK:
+        prev_sf = dict(STATUS_FILE)
+    prev_da = dict(DRIVE_ACCESS)
+    real_req = globals()["request_delivery"]
+    kicks = []
+    try:
+        with _tmp.TemporaryDirectory(prefix="tar-656-") as td:
+            td = Path(td)
+            REC_DIR = td / "rec"
+            DRIVE_PARTS_DIR = REC_DIR / "Drive parts"
+            PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
+            tgt = td / "CloudStorage" / "GoogleDrive-selftest@example.com" / "My Drive" / "Twitch"
+            (tgt / ORIGINALS_SUBDIR).mkdir(parents=True)
+            REC_DIR.mkdir(parents=True)
+            os.environ["TWITCH_RECORDER_CLOUDSTORAGE"] = str(td / "CloudStorage")
+            os.environ["TWITCH_RECORDER_DRIVE_VOLUMES"] = ""
+            orig = "selftestfda-Fri-2026-10-23T19-00-00.ogg"
+            (REC_DIR / orig).write_bytes(b"f" * 4000)
+            with PIPELINE_LOCK:
+                PIPELINE["deliveries"] = {}
+                PIPELINE["originals"] = {}
+                PIPELINE["target"] = os.path.realpath(str(tgt))
+            register_original(orig, "selftestfda", "stream")
+            globals()["request_delivery"] = lambda base=None: kicks.append(base)
+            can_block = hasattr(os, "geteuid") and os.geteuid() != 0
+            if can_block:
+                os.chmod(tgt / ORIGINALS_SUBDIR, 0o500)
+                os.chmod(tgt, 0o500)
+                try:
+                    snap = deliver_original(orig) or {}
+                    assert snap.get("status") == "error" and _drive_access_kind(snap.get("error")) == "fda", snap
+                    assert _drive_blocked_now()
+                    r = drive_access_recheck("self-test")
+                    assert r["ok"] is False and r["kind"] == "fda" and not kicks, r
+                    assert drive_access_extra("fda")["stuck"]["originals"] == 1
+                finally:
+                    os.chmod(tgt, 0o755)
+                    os.chmod(tgt / ORIGINALS_SUBDIR, 0o755)
+            else:
+                _orig_update(orig, status="error", error=drive_permission_message(), lastAttempt=time.time())
+            r = drive_access_recheck("self-test")
+            assert r["ok"] is True and kicks and r["kicked"]["originals"] == 1, r
+            assert not list(tgt.glob(".tar-access-check-*"))  # probe leaves nothing behind
+            todo = originals_due({"*"}, time.time())
+            assert orig in todo, todo
+            for nm in todo:
+                deliver_original(nm)
+            dest = tgt / ORIGINALS_SUBDIR / orig
+            assert dest.is_file() and dest.stat().st_size == 4000
+            # a second retry (e.g. the next kick) must not create a second copy
+            _orig_update(orig, status="error", error="x")
+            deliver_original(orig)
+            assert len(list((tgt / ORIGINALS_SUBDIR).iterdir())) == 1, list((tgt / ORIGINALS_SUBDIR).iterdir())
+    finally:
+        globals()["request_delivery"] = real_req
+        REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE = prev_g
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        with PIPELINE_LOCK:
+            for k, v in prev_p.items():
+                if v is None:
+                    PIPELINE.pop(k, None)
+                else:
+                    PIPELINE[k] = v
+        with STATUS_FILE_LOCK:
+            STATUS_FILE.clear()
+            STATUS_FILE.update(prev_sf)
+        DRIVE_ACCESS.clear()
+        DRIVE_ACCESS.update(prev_da)
+    # Fix 2: the demucs launcher saves WAV when torchaudio.save has no backend
+    compile(DEMUCS_SAVE_SHIM, "<demucs-shim>", "exec")
+    m = friendly_demucs_error("RuntimeError: Couldn't find appropriate backend to handle uri /x/vocals.wav and format None.")
+    assert "soundfile" in m and "Traceback" not in m and len(m) < 400, m
+    assert friendly_demucs_error("a\nValueError: boom").endswith("ValueError: boom")
+    try:
+        import numpy as _np  # noqa: F401
+        has_np = True
+    except ImportError:
+        has_np = False
+    if has_np:
+        with _tmp.TemporaryDirectory(prefix="tar-656d-") as td:
+            td = Path(td)
+            fake = td / "fake"
+            (fake / "torchaudio").mkdir(parents=True)
+            (fake / "demucs").mkdir(parents=True)
+            (fake / "torchaudio" / "__init__.py").write_text(
+                "def save(uri, src, sr, **kw):\n"
+                "    raise RuntimeError(\"Couldn't find appropriate backend to handle uri %s and format None.\" % uri)\n")
+            (fake / "demucs" / "__init__.py").write_text("")
+            (fake / "demucs" / "separate.py").write_text(
+                "import sys, numpy as np, torchaudio as ta\n"
+                "def main():\n"
+                "    out = sys.argv[sys.argv.index('-o') + 1]\n"
+                "    a = np.zeros((2, 4410), dtype='float32'); a[0, :100] = 0.5\n"
+                "    ta.save(out + '/vocals.wav', a, 44100, bits_per_sample=16)\n"
+                "    ta.save(out + '/no_vocals.wav', a, 44100, bits_per_sample=24)\n")
+            env = dict(os.environ, PYTHONPATH=str(fake))
+            r = subprocess.run([sys.executable, "-c", DEMUCS_SAVE_SHIM, "-o", str(td)], capture_output=True,
+                               text=True, env=env, timeout=120)
+            assert r.returncode == 0, r.stderr[-800:]
+            import wave as _wave
+            for nm, w in (("vocals.wav", 2), ("no_vocals.wav", 3)):
+                with _wave.open(str(td / nm), "rb") as wf:
+                    assert wf.getnchannels() == 2 and wf.getsampwidth() == w and wf.getnframes() == 4410, nm
+            assert "saved with" in r.stderr, r.stderr
+    # Fix 3: Windows autostart files + watchdog decisions (simulated; no registry / schtasks touched)
+    with _tmp.TemporaryDirectory(prefix="tar-656w-") as td:
+        calls = []
+
+        class _R:
+            returncode = 0
+            stdout = "SUCCESS"
+            stderr = ""
+        st = ensure_windows_autostart(startup_dir=td, run=lambda c: calls.append(c) or _R(),
+                                      script=r"C:\Users\x\AppData\Local\TwitchRecorder\twitch-recorder-server.py",
+                                      pyw=r"C:\Python312\pythonw.exe")
+        body = (Path(td) / AUTOSTART_STARTUP_NAME).read_text(encoding="utf-8")
+        assert '--watchdog", 0, False' in body and "pythonw.exe" in body, body
+        assert st["task"] == AUTOSTART_TASK and calls and "/SC" in calls[0] and "MINUTE" in calls[0], (st, calls)
+        st2 = ensure_windows_autostart(startup_dir=td, run=lambda c: _R(), script="s.py", pyw="p.exe")
+        assert st2["startup"]
+
+        class _Bad:
+            returncode = 1
+            stdout = ""
+            stderr = "ERROR: Access is denied."
+        st3 = ensure_windows_autostart(startup_dir=td, run=lambda c: _Bad(), script="s.py", pyw="p.exe")
+        assert st3["startup"] and st3["task"] is None and "Access is denied" in (st3["error"] or ""), st3
+    assert watchdog_decide(0, True, 0) == (0, False, WATCHDOG_CHECK_SECS)
+    assert watchdog_decide(0, False, 0)[1] is False  # one miss (e.g. restart in progress) → wait
+    f, go, _w = watchdog_decide(1, False, 0)
+    assert go and f == 0
+    assert watchdog_decide(1, False, 4)[2] > WATCHDOG_CHECK_SECS  # keeps crashing → back off
+    started, alive_seq = [], iter([False, False, True, True])
+    global WATCHDOG_LOCK_PORT
+    prev_port = WATCHDOG_LOCK_PORT
+    import socket as _s
+    probe = _s.socket()
+    probe.bind(("127.0.0.1", 0))
+    WATCHDOG_LOCK_PORT = probe.getsockname()[1]
+    probe.close()
+    try:
+        watchdog_main(max_loops=4, alive_fn=lambda: next(alive_seq), start_fn=lambda: started.append(1),
+                      sleep_fn=lambda s: None)
+        assert started == [1], started
+        # second instance while the lock is held exits at once
+        hold = _s.socket()
+        hold.bind(("127.0.0.1", WATCHDOG_LOCK_PORT))
+        hold.listen(1)
+        try:
+            assert watchdog_main(max_loops=3, alive_fn=lambda: False, start_fn=lambda: started.append(2),
+                                 sleep_fn=lambda s: None) == 0 and started == [1]
+        finally:
+            hold.close()
+    finally:
+        WATCHDOG_LOCK_PORT = prev_port
+
+
 def main():
     REC_DIR.mkdir(parents=True, exist_ok=True)
     # v6.29: clear orphan music-only-* temp dirs left by mid-demucs crashes
@@ -10559,6 +11219,11 @@ def main():
     threading.Thread(target=auto_update_loop, daemon=True, name="auto-update").start()
     # v6.55: keep streamlink current (PyPI check a few min after start, then every ~12 h; upgrades when idle)
     threading.Thread(target=streamlink_update_loop, daemon=True, name="streamlink-update").start()
+    # v6.56: re-check a blocked Drive every minute and send the backlog once access works
+    threading.Thread(target=drive_access_loop, daemon=True, name="drive-access").start()
+    # v6.56: Windows — start on login + watchdog that restarts the helper if it stops
+    if os.name == "nt":
+        threading.Thread(target=autostart_loop, daemon=True, name="autostart").start()
     sl = which_streamlink()
     ff = which_ffmpeg()
     html_path = HERE / HTML_NAME
@@ -10609,4 +11274,6 @@ if __name__ == "__main__":
     _harden_stdio()  # v6.51: Windows cp1252 output can't make log lines raise
     if "--self-test" in sys.argv[1:]:  # v6.43: used by apply_update before swapping in a download
         sys.exit(self_test())
+    if "--watchdog" in sys.argv[1:]:  # v6.56: Windows login start / crash restart
+        sys.exit(watchdog_main())
     main()
