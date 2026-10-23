@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.54</span>
+    <span class="badge">v6.55</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -318,6 +318,9 @@
           </label>
           <label title="v6.43: the helper checks GitHub ~2 min after it starts and then every ~3 hours. When a newer version is out it installs it and restarts itself — but only when nothing is recording (or waiting through a stream restart), removing voice, splitting, joining or sending to Drive, and it has been idle a few minutes. A broken download is never installed and the previous files are kept in .update-backup. Helpers older than v6.43 need one last Check for updates → Install update; with this on, this page does that for them automatically once when they are idle." style="margin-left:1rem">
             <input type="checkbox" id="autoUpdateToggle" checked onchange="saveAutoUpdateToggle()"> Install helper updates automatically when idle
+          </label>
+          <label title="v6.55: Twitch changes its site every few months and older streamlink versions then stop finding the stream — every recording fails even though the streamer is live. The helper checks the installed streamlink against PyPI a few minutes after it starts and every ~12 hours, and when streamlink was installed with pip it upgrades it to the newest release this computer's Python can run — only when nothing is recording, removing voice or sending to Drive. It then checks the new streamlink still handles Twitch and has every option the recorder uses, and puts the old version back if not. Homebrew / pipx / Windows-installer copies are never touched; the helper bar and the Drive status file say how to update them, or that the newest streamlink needs a newer Python." style="margin-left:1rem">
+            <input type="checkbox" id="streamlinkUpdateToggle" checked onchange="saveStreamlinkUpdateToggle()"> Keep streamlink up to date when idle <span id="streamlinkUpdateInfo" class="muted" style="font-size:.85em"></span>
           </label>
           <label title="v6.49: if this page is closed, Chrome crashes, the tab is discarded, or the computer reboots and only the helper comes back, the helper still watches whoever you left Auto-Rec armed for (persisted under ~/TwitchRecordings/.solo-watch.json) and starts recording when they go live — same path as when this page starts them (supervisor, restart grace, voice removal → Drive). Turn off to require this page open. Needs helper v6.49+." style="margin-left:1rem">
             <input type="checkbox" id="soloWatchToggle" checked onchange="saveSoloWatchToggle()"> Keep recording armed streamers if this page is closed
@@ -554,9 +557,9 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.54'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.55'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
-let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
+let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
@@ -692,6 +695,7 @@ function persist(){
       keepAwakeSchedule: cfg.keepAwakeSchedule!==false, // v6.52
       statusToDrive: cfg.statusToDrive!==false, // v6.41
       autoUpdate: cfg.autoUpdate!==false, // v6.43
+      streamlinkUpdate: cfg.streamlinkUpdate!==false, // v6.55
       soloWatch: cfg.soloWatch!==false, // v6.49
       oneCopy: cfg.oneCopy!==false, // v6.50
       homeStreamer: String(cfg.homeStreamer||'').toLowerCase(),
@@ -742,6 +746,7 @@ function restoreSettings(){
     cfg.keepAwakeSchedule=data.keepAwakeSchedule!==false; // v6.52 default on
     cfg.statusToDrive=data.statusToDrive!==false; // v6.41 default on
     cfg.autoUpdate=data.autoUpdate!==false; // v6.43 default on
+    cfg.streamlinkUpdate=data.streamlinkUpdate!==false; // v6.55 default on
     cfg.soloWatch=data.soloWatch!==false; // v6.49 default on
     cfg.oneCopy=data.oneCopy!==false; // v6.50 default on
     // v6.25: home streamer + return after guest/DJ set
@@ -857,6 +862,7 @@ function markHelperDown(wasOk){
   helper.statusFile=null; // v6.41
   helper.driveAccess=null; // v6.47
   helper.autoUpdate=null; // v6.43
+  helper.streamlinkUpdate=null; // v6.55
   helper.graceOfflineSecs=null; // v6.48
   helper.soloWatch=null; // v6.49
   helperOkSince=0; // v6.43
@@ -1442,6 +1448,7 @@ function pingHelperAndStatus(){
       helper.statusFile=(d.statusFile && typeof d.statusFile==='object')?d.statusFile:null; // v6.41
       helper.driveAccess=(d.driveAccess && typeof d.driveAccess==='object')?d.driveAccess:null; // v6.47
       helper.autoUpdate=(d.autoUpdate && typeof d.autoUpdate==='object')?d.autoUpdate:null; // v6.43
+      helper.streamlinkUpdate=(d.streamlinkUpdate && typeof d.streamlinkUpdate==='object')?d.streamlinkUpdate:null; // v6.55
       helper.graceOfflineSecs=(typeof d.graceOfflineSecs==='number' && isFinite(d.graceOfflineSecs))?d.graceOfflineSecs:null; // v6.48
       helper.soloWatch=(d.soloWatch && typeof d.soloWatch==='object')?d.soloWatch:null; // v6.49
       { const sf=helper.statusFile; const da=helper.driveAccess;
@@ -1481,6 +1488,7 @@ function pingHelperAndStatus(){
       applyPipelineFromHealth(d); // v6.36
       if(!helperOkSince) helperOkSince=Date.now(); // v6.43
       renderAutoUpdateLine(); // v6.43
+      try{ noticeStreamlinkUpdate(); }catch(_e){} // v6.55
     }else{
       markHelperDown(wasOk);
       return;
@@ -2209,7 +2217,7 @@ function updateHelperBar(){
   const dot=document.getElementById('helperDot');
   const txt=document.getElementById('helperTxt');
   if(!dot||!txt) return;
-  const pendingBit=(helper.pendingRestart?(' · restart pending (disk v'+(helper.diskVersion||'?')+')'):'')+keepAwakeBit()+autoUpdateBit(); // v6.40 keep-awake bit · v6.43 auto-update bit
+  const pendingBit=(helper.pendingRestart?(' · restart pending (disk v'+(helper.diskVersion||'?')+')'):'')+keepAwakeBit()+autoUpdateBit()+streamlinkBit(); // v6.40 keep-awake bit · v6.43 auto-update bit · v6.55 streamlink bit
   if(helper.ok && helper.streamlink){
     const diskBit=(helper.diskFree!=null)?(' · '+fmtDiskBytes(helper.diskFree)+' free'):'';
     const demucsBit=helper.demucs?'':(voiceReady()?' · voice removal: Fast (no demucs)':' · demucs missing');
@@ -5092,6 +5100,7 @@ function pipelinePrefsBody(){
     keepAwakeSchedule:cfg.keepAwakeSchedule!==false, // v6.52
     statusToDrive:cfg.statusToDrive!==false, // v6.41
     autoUpdate:cfg.autoUpdate!==false, // v6.43
+    streamlinkUpdate:cfg.streamlinkUpdate!==false, // v6.55
     soloWatch:cfg.soloWatch!==false, // v6.49
     oneCopy:cfg.oneCopy!==false, // v6.50
     voiceQuality:normVoiceQuality(cfg.voiceQuality)}; // v6.45
@@ -5492,8 +5501,73 @@ function autoUpdateText(){
   if(a.lastError) t+=' · ⚠ '+a.lastError;
   return t;
 }
+// v6.55: installed vs newest streamlink (an outdated streamlink makes every Twitch recording fail)
+function initStreamlinkUpdateToggle(){
+  const el=document.getElementById('streamlinkUpdateToggle');
+  if(el) el.checked=cfg.streamlinkUpdate!==false;
+}
+function saveStreamlinkUpdateToggle(){
+  const el=document.getElementById('streamlinkUpdateToggle');
+  cfg.streamlinkUpdate=el?!!el.checked:true;
+  persist();
+  syncPipelinePrefs(true);
+  let msg=cfg.streamlinkUpdate
+    ? 'streamlink will be upgraded automatically (pip installs only) when nothing is recording, removing voice or sending to Drive.'
+    : 'Automatic streamlink updates off — the helper still reports when streamlink is outdated.';
+  if(helper.ok && helper.version && helperVerLt(helper.version,'6.55')) msg+=' Needs helper v6.55 — Check for updates → Install update.';
+  flashOk(msg);
+  setTimeout(function(){ pingHelperAndStatus().catch(function(){}); }, 1500);
+}
+function streamlinkUpdateText(){
+  const s=helper.streamlinkUpdate;
+  if(!helper.ok || !s) return '';
+  if(!s.lastCheckAt) return 'streamlink: version check a few minutes after the helper starts';
+  const inst=s.installed;
+  if(s.state==='missing' || !inst) return 'streamlink: ⚠ not working — '+(s.hint||s.lastResult||'streamlink --version failed');
+  let t='streamlink '+inst+(s.installedReleasedAt?' ('+s.installedReleasedAt+')':'');
+  if(s.state==='up-to-date') t+=' — up to date';
+  else if(s.state==='python-too-old') t+=' — newest for Python '+(s.pythonVersion||'?')+'; streamlink '+(s.latest||'?')+' needs Python '+(s.latestRequiresPython||'newer');
+  else if(s.state==='waiting-idle') t+=' — '+s.latestCompatible+' available, upgrades when idle'+(s.waitingFor?' (waiting: '+s.waitingFor+')':'');
+  else if(s.state==='upgrading' || s.upgrading) t+=' — upgrading to '+s.latestCompatible+'…';
+  else if(s.state==='outdated-manual') t+=' — ⚠ outdated ('+s.latestCompatible+' available): '+(s.hint||'update it the way it was installed');
+  else if(s.state==='off') t+=' — ⚠ outdated ('+s.latestCompatible+' available; automatic streamlink updates off)';
+  else if(s.state==='error') t+=' — ⚠ '+(s.lastError||s.lastResult||'check failed');
+  if(s.lastUpgradeTo) t+=' · last auto-upgrade '+(s.lastUpgradeFrom||'?')+' → '+s.lastUpgradeTo+(s.lastUpgradeAt?' at '+auClock(s.lastUpgradeAt):'');
+  return t;
+}
+function streamlinkBit(){
+  const s=helper.streamlinkUpdate;
+  if(!helper.ok || !s) return '';
+  if(s.state==='upgrading' || s.upgrading) return ' · ⬆ updating streamlink';
+  if(s.state==='waiting-idle') return ' · ⬆ streamlink '+s.latestCompatible+' when idle';
+  if(s.outdated && (s.state==='outdated-manual' || s.state==='off' || s.state==='error')) return ' · ⚠ streamlink '+s.installed+' outdated';
+  return '';
+}
+var streamlinkNoticeSig='', streamlinkNoticeInit=false;
+function noticeStreamlinkUpdate(){
+  const el=document.getElementById('streamlinkUpdateInfo');
+  const t=streamlinkUpdateText();
+  if(el) el.textContent=t?('— '+t):'';
+  const s=helper.streamlinkUpdate;
+  if(!s || !s.lastCheckAt) return;
+  // One flash + desktop notification per problem (manual update needed / upgrade failed / now upgraded)
+  let sig='', bad=false;
+  if(s.outdated && (s.state==='outdated-manual' || s.state==='error')){ sig='bad|'+s.state+'|'+s.installed+'|'+s.latestCompatible; bad=true; }
+  else if(s.state==='missing'){ sig='missing'; bad=true; }
+  else if(s.lastUpgradeTo && s.lastUpgradeAt && Date.now()/1000-Number(s.lastUpgradeAt)<6*3600){ sig='up|'+s.lastUpgradeTo; }
+  if(!streamlinkNoticeInit){ streamlinkNoticeInit=true; if(!bad){ streamlinkNoticeSig=sig; return; } } // don't re-announce an old upgrade on page load
+  if(!sig || sig===streamlinkNoticeSig) return;
+  streamlinkNoticeSig=sig;
+  if(bad){
+    flashErr('⚠ '+t+' — an outdated streamlink can make Twitch recordings fail.');
+    fireNotify('tar-streamlink-'+sig, 'streamlink needs an update', t);
+  }else{
+    flashOk('streamlink updated to '+s.lastUpgradeTo+' (checked: Twitch plugin + recorder options).');
+  }
+}
 function renderAutoUpdateLine(){
-  const t=autoUpdateText();
+  const slt=streamlinkUpdateText(); // v6.55
+  const t=autoUpdateText()+(slt?(' · '+slt):'');
   const a=document.getElementById('updateAutoLine');
   if(a) a.textContent=t;
   const b=document.getElementById('setupAutoUpdateLine');
@@ -5783,6 +5857,7 @@ initDriveOrigToggle();
 initKeepAwakeToggle(); // v6.40
 initStatusFileToggle(); // v6.41
 initAutoUpdateToggle(); // v6.43
+initStreamlinkUpdateToggle(); // v6.55
 initSoloWatchToggle(); // v6.49
 initOneCopyToggle(); // v6.50
 initDriveCard();

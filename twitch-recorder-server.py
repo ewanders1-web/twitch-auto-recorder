@@ -20,7 +20,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.54"
+HELPER_VERSION = "6.55"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -1196,6 +1196,7 @@ def build_cmd(username, quality):
     Without ffmpeg: ogg remux is impossible, so fall back to .ts only.
     UI may pass quality best|audio_only; both map to audio_only for reliable OGG.
     """
+    wait_streamlink_upgrade()  # v6.55: don't launch a half-replaced streamlink
     sl = which_streamlink()
     ff = which_ffmpeg()
     # Supported OGG path is audio_only (video→ogg is unreliable / not wanted).
@@ -2634,6 +2635,8 @@ def update_busy_reason():
                 reason = "sending to Google Drive"
     if not reason and UPLOADS_INFLIGHT[0] > 0:
         reason = "receiving an upload"
+    if not reason and SL_UPGRADING.is_set():  # v6.55
+        reason = "updating streamlink"
     if reason:
         _auto_update_set(lastBusyAt=time.time())
     return reason
@@ -2789,6 +2792,581 @@ def api_update_auto(body):
         _auto_update_set(checkNow=True)
     AUTO_UPDATE_WAKE.set()
     return {"ok": True, "autoUpdate": auto_update_snapshot()}, 200
+
+
+import re  # v6.55
+
+# ─── v6.55: KEEP STREAMLINK CURRENT ──────────────────────────────────
+# Twitch changes its site/API every few months and older streamlink releases then stop finding
+# the stream ("No playable streams found", 403s, integrity errors) — every recording attempt fails
+# even though the stream is live, and nothing on a computer nobody looks at says why. The helper
+# now checks the installed streamlink against PyPI (a few minutes after start, then every ~12 h)
+# and, when it was installed with pip (venv, user or system site), upgrades it to the newest
+# release that this computer's Python can run — only when nothing is recording / processing /
+# sending, same idle rules as the v6.43 helper auto-update. After the upgrade it checks that
+# `streamlink --version` reports the new version, that the Twitch plugin still handles twitch.tv
+# URLs and that every command-line option the recorder uses still exists; if not, it puts the
+# previous version back. Homebrew / pipx / Windows-installer copies are never touched — the
+# helper just says how to update them. When the newest streamlink needs a newer Python than the
+# computer has (e.g. macOS Command Line Tools Python 3.9 can't run streamlink 8), that is said
+# too. A recording that starts while an upgrade is running waits for it (≤ 4 min).
+SL_UPDATE_ENV_OFF = (os.environ.get("TWITCH_RECORDER_STREAMLINK_UPDATE") or "").strip().lower() in (
+    "0", "off", "false", "no")
+SL_UPDATE_FIRST_SECS = _env_secs("TWITCH_RECORDER_STREAMLINK_UPDATE_FIRST_SECS", 240, 1)
+SL_UPDATE_EVERY_SECS = _env_secs("TWITCH_RECORDER_STREAMLINK_UPDATE_SECS", 12 * 3600, 60)
+SL_UPDATE_RETRY_SECS = _env_secs("TWITCH_RECORDER_STREAMLINK_UPDATE_RETRY_SECS", 3600, 5)
+SL_UPDATE_MAX_FAILS = 3  # per target version; then wait for a newer release (or a manual "check now")
+SL_PYPI_URL = os.environ.get("TWITCH_RECORDER_STREAMLINK_PYPI_URL") or "https://pypi.org/pypi/streamlink/json"
+SL_REQUIRED_OPTS = ("--output", "--force", "--ffmpeg-fout", "--json")  # build_cmd + live probe
+SL_UPDATE_WAKE = threading.Event()
+SL_UPDATE_LOCK = threading.Lock()
+SL_UPGRADING = threading.Event()  # set while pip is replacing streamlink
+SL_UPDATE = {
+    "state": "starting", "installed": None, "kind": None, "python": None, "pythonVersion": None,
+    "latest": None, "latestCompatible": None, "latestRequiresPython": None, "installedReleasedAt": None,
+    "lastCheckAt": 0.0, "lastResult": None, "lastError": None, "hint": None, "waitingFor": None,
+    "nextCheckAt": 0.0, "lastUpgradeAt": 0.0, "lastUpgradeFrom": None, "lastUpgradeTo": None,
+    "fails": {}, "checkNow": False,
+}
+
+
+def _sl_set(**kw):
+    with SL_UPDATE_LOCK:
+        SL_UPDATE.update(kw)
+
+
+def streamlink_update_enabled():
+    if SL_UPDATE_ENV_OFF:
+        return False
+    with PIPELINE_LOCK:
+        return PIPELINE.get("streamlinkUpdate", True) is not False
+
+
+def _sl_run(cmd, timeout=60):
+    """subprocess.run, UTF-8 safe (v6.51), no console window on Windows. Returns (rc, out)."""
+    kw = {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace",
+          "timeout": timeout, "stdin": subprocess.DEVNULL}
+    env = os.environ.copy()
+    env["PYTHONWARNINGS"] = "ignore"
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    kw["env"] = env
+    if os.name == "nt" and getattr(subprocess, "CREATE_NO_WINDOW", 0):
+        kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        r = subprocess.run(cmd, **kw)
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+    except OSError as e:
+        return 127, str(e)
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def _sl_vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or ""))) or (0,)
+
+
+def streamlink_cli_version(sl=None):
+    sl = sl or which_streamlink()
+    if not sl:
+        return None
+    rc, out = _sl_run([sl, "--version"], timeout=45)
+    m = re.search(r"streamlink\s+v?(\d+(?:\.\d+)+)", out or "", re.I)
+    return m.group(1) if (rc == 0 and m) else None
+
+
+def _sl_python_candidates(sl):
+    cands = []
+    try:
+        p = Path(sl)
+        if os.name == "nt":
+            cands += [p.parent / "python.exe", p.parent.parent / "python.exe"]
+        else:
+            with open(p, "rb") as fh:
+                first = fh.readline(400)
+            if first.startswith(b"#!"):
+                parts = first[2:].decode("utf-8", "replace").strip().split()
+                if parts:
+                    if os.path.basename(parts[0]) == "env" and len(parts) > 1:
+                        w = shutil.which(parts[1])
+                        if w:
+                            cands.append(Path(w))
+                    else:
+                        cands.append(Path(parts[0]))
+    except OSError:
+        pass
+    if sys.executable:
+        cands.append(Path(sys.executable))
+    seen, out = set(), []
+    for c in cands:
+        try:
+            k = str(c)
+            if k not in seen and c.is_file():
+                seen.add(k)
+                out.append(k)
+        except OSError:
+            continue
+    return out
+
+
+_SL_PROBE = ("import sys,site\nimport streamlink\n"
+             "print('V='+streamlink.__version__)\nprint('F='+streamlink.__file__)\n"
+             "print('P=%d.%d.%d'%tuple(sys.version_info[:3]))\n"
+             "print('U='+(site.getusersitepackages() if hasattr(site,'getusersitepackages') else ''))\n")
+
+
+def _sl_manual_hint(kind):
+    return {
+        "homebrew": "installed with Homebrew — update it with: brew upgrade streamlink",
+        "pipx": "installed with pipx — update it with: pipx upgrade streamlink",
+        "installer": "installed with the Streamlink Windows installer — install the newest one from "
+                     "https://github.com/streamlink/windows-builds/releases (or: winget upgrade streamlink)",
+        "externally-managed": "this Python refuses pip installs (externally managed) — update streamlink the way it "
+                              "was installed (brew / pipx / your package manager)",
+    }.get(kind, "streamlink wasn't installed with pip for a Python the helper can find — update it the way it "
+                "was installed (e.g. pip install --upgrade streamlink)")
+
+
+def streamlink_inspect(sl=None):
+    """{installed, kind: pip|pip-user|homebrew|pipx|installer|other|missing, python, pythonVersion, hint}."""
+    sl = sl or which_streamlink()
+    if not sl:
+        return {"installed": None, "kind": "missing", "python": None, "pythonVersion": None,
+                "hint": "streamlink not found — pip install streamlink"}
+    ver = streamlink_cli_version(sl)
+    try:
+        real = os.path.realpath(sl)
+    except OSError:
+        real = sl
+    low = real.replace("\\", "/").lower()
+    kind = None
+    if "/cellar/" in low or "/homebrew/" in low or "linuxbrew" in low:
+        kind = "homebrew"
+    elif "/pipx/" in low:
+        kind = "pipx"
+    elif os.name == "nt" and "program files" in low and "/streamlink/" in low:
+        kind = "installer"
+    info = {"installed": ver, "kind": kind or "other", "python": None, "pythonVersion": None, "hint": None}
+    if kind is None and ver:
+        for py in _sl_python_candidates(sl):
+            rc, out = _sl_run([py, "-c", _SL_PROBE], timeout=45)
+            if rc != 0:
+                continue
+            kv = dict(ln.split("=", 1) for ln in (out or "").splitlines() if len(ln) > 2 and ln[1] == "=")
+            if kv.get("V") != ver:
+                continue
+            rc2, _o2 = _sl_run([py, "-m", "pip", "--version"], timeout=60)
+            if rc2 != 0:
+                continue
+            mod = os.path.realpath(kv.get("F") or "").replace("\\", "/").lower()
+            usr = os.path.realpath(kv.get("U") or "").replace("\\", "/").lower() if kv.get("U") else ""
+            info.update(python=py, pythonVersion=kv.get("P"),
+                        kind="pip-user" if (usr and mod.startswith(usr.rstrip("/") + "/")) else "pip")
+            break
+    if info["kind"] not in ("pip", "pip-user"):
+        info["hint"] = _sl_manual_hint(info["kind"])
+    return info
+
+
+def _py_satisfies(spec, pyver):
+    """Tiny PEP 440 requires_python check (>=, >, <=, <, ==, !=, ~=, with .* wildcards)."""
+    if not spec:
+        return True
+    pv = _sl_vtuple(pyver)
+    for clause in str(spec).split(","):
+        clause = clause.strip()
+        if not clause:
+            continue
+        m = re.match(r"^(~=|==|!=|>=|<=|>|<)\s*([0-9][0-9.]*)(\.\*)?$", clause)
+        if not m:
+            continue  # unknown syntax — let pip decide
+        op, v, wild = m.group(1), _sl_vtuple(m.group(2)), bool(m.group(3))
+        n = len(v)
+        a = pv[:n] + (0,) * max(0, n - len(pv[:n]))
+        if op == "==":
+            ok = a == v if wild else (pv + (0,) * 3)[:max(n, 3)] == (v + (0,) * 3)[:max(n, 3)]
+        elif op == "!=":
+            ok = a != v if wild else (pv + (0,) * 3)[:max(n, 3)] != (v + (0,) * 3)[:max(n, 3)]
+        elif op == ">=":
+            ok = a >= v
+        elif op == ">":
+            ok = a > v
+        elif op == "<=":
+            ok = a <= v
+        elif op == "<":
+            ok = a < v
+        else:  # ~=
+            ok = a >= v and pv[:max(1, n - 1)] == v[:max(1, n - 1)]
+        if not ok:
+            return False
+    return True
+
+
+def streamlink_latest(pyver=None, doc=None):
+    """From PyPI JSON → {latest, latestRequiresPython, latestCompatible, releasedAt:{ver: iso}}."""
+    if doc is None:
+        doc = json.loads(fetch_url_text(SL_PYPI_URL, timeout=20))
+    rels = doc.get("releases") if isinstance(doc, dict) else None
+    if not isinstance(rels, dict):
+        raise RuntimeError("PyPI: unexpected response")
+    best = best_c = None
+    req_of, when = {}, {}
+    for ver, files in rels.items():
+        if not re.fullmatch(r"\d+(?:\.\d+)*", str(ver)) or not isinstance(files, list):
+            continue  # pre-releases / dev builds
+        good = [f for f in files if isinstance(f, dict) and not f.get("yanked")]
+        if not good:
+            continue
+        req = good[0].get("requires_python") or ""
+        req_of[ver] = req
+        when[ver] = str(good[0].get("upload_time") or good[0].get("upload_time_iso_8601") or "")[:10] or None
+        if best is None or _sl_vtuple(ver) > _sl_vtuple(best):
+            best = ver
+        if (pyver is None or _py_satisfies(req, pyver)) and (best_c is None or _sl_vtuple(ver) > _sl_vtuple(best_c)):
+            best_c = ver
+    if not best:
+        raise RuntimeError("PyPI: no streamlink releases listed")
+    return {"latest": best, "latestRequiresPython": req_of.get(best) or None,
+            "latestCompatible": best_c, "releasedAt": when}
+
+
+def _sl_verify(expected):
+    """New streamlink works: version matches, Twitch plugin handles twitch.tv, our options exist."""
+    sl = which_streamlink()
+    if not sl:
+        return "streamlink disappeared after the upgrade"
+    got = streamlink_cli_version(sl)
+    if got != expected:
+        return f"streamlink --version says {got or 'nothing'} (expected {expected})"
+    rc, _o = _sl_run([sl, "--can-handle-url", "https://twitch.tv/twitch"], timeout=60)
+    if rc != 0:
+        return "the new streamlink's Twitch plugin doesn't handle twitch.tv URLs"
+    rc, out = _sl_run([sl, "--help"], timeout=60)
+    missing = [o for o in SL_REQUIRED_OPTS if o not in (out or "")]
+    if rc != 0 or missing:
+        return "the new streamlink lacks options the recorder uses: " + ", ".join(missing or ["--help failed"])
+    return None
+
+
+def _sl_pip_install(info, version):
+    cmd = [info["python"], "-m", "pip", "install", "--upgrade", "--no-input", "--disable-pip-version-check",
+           f"streamlink=={version}"]
+    if info.get("kind") == "pip-user":
+        cmd.insert(5, "--user")
+    return _sl_run(cmd, timeout=900)
+
+
+def streamlink_upgrade(info, target):
+    """pip-upgrade to target, verify, roll back on failure. Returns (ok, message)."""
+    old = info.get("installed")
+    log(f"streamlink update: upgrading {old} → {target} with {info.get('python')} ({info.get('kind')})")
+    SL_UPGRADING.set()
+    try:
+        rc, out = _sl_pip_install(info, target)
+        if rc != 0:
+            tail = _short(" ".join((out or "").split()[-60:]), 300)
+            if "externally-managed" in (out or "").lower():
+                return False, "externally-managed:" + tail
+            if streamlink_cli_version() == old:
+                return False, f"pip install failed (exit {rc}): {tail}"
+            bad = f"pip install failed (exit {rc}) midway: {tail}"
+        else:
+            bad = _sl_verify(target)
+            if not bad:
+                return True, f"streamlink {old} → {target}"
+        log(f"streamlink update: {bad} — putting {old} back")
+        rrc, rout = _sl_pip_install(info, old) if old else (1, "no previous version known")
+        back = streamlink_cli_version()
+        if back == old:
+            return False, f"{bad}; kept streamlink {old}"
+        return False, (f"{bad}; ROLLBACK to {old} failed (exit {rrc}: {_short(rout, 160)}) — "
+                       f"streamlink is now {back or 'not working'}; run: pip install streamlink=={old}")
+    finally:
+        SL_UPGRADING.clear()
+        STATUS_FILE_WAKE.set()
+
+
+def wait_streamlink_upgrade(max_secs=240):
+    """A recording that starts while pip is swapping streamlink waits for it (bounded)."""
+    if not SL_UPGRADING.is_set():
+        return
+    log("recording start waits for the streamlink upgrade to finish…")
+    end = time.time() + max_secs
+    while SL_UPGRADING.is_set() and time.time() < end:
+        time.sleep(0.5)
+
+
+def streamlink_update_tick(now=None):
+    """One step of the streamlink updater. Returns seconds until the next step."""
+    now = time.time() if now is None else now
+    with SL_UPDATE_LOCK:
+        last = float(SL_UPDATE.get("lastCheckAt") or 0.0)
+        had_err = bool(SL_UPDATE.get("lastError")) and SL_UPDATE.get("state") == "error"
+        force = bool(SL_UPDATE.get("checkNow"))
+        SL_UPDATE["checkNow"] = False
+    due = SL_UPDATE_RETRY_SECS if had_err else SL_UPDATE_EVERY_SECS
+    if force or not last or now - last >= due:
+        info = streamlink_inspect()
+        try:
+            lat = streamlink_latest(info.get("pythonVersion"))
+            lerr = None
+        except Exception as e:
+            lat, lerr = {}, f"PyPI check failed: {e}"
+        rel = (lat.get("releasedAt") or {})
+        _sl_set(installed=info.get("installed"), kind=info.get("kind"), python=info.get("python"),
+                pythonVersion=info.get("pythonVersion"), hint=info.get("hint"),
+                latest=lat.get("latest"), latestCompatible=lat.get("latestCompatible"),
+                latestRequiresPython=lat.get("latestRequiresPython"),
+                installedReleasedAt=rel.get(info.get("installed") or ""),
+                lastCheckAt=now, lastError=lerr)
+        last = now
+        if lerr:
+            log(f"streamlink update: {lerr}; retry in {int(SL_UPDATE_RETRY_SECS // 60)} min")
+            _sl_set(state="error", lastResult="check failed", nextCheckAt=now + SL_UPDATE_RETRY_SECS)
+            STATUS_FILE_WAKE.set()
+            return SL_UPDATE_RETRY_SECS
+        if force:
+            with SL_UPDATE_LOCK:
+                SL_UPDATE["fails"] = {}
+    with SL_UPDATE_LOCK:
+        s = dict(SL_UPDATE)
+    inst, best, kind = s.get("installed"), s.get("latestCompatible"), s.get("kind")
+    nxt = last + SL_UPDATE_EVERY_SECS
+    if kind == "missing" or not inst:
+        # a --version that failed/timed out (busy computer at boot) is re-checked within the hour
+        _sl_set(state="missing", lastResult="streamlink not found" if kind == "missing" else
+                "streamlink --version failed", waitingFor=None, nextCheckAt=last + SL_UPDATE_RETRY_SECS)
+        return max(1.0, last + SL_UPDATE_RETRY_SECS - now)
+    if not best or _sl_vtuple(inst) >= _sl_vtuple(best):
+        res = f"up to date ({inst})"
+        if s.get("latest") and _sl_vtuple(s["latest"]) > _sl_vtuple(inst):
+            res = (f"{inst} is the newest this computer's Python {s.get('pythonVersion') or '?'} can run — "
+                   f"streamlink {s['latest']} needs Python {s.get('latestRequiresPython') or 'newer'}")
+        if s.get("lastResult") != res:
+            log(f"streamlink update: {res}")
+            STATUS_FILE_WAKE.set()
+        _sl_set(state="up-to-date" if res.startswith("up to date") else "python-too-old",
+                lastResult=res, waitingFor=None, nextCheckAt=nxt)
+        return max(1.0, nxt - now)
+    if kind not in ("pip", "pip-user") or not streamlink_update_enabled():
+        res = f"{inst} installed, {best} available"
+        st2 = "outdated-manual" if kind not in ("pip", "pip-user") else "off"
+        if s.get("lastResult") != res or s.get("state") != st2:
+            log(f"streamlink update: {res} — " + (s.get("hint") or "automatic streamlink updates are off"))
+        _sl_set(state=st2, lastResult=res, waitingFor=None, nextCheckAt=nxt)
+        STATUS_FILE_WAKE.set()
+        return max(1.0, nxt - now)
+    fails = int((s.get("fails") or {}).get(best) or 0)
+    if fails >= SL_UPDATE_MAX_FAILS:
+        _sl_set(state="error", waitingFor=None, nextCheckAt=nxt,
+                lastResult=f"{inst} installed, {best} available — automatic upgrade failed {fails}×")
+        return max(1.0, nxt - now)
+    busy = update_busy_reason()
+    if busy or not update_idle_settled(now):
+        why = busy or "just finished work — waiting a few idle minutes"
+        if s.get("waitingFor") != why:
+            log(f"streamlink update: {best} available (have {inst}) — waiting until idle ({why})")
+        _sl_set(state="waiting-idle", waitingFor=why, lastResult=f"{inst} installed, {best} available",
+                nextCheckAt=nxt)
+        return AUTO_UPDATE_BUSY_SECS
+    _sl_set(state="upgrading", waitingFor=None)
+    ok, msg = streamlink_upgrade({"python": s.get("python"), "kind": kind, "installed": inst}, best)
+    if ok:
+        log(f"streamlink update: {msg} (verified: Twitch plugin + recorder options)")
+        _sl_set(state="up-to-date", installed=best, lastResult=f"updated {msg}", lastError=None,
+                lastUpgradeAt=time.time(), lastUpgradeFrom=inst, lastUpgradeTo=best, nextCheckAt=nxt,
+                installedReleasedAt=None)
+        return max(1.0, nxt - now)
+    if msg.startswith("externally-managed:"):
+        log(f"streamlink update: pip refused ({msg[19:]}) — {_sl_manual_hint('externally-managed')}")
+        _sl_set(state="outdated-manual", kind="externally-managed", hint=_sl_manual_hint("externally-managed"),
+                lastResult=f"{inst} installed, {best} available", lastError=None, nextCheckAt=nxt)
+        return max(1.0, nxt - now)
+    with SL_UPDATE_LOCK:
+        SL_UPDATE.setdefault("fails", {})[best] = fails + 1
+    log(f"streamlink update: upgrade to {best} failed — {msg}; retry in {int(SL_UPDATE_RETRY_SECS // 60)} min")
+    _sl_set(state="error", lastError=f"streamlink upgrade to {best} failed: {msg}",
+            lastResult=f"{inst} installed, {best} available", installed=streamlink_cli_version() or inst,
+            nextCheckAt=now + SL_UPDATE_RETRY_SECS)
+    STATUS_FILE_WAKE.set()
+    return SL_UPDATE_RETRY_SECS
+
+
+def streamlink_update_loop():
+    SL_UPDATE_WAKE.wait(SL_UPDATE_FIRST_SECS)
+    SL_UPDATE_WAKE.clear()
+    while True:
+        wait = SL_UPDATE_EVERY_SECS
+        try:
+            wait = streamlink_update_tick()
+        except Exception as e:
+            log(f"streamlink update loop error: {e}")
+            _sl_set(state="error", lastError=f"streamlink update error: {e}")
+            wait = SL_UPDATE_RETRY_SECS
+        SL_UPDATE_WAKE.wait(max(1.0, float(wait)))
+        SL_UPDATE_WAKE.clear()
+
+
+def streamlink_update_snapshot():
+    with SL_UPDATE_LOCK:
+        s = dict(SL_UPDATE)
+    s.pop("fails", None)
+    s.pop("checkNow", None)
+    s["enabled"] = streamlink_update_enabled()
+    s["envDisabled"] = SL_UPDATE_ENV_OFF
+    s["upgrading"] = SL_UPGRADING.is_set()
+    s["lastCheckAt"] = s.get("lastCheckAt") or None
+    s["nextCheckAt"] = s.get("nextCheckAt") or None
+    s["lastUpgradeAt"] = s.get("lastUpgradeAt") or None
+    s["outdated"] = bool(s.get("installed") and s.get("latestCompatible")
+                         and _sl_vtuple(s["installed"]) < _sl_vtuple(s["latestCompatible"]))
+    return s
+
+
+def streamlink_status_line(s):
+    """One plain-English line for the Recorder status file / page."""
+    if not s or not s.get("lastCheckAt"):
+        return "streamlink: version not checked yet (first check a few minutes after the helper starts)"
+    inst = s.get("installed")
+    st = s.get("state")
+    if st == "missing" or not inst:
+        return "streamlink: NOT WORKING — " + (s.get("hint") or "streamlink --version failed")
+    line = f"streamlink {inst}"
+    if s.get("installedReleasedAt"):
+        line += f" (released {s['installedReleasedAt']})"
+    if st == "up-to-date":
+        line += " — up to date"
+    elif st == "python-too-old":
+        line += f" — newest for Python {s.get('pythonVersion') or '?'}; streamlink {s.get('latest')} needs Python " \
+                f"{s.get('latestRequiresPython') or 'newer'} (install a newer Python to get Twitch fixes)"
+    elif st == "waiting-idle":
+        line += f" — {s.get('latestCompatible')} available, upgrading when idle ({s.get('waitingFor')})"
+    elif st == "upgrading":
+        line += f" — upgrading to {s.get('latestCompatible')}…"
+    elif st == "outdated-manual":
+        line += f" — OUTDATED, {s.get('latestCompatible')} available; {s.get('hint')}"
+    elif st == "off":
+        line += f" — OUTDATED, {s.get('latestCompatible')} available (automatic streamlink updates off)"
+    elif st == "error":
+        line += " — " + (s.get("lastError") or s.get("lastResult") or "check failed")
+    if s.get("lastUpgradeTo"):
+        line += f"; last auto-upgrade {s.get('lastUpgradeFrom')} → {s['lastUpgradeTo']} at {_iso_local(s.get('lastUpgradeAt'))}"
+    return line
+
+
+def api_streamlink_update(body):
+    """POST /api/streamlink/update {enabled?: bool, checkNow?: bool} → snapshot."""
+    body = body if isinstance(body, dict) else {}
+    if "enabled" in body:
+        with PIPELINE_LOCK:
+            PIPELINE["streamlinkUpdate"] = bool(body.get("enabled"))
+        _pipeline_save()
+        log(f"streamlink update pref: {'on' if body.get('enabled') else 'off'}")
+        STATUS_FILE_WAKE.set()
+    if body.get("checkNow"):
+        _sl_set(checkNow=True)
+    SL_UPDATE_WAKE.set()
+    return {"ok": True, "streamlinkUpdate": streamlink_update_snapshot()}, 200
+
+
+def _self_test_streamlink_update():
+    """v6.55: requires_python check, PyPI pick, tick decisions (idle wait, upgrade, rollback, manual)."""
+    assert _py_satisfies(">=3.10", "3.9.6") is False
+    assert _py_satisfies(">=3.10", "3.12.1") is True
+    assert _py_satisfies(">=3.9", "3.9.6") is True
+    assert _py_satisfies(">=3.8, !=3.9.*, <4", "3.9.6") is False
+    assert _py_satisfies("~=3.9", "3.13.0") is True and _py_satisfies("", "2.7.0") is True
+    doc = {"releases": {
+        "6.5.0": [{"requires_python": ">=3.8", "upload_time": "2024-01-01T00:00:00"}],
+        "7.6.0": [{"requires_python": ">=3.9", "upload_time": "2025-09-08T17:20:57"}],
+        "8.6.2": [{"requires_python": ">=3.10", "upload_time": "2026-10-07T19:50:40"}],
+        "9.0.0b1": [{"requires_python": ">=3.10"}],
+        "9.0.0": [{"requires_python": ">=3.10", "yanked": True}],
+    }}
+    lat = streamlink_latest("3.9.6", doc=doc)
+    assert lat["latest"] == "8.6.2" and lat["latestCompatible"] == "7.6.0", lat
+    assert streamlink_latest("3.12.0", doc=doc)["latestCompatible"] == "8.6.2"
+    g = globals()
+    saved = {k: g[k] for k in ("streamlink_inspect", "streamlink_latest", "streamlink_upgrade",
+                               "update_busy_reason", "update_idle_settled", "streamlink_cli_version")}
+    with SL_UPDATE_LOCK:
+        saved_state = dict(SL_UPDATE)
+        saved_state["fails"] = dict(SL_UPDATE.get("fails") or {})
+    with PIPELINE_LOCK:
+        saved_pref = PIPELINE.get("streamlinkUpdate", True)
+        PIPELINE["streamlinkUpdate"] = True
+    calls = []
+    env = {"info": {"installed": "6.5.0", "kind": "pip-user", "python": "/x/python3", "pythonVersion": "3.12.1",
+                    "hint": None},
+           "busy": "recording whistleface", "ok": (True, "streamlink 6.5.0 → 8.6.2")}
+
+    def _reset():
+        with SL_UPDATE_LOCK:
+            SL_UPDATE.update(state="starting", lastCheckAt=0.0, lastError=None, lastResult=None, fails={},
+                             waitingFor=None, lastUpgradeTo=None, checkNow=False)
+    try:
+        g["streamlink_inspect"] = lambda sl=None: dict(env["info"])
+        g["streamlink_latest"] = lambda pyver=None, doc=None: streamlink_latest_real(pyver, doc=doc_)
+        streamlink_latest_real, doc_ = saved["streamlink_latest"], doc
+        g["update_busy_reason"] = lambda: env["busy"]
+        g["update_idle_settled"] = lambda now=None: True
+        g["streamlink_cli_version"] = lambda sl=None: env["info"]["installed"]
+
+        def _fake_up(info, target):
+            calls.append((info.get("installed"), target, info.get("kind")))
+            return env["ok"]
+        g["streamlink_upgrade"] = _fake_up
+        _reset()
+        # recording → wait, never upgrade mid-stream
+        assert streamlink_update_tick() == AUTO_UPDATE_BUSY_SECS
+        assert SL_UPDATE["state"] == "waiting-idle" and not calls, SL_UPDATE
+        assert "upgrading when idle" in streamlink_status_line(streamlink_update_snapshot())
+        # idle → upgrade to newest compatible
+        env["busy"] = None
+        streamlink_update_tick()
+        assert calls == [("6.5.0", "8.6.2", "pip-user")], calls
+        assert SL_UPDATE["state"] == "up-to-date" and SL_UPDATE["lastUpgradeTo"] == "8.6.2", SL_UPDATE
+        # failed upgrade (rolled back) → error, retry later, give up after SL_UPDATE_MAX_FAILS
+        _reset()
+        calls.clear()
+        env["ok"] = (False, "pip install failed (exit 1): boom; kept streamlink 6.5.0")
+        for _i in range(SL_UPDATE_MAX_FAILS + 2):
+            with SL_UPDATE_LOCK:
+                SL_UPDATE["lastCheckAt"] = 0.0
+            streamlink_update_tick()
+        assert len(calls) == SL_UPDATE_MAX_FAILS, calls
+        assert SL_UPDATE["state"] == "error"
+        # Python 3.9 can't run 8.x → no upgrade, clear explanation
+        _reset()
+        calls.clear()
+        env["info"] = dict(env["info"], installed="7.6.0", pythonVersion="3.9.6")
+        streamlink_update_tick()
+        assert not calls and SL_UPDATE["state"] == "python-too-old", SL_UPDATE
+        assert "needs Python >=3.10" in streamlink_status_line(streamlink_update_snapshot())
+        # Homebrew copy → never touched, hint shown
+        _reset()
+        env["info"] = {"installed": "6.5.0", "kind": "homebrew", "python": None, "pythonVersion": None,
+                       "hint": _sl_manual_hint("homebrew")}
+        streamlink_update_tick()
+        assert not calls and SL_UPDATE["state"] == "outdated-manual", SL_UPDATE
+        assert "brew upgrade streamlink" in streamlink_status_line(streamlink_update_snapshot())
+        # pref off → report only
+        _reset()
+        env["info"] = {"installed": "6.5.0", "kind": "pip", "python": "/x/py", "pythonVersion": "3.12.0", "hint": None}
+        with PIPELINE_LOCK:
+            PIPELINE["streamlinkUpdate"] = False
+        streamlink_update_tick()
+        assert not calls and SL_UPDATE["state"] == "off", SL_UPDATE
+    finally:
+        g.update(saved)
+        with SL_UPDATE_LOCK:
+            SL_UPDATE.clear()
+            SL_UPDATE.update(saved_state)
+        with PIPELINE_LOCK:
+            PIPELINE["streamlinkUpdate"] = saved_pref
+    # recording start doesn't wait when no upgrade is running
+    t0 = time.time()
+    wait_streamlink_upgrade(5)
+    assert time.time() - t0 < 1
 
 
 def _self_test_go_live_schedule():
@@ -3111,6 +3689,7 @@ def self_test():
     _self_test_go_live_schedule()  # v6.52
     _self_test_orphan_recovery()  # v6.53
     _self_test_claimed_unstarted()  # v6.54
+    _self_test_streamlink_update()  # v6.55
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -3273,6 +3852,7 @@ def health_payload():
         "statusFile": status_file_snapshot(),  # v6.41
         "driveAccess": drive_access_snapshot(),  # v6.47: sticky banner when FDA/Drive blocks
         "autoUpdate": auto_update_snapshot(),  # v6.43
+        "streamlinkUpdate": streamlink_update_snapshot(),  # v6.55
         "soloWatch": solo_watch_snapshot(),  # v6.49
         "recoveredSessions": recovery_snapshot(),  # v6.53
         # v6.51: log lines the console/log file couldn't take as-is (Windows code page, closed pipe)
@@ -6249,6 +6829,8 @@ def _pipeline_load():
         PIPELINE["statusToDrive"] = data.get("statusToDrive") is not False
         # v6.43: install helper updates automatically when idle (default on)
         PIPELINE["autoUpdate"] = data.get("autoUpdate") is not False
+        # v6.55: keep streamlink current (pip installs only; default on)
+        PIPELINE["streamlinkUpdate"] = data.get("streamlinkUpdate") is not False
         # v6.49: mirror of solo-watch enabled (authoritative copy is .solo-watch.json)
         PIPELINE["soloWatch"] = data.get("soloWatch") is not False
         # v6.50: only one computer sends each stream's parts to Drive (default on)
@@ -7294,6 +7876,14 @@ def api_pipeline_prefs(body):
                 AUTO_UPDATE_WAKE.set()
                 STATUS_FILE_WAKE.set()
             PIPELINE["autoUpdate"] = on
+            changed = True
+        if "streamlinkUpdate" in body:  # v6.55
+            on = bool(body.get("streamlinkUpdate"))
+            if PIPELINE.get("streamlinkUpdate", True) is not on:
+                log(f"streamlink update pref: {'on' if on else 'off'}")
+                SL_UPDATE_WAKE.set()
+                STATUS_FILE_WAKE.set()
+            PIPELINE["streamlinkUpdate"] = on
             changed = True
         if "oneCopy" in body:  # v6.50: only one computer sends each stream to Drive
             on = bool(body.get("oneCopy"))
@@ -9201,6 +9791,13 @@ def build_status_doc(now=None):
                        "remoteVersion": au.get("remoteVersion"), "waitingFor": au.get("waitingFor"),
                        "lastAppliedVersion": au.get("lastAppliedVersion"),
                        "lastAppliedAt": _iso_local(au.get("lastAppliedAt"))},
+        # v6.55: installed vs newest streamlink (outdated streamlink = Twitch recordings fail)
+        "streamlinkUpdate": {k: v for k, v in streamlink_update_snapshot().items()
+                             if k in ("enabled", "state", "installed", "kind", "pythonVersion", "latest",
+                                      "latestCompatible", "latestRequiresPython", "installedReleasedAt",
+                                      "outdated", "hint", "waitingFor", "lastResult", "lastError",
+                                      "lastUpgradeFrom", "lastUpgradeTo")},
+        "streamlinkLine": streamlink_status_line(streamlink_update_snapshot()),
         "recentRecordings": recent,
         # v6.49: helper watching armed streamers while the recorder page is closed
         "soloWatch": solo_watch_snapshot(),
@@ -9238,6 +9835,8 @@ def render_status_text(doc):
     L.append(ver)
     tools = [("streamlink", doc["streamlink"]), ("ffmpeg", doc["ffmpeg"]), ("demucs", doc["demucs"])]
     L.append("Tools: " + ", ".join(f"{n} {'ok' if ok else 'MISSING'}" for n, ok in tools))
+    if doc.get("streamlinkLine"):  # v6.55
+        L.append(doc["streamlinkLine"])
     disk = f"Disk free: {_fmt_mb(doc.get('diskFreeBytes'))}"
     if doc.get("diskBlock"):
         disk += " — ALMOST FULL, new recordings blocked"
@@ -9622,6 +10221,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/update/auto":  # v6.43
             self.send_json({"ok": True, "autoUpdate": auto_update_snapshot()})
             return
+        if path == "/api/streamlink/update":  # v6.55
+            self.send_json({"ok": True, "streamlinkUpdate": streamlink_update_snapshot()})
+            return
         if path == "/api/status":
             self.send_json(status_payload())
             return
@@ -9705,6 +10307,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "origin not allowed"}, status=403)
                 return
             payload, status = api_update_auto(self.read_json())
+            self.send_json(payload, status=status)
+            return
+        if path == "/api/streamlink/update":  # v6.55: {enabled?, checkNow?}
+            if not origin_allowed(self.headers.get("Origin")):
+                self.send_json({"ok": False, "error": "origin not allowed"}, status=403)
+                return
+            payload, status = api_streamlink_update(self.read_json())
             self.send_json(payload, status=status)
             return
         if path == "/api/restart":
@@ -9948,6 +10557,8 @@ def main():
     httpd = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
     # v6.43: unattended GitHub update check (~2 min after start, then every ~3 h; installs when idle)
     threading.Thread(target=auto_update_loop, daemon=True, name="auto-update").start()
+    # v6.55: keep streamlink current (PyPI check a few min after start, then every ~12 h; upgrades when idle)
+    threading.Thread(target=streamlink_update_loop, daemon=True, name="streamlink-update").start()
     sl = which_streamlink()
     ff = which_ffmpeg()
     html_path = HERE / HTML_NAME
@@ -9971,6 +10582,11 @@ def main():
     else:
         log(f"auto-update: {'on' if auto_update_enabled() else 'OFF (Settings)'} — first GitHub check in "
             f"{int(AUTO_UPDATE_FIRST_SECS)}s, then every {AUTO_UPDATE_EVERY_SECS / 3600:g} h; installs only when idle")
+    if SL_UPDATE_ENV_OFF:
+        log("streamlink update: disabled by TWITCH_RECORDER_STREAMLINK_UPDATE=0 (version still reported)")
+    else:
+        log(f"streamlink update: {'on' if streamlink_update_enabled() else 'OFF (Settings)'} — PyPI check in "
+            f"{int(SL_UPDATE_FIRST_SECS)}s, then every {SL_UPDATE_EVERY_SECS / 3600:g} h; upgrades pip installs only when idle")
     sw = solo_watch_snapshot()
     if SOLO_WATCH_SECS <= 0:
         log("solo watch: disabled by TWITCH_RECORDER_SOLO_WATCH_SECS=0")
