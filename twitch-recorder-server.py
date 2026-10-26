@@ -3,6 +3,7 @@
 
 import http.server
 import json
+import re  # v6.57 (ad-break log lines); also re-imported below for v6.55
 import sys
 import os
 import shutil
@@ -20,7 +21,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.56"
+HELPER_VERSION = "6.57"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -49,6 +50,20 @@ RETRY_BACKOFFS = (5, 15, 30)
 MID_RESUME_BACKOFFS = (3, 8, 15)
 # After establish: no output growth for this long → kill + mid-resume (hung streamlink).
 STALL_SECS = 90
+# v6.57: Twitch ad breaks. streamlink 7+ always cuts Twitch ads out of the recording, so the
+# file simply stops growing for the whole break (mid-rolls are often 90-180 s, pre-rolls on a
+# fresh connection 15-90 s). That used to look like a hung streamlink: the 90 s stall check
+# killed it mid-ad (new segment, a few seconds of the set lost at the cut) and the 20 s
+# establish check killed every fresh start that sat in a pre-roll — and the retry got a new
+# pre-roll. streamlink logs the pause ("Filtering out segments and pausing stream output",
+# "Waiting for pre-roll ads to finish", "Detected advertisement break of N seconds"), so while
+# that says an ad is running we wait for it (up to the ad length + slack, capped here) instead.
+# 0 disables (old behavior). Env: TWITCH_RECORDER_AD_PAUSE_MAX_SECS.
+try:
+    AD_PAUSE_MAX_SECS = max(0, int(os.environ.get("TWITCH_RECORDER_AD_PAUSE_MAX_SECS", "480")))
+except ValueError:
+    AD_PAUSE_MAX_SECS = 480
+AD_STATS = {"breaks": 0, "prerolls": 0, "stallsAvoided": 0, "lastAt": 0.0, "lastUser": "", "lastSecs": None}
 # Mid-resume: consecutive establish failures before giving up (stream likely offline /
 # page closed so Twitch poll cannot /api/stop). Auto-Rec can POST /api/record again if still live.
 MAX_MID_QUICK_FAILS = 5
@@ -1206,6 +1221,8 @@ def build_cmd(username, quality):
         cmd = [
             sl,
             "--force",
+            "--loglevel",
+            "info",  # v6.57: ad-break lines ("pausing stream output") must reach stderr
             "--output",
             str(out),
             "--ffmpeg-fout",
@@ -1216,7 +1233,7 @@ def build_cmd(username, quality):
     else:
         # streamlink cannot remux to ogg without ffmpeg — keep .ts fallback
         out = unique_recording_path(username, "ts")
-        cmd = [sl, "--force", "--output", str(out), f"twitch.tv/{username}", sl_quality]
+        cmd = [sl, "--force", "--loglevel", "info", "--output", str(out), f"twitch.tv/{username}", sl_quality]
     return cmd, out
 
 
@@ -1297,6 +1314,102 @@ def with_stderr(err_msg, proc):
     return f"{err_msg} — {snippet}"
 
 
+_AD_PAUSE_RE = re.compile(r"filtering out segments and pausing stream output", re.I)
+_AD_RESUME_RE = re.compile(r"resuming stream output", re.I)
+_AD_PREROLL_RE = re.compile(r"waiting for pre-roll ads to finish", re.I)
+_AD_BREAK_RE = re.compile(r"detected advertisement break of (\d+) second", re.I)
+
+
+def _stderr_tail_bytes(proc, limit=16384):
+    """v6.57: last bytes of streamlink's stderr temp file without moving the shared offset.
+
+    The child writes through the same open file, so a seek here could make it overwrite its
+    own log. POSIX: os.pread. Elsewhere: short seek/read, then back to the end.
+    """
+    f = getattr(proc, "_stderr_file", None) if proc is not None else None
+    if f is None:
+        return b""
+    try:
+        fd = f.fileno()
+        size = os.fstat(fd).st_size
+        start = max(0, size - limit)
+        if hasattr(os, "pread"):
+            return os.pread(fd, size - start, start) or b""
+        try:
+            os.lseek(fd, start, os.SEEK_SET)
+            return os.read(fd, size - start) or b""
+        finally:
+            os.lseek(fd, 0, os.SEEK_END)
+    except Exception:
+        return b""
+
+
+def streamlink_ad_state(proc, text=None):
+    """v6.57: is streamlink currently sitting in a Twitch ad (output paused on purpose)?
+
+    Returns {inAd, preroll, breakSecs}. inAd: the last pause / pre-roll line has no
+    "Resuming stream output" after it. breakSecs: the newest "advertisement break of N s".
+    """
+    if text is None:
+        text = _stderr_tail_bytes(proc).decode("utf-8", errors="replace")
+    last_pause = -1
+    for m in _AD_PAUSE_RE.finditer(text):
+        last_pause = m.start()
+    last_pre = -1
+    for m in _AD_PREROLL_RE.finditer(text):
+        last_pre = m.start()
+    last_resume = -1
+    for m in _AD_RESUME_RE.finditer(text):
+        last_resume = m.start()
+    secs = None
+    for m in _AD_BREAK_RE.finditer(text):
+        try:
+            secs = int(m.group(1))
+        except ValueError:
+            pass
+    started = max(last_pause, last_pre)
+    in_ad = started >= 0 and last_resume < started
+    return {"inAd": bool(in_ad), "preroll": bool(in_ad and last_pre >= 0 and last_pre >= last_pause),
+            "breakSecs": secs}
+
+
+def ad_pause_allowance(state, base_secs):
+    """v6.57: how long a no-growth gap may last while streamlink says an ad is playing."""
+    if not AD_PAUSE_MAX_SECS or not state or not state.get("inAd"):
+        return base_secs
+    secs = state.get("breakSecs")
+    if secs:
+        want = int(secs) + max(45, base_secs)
+    else:
+        want = AD_PAUSE_MAX_SECS
+    return max(base_secs, min(AD_PAUSE_MAX_SECS, want))
+
+
+def _note_ad_break_locked(username, gen, state, since, preroll=False):
+    """v6.57: mark rec['adBreak'] (shown on the page) and count it once per break."""
+    rec = ACTIVE.get(username)
+    if not rec or rec.get("gen") != gen:
+        return False
+    if rec.get("adBreak"):
+        rec["adBreak"]["secs"] = state.get("breakSecs") or rec["adBreak"].get("secs")
+        return False
+    rec["adBreak"] = {"since": since, "secs": state.get("breakSecs"), "preroll": bool(preroll)}
+    rec["adBreaks"] = int(rec.get("adBreaks") or 0) + 1
+    AD_STATS["prerolls" if preroll else "breaks"] += 1
+    AD_STATS["lastAt"] = time.time()
+    AD_STATS["lastUser"] = username
+    AD_STATS["lastSecs"] = state.get("breakSecs")
+    return True
+
+
+def _clear_ad_break_locked(username, gen):
+    rec = ACTIVE.get(username)
+    if rec and rec.get("gen") == gen and rec.get("adBreak"):
+        rec.pop("adBreak", None)
+        return True
+    return False
+
+
 def looks_offline_err(err_msg):
     low = (err_msg or "").lower()
     return any(h in low for h in OFFLINE_STDERR_HINTS)
@@ -1314,7 +1427,29 @@ def monitor_quick_fail(username, gen, proc, out_path):
     deadline = t0 + QUICK_FAIL_SECS
     last_size = 0
     grew = False
-    while time.time() < deadline:
+    ad_checked_at = 0.0
+    ad_noted = False
+    while True:
+        now = time.time()
+        if now >= deadline and not grew and AD_PAUSE_MAX_SECS:
+            # v6.57: nothing written yet — a Twitch pre-roll (or an ad on the first
+            # playlist) holds streamlink's output back. Wait it out instead of retrying
+            # into a brand-new pre-roll.
+            if now - ad_checked_at >= 1.5:
+                ad_checked_at = now
+                st = streamlink_ad_state(proc)
+                if st["inAd"] and proc.poll() is None:
+                    deadline = max(deadline, min(t0 + ad_pause_allowance(st, QUICK_FAIL_SECS),
+                                                 t0 + AD_PAUSE_MAX_SECS + QUICK_FAIL_SECS))
+                    if not ad_noted:
+                        ad_noted = True
+                        with LOCK:
+                            _note_ad_break_locked(username, gen, st, t0, preroll=True)
+                        log(f"ad break: {username} — Twitch pre-roll ad before the stream"
+                            + (f" ({st['breakSecs']} s)" if st.get("breakSecs") else "")
+                            + f"; waiting up to {int(deadline - t0)} s instead of retrying")
+        if time.time() >= deadline:
+            break
         if not still_wanted(username, gen):
             terminate_proc(proc)
             return False, "stopped"
@@ -1333,6 +1468,10 @@ def monitor_quick_fail(username, gen, proc, out_path):
             last_size = sz
         # Playlist is clearly flowing — treat as established early
         if grew and last_size > 0 and (time.time() - t0) >= 3:
+            if ad_noted:
+                with LOCK:
+                    _clear_ad_break_locked(username, gen)
+                log(f"ad break over: {username} — pre-roll finished after {int(time.time() - t0)} s, recording")
             return True, None
         time.sleep(0.5)
     code = proc.poll()
@@ -1345,10 +1484,18 @@ def monitor_quick_fail(username, gen, proc, out_path):
     sz = file_size(out_path)
     if sz <= 0 and not grew:
         terminate_proc(proc)
+        if ad_noted:
+            with LOCK:
+                _clear_ad_break_locked(username, gen)
         return False, with_stderr(
-            f"no output file growth within {QUICK_FAIL_SECS}s — retrying",
+            f"no output file growth within {int(deadline - t0)}s"
+            + (" (Twitch pre-roll ad never ended)" if ad_noted else "")
+            + " — retrying",
             proc,
         )
+    if ad_noted:
+        with LOCK:
+            _clear_ad_break_locked(username, gen)
     return True, None
 
 
@@ -1705,6 +1852,9 @@ def watch_and_resume(username, quality, gen, proc):
         path0 = rec0.get("file") or ""
     last_size = file_size(path0)
     last_growth = time.time()
+    ad_checked_at = 0.0  # v6.57
+    ad_state = None
+    ad_logged = False
 
     def in_grace():
         """v6.42: still inside the restart window for this ended segment?"""
@@ -1787,6 +1937,14 @@ def watch_and_resume(username, quality, gen, proc):
             sz = file_size(path)
             now = time.time()
             if sz > last_size:
+                if ad_logged:
+                    with LOCK:
+                        _clear_ad_break_locked(username, gen)
+                    if now - last_growth >= STALL_SECS:
+                        AD_STATS["stallsAvoided"] += 1
+                    log(f"ad break over: {username} — output resumed after {int(now - last_growth)} s")
+                ad_logged = False
+                ad_state = None
                 last_size = sz
                 last_growth = now
                 # Growing is the best time to notice a nearly-full volume before
@@ -1797,11 +1955,36 @@ def watch_and_resume(username, quality, gen, proc):
                     return
                 time.sleep(0.75)
                 continue
-            if now - last_growth < STALL_SECS:
+            gap = now - last_growth
+            if AD_PAUSE_MAX_SECS and gap >= min(15.0, STALL_SECS * 0.5) and now - ad_checked_at >= 3:
+                # v6.57: a Twitch ad pauses output on purpose — read streamlink's log
+                ad_checked_at = now
+                ad_state = streamlink_ad_state(proc)
+                if ad_state["inAd"]:
+                    with LOCK:
+                        fresh = _note_ad_break_locked(username, gen, ad_state, last_growth)
+                    if fresh or not ad_logged:
+                        ad_logged = True
+                        log(f"ad break: {username} — Twitch ad"
+                            + (f" ({ad_state['breakSecs']} s)" if ad_state.get("breakSecs") else "")
+                            + ", streamlink paused output; not a stall (waiting up to "
+                            + f"{ad_pause_allowance(ad_state, STALL_SECS)} s)")
+                elif ad_logged:
+                    with LOCK:
+                        _clear_ad_break_locked(username, gen)
+                    ad_logged = False
+            limit = ad_pause_allowance(ad_state, STALL_SECS) if ad_state else STALL_SECS
+            if gap < limit:
                 time.sleep(0.75)
                 continue
+            in_ad = bool(ad_state and ad_state.get("inAd"))
+            if in_ad:
+                with LOCK:
+                    _clear_ad_break_locked(username, gen)
             err = with_stderr(
-                f"streamlink stalled (no file growth for {STALL_SECS}s) — resuming",
+                f"streamlink stalled (no file growth for {int(gap)}s"
+                + (", longer than the Twitch ad break it reported" if in_ad else "")
+                + ") — resuming",
                 proc,
             )
             log(f"mid-stream stall: {username} size={sz}B — {err}")
@@ -2817,7 +3000,7 @@ SL_UPDATE_EVERY_SECS = _env_secs("TWITCH_RECORDER_STREAMLINK_UPDATE_SECS", 12 * 
 SL_UPDATE_RETRY_SECS = _env_secs("TWITCH_RECORDER_STREAMLINK_UPDATE_RETRY_SECS", 3600, 5)
 SL_UPDATE_MAX_FAILS = 3  # per target version; then wait for a newer release (or a manual "check now")
 SL_PYPI_URL = os.environ.get("TWITCH_RECORDER_STREAMLINK_PYPI_URL") or "https://pypi.org/pypi/streamlink/json"
-SL_REQUIRED_OPTS = ("--output", "--force", "--ffmpeg-fout", "--json")  # build_cmd + live probe
+SL_REQUIRED_OPTS = ("--output", "--force", "--ffmpeg-fout", "--json", "--loglevel")  # build_cmd + live probe
 SL_UPDATE_WAKE = threading.Event()
 SL_UPDATE_LOCK = threading.Lock()
 SL_UPGRADING = threading.Event()  # set while pip is replacing streamlink
@@ -3518,6 +3701,30 @@ def self_test():
             if prev_fake is not None:
                 ACTIVE[fake_u] = prev_fake
     assert "graceOfflineSecs" in health_payload()
+    # v6.57: Twitch ad-break detection from streamlink's log
+    _pre = "[cli][info] Opening stream: audio_only (hls)\n[plugins.twitch][info] Will skip ad segments\n" \
+           "[plugins.twitch][info] Waiting for pre-roll ads to finish, be patient\n"
+    st_a = streamlink_ad_state(None, _pre)
+    assert st_a["inAd"] and st_a["preroll"] and st_a["breakSecs"] is None, st_a
+    _mid = _pre + "[stream.hls][info] Resuming stream output\n[plugins.twitch][info] Detected advertisement " \
+           "break of 120 seconds\n[stream.hls][info] Filtering out segments and pausing stream output\n"
+    st_b = streamlink_ad_state(None, _mid)
+    assert st_b["inAd"] and not st_b["preroll"] and st_b["breakSecs"] == 120, st_b
+    st_c = streamlink_ad_state(None, _mid + "[stream.hls][info] Resuming stream output\n")
+    assert not st_c["inAd"], st_c
+    assert ad_pause_allowance(st_c, STALL_SECS) == STALL_SECS
+    if AD_PAUSE_MAX_SECS:
+        assert ad_pause_allowance(st_b, STALL_SECS) == min(AD_PAUSE_MAX_SECS, 120 + STALL_SECS)
+        assert ad_pause_allowance(st_a, QUICK_FAIL_SECS) == AD_PAUSE_MAX_SECS
+    import tempfile as _tmpf57
+    with _tmpf57.TemporaryFile() as _tf:
+        _tf.write(_mid.encode()); _tf.flush()
+        class _P: pass
+        _pp = _P(); _pp._stderr_file = _tf
+        pos = _tf.tell()
+        assert streamlink_ad_state(_pp)["inAd"]
+        assert _tf.tell() == pos  # never moves the offset streamlink writes through
+    assert "adPause" in health_payload()
     # v6.47: status_file_snapshot exposes local mirror + driveOk keys
     with STATUS_FILE_LOCK:
         prev_sf = dict(STATUS_FILE)
@@ -3834,6 +4041,8 @@ def health_payload():
         # v6.48: page ends restart grace after Helix says offline this long (0 = never early)
         "graceOfflineSecs": GRACE_OFFLINE_SECS,
         "restartGraceSecs": RESTART_GRACE_SECS,
+        # v6.57: Twitch ad breaks waited out instead of treated as a stall / failed start
+        "adPause": {"maxSecs": AD_PAUSE_MAX_SECS, **{k: AD_STATS[k] for k in AD_STATS}},
         "recordingsDir": str(REC_DIR),
         "active": active,
         "lastErrors": last_errors,
@@ -3895,6 +4104,9 @@ def status_payload():
                 "graceReleased": bool(rec.get("graceRelease")),
                 # v6.49: "helper" when solo-watch started this while the page was closed
                 "startedBy": rec.get("startedBy") or "page",
+                # v6.57: Twitch ad playing — streamlink paused output on purpose (not a stall)
+                "adBreak": dict(rec["adBreak"]) if rec.get("adBreak") else None,
+                "adBreaks": int(rec.get("adBreaks") or 0),
             }
             peak = rec.get("peak")
             level = rec.get("level")

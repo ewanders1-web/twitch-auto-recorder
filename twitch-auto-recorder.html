@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.56</span>
+    <span class="badge">v6.57</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -559,7 +559,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.56'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.57'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -3385,6 +3385,18 @@ function paintHelperVu(job){
   }
 
   let label='writing';
+  // v6.57: Twitch ad playing — streamlink leaves ads out, so the file pauses on purpose
+  if(job.adBreak && !job.retrying){
+    const ab=job.adBreak;
+    const secs=Number(ab.secs)||0;
+    const since=Number(ab.since)||0;
+    const left=(secs && since)?Math.max(0, Math.round(since+secs-Date.now()/1000)):0;
+    label=(ab.preroll?'pre-roll ad':'ad break')+(left?' ~'+left+'s':'')+' · not recorded';
+    st.quietPolls=0;
+    if(!st.peakHold || st.peakHold.length!==VU_BARS) st.peakHold=new Array(VU_BARS).fill(0.06);
+    paintVuBars(pfx, activityToBars(0, st.peakHold), label);
+    return;
+  }
   if(job.retrying) label='stalled';
   else if(hasPeak && peak>0) label=(peak<0.02)?'silent':'signal';
   else if(st.quietPolls>=6) label='stalled';
