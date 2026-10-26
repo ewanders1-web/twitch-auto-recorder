@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch Raid Reset
 // @namespace    https://twitch.tv/
-// @version      1.2
+// @version      1.3
 // @description  Redirects back to the original streamer when a raid occurs, and (new) can return home after a set ends — works for multiple streamers
 // @match        https://www.twitch.tv/*
 // @run-at       document-idle
@@ -37,7 +37,8 @@
             'thegafflive',
             'djicyice',
             'lilypita',
-            'dj_sweettooth'
+            'dj_sweettooth',
+            'dogloversnyc'
         ],
 
         // How long the channel must stay offline before the set counts
