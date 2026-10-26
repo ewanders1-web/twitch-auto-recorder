@@ -15,6 +15,54 @@ import site
 os.environ["PATH"] = str(Path(site.USER_BASE) / "bin") + os.pathsep + os.environ.get("PATH", "")
 import time
 
+TOOLS_PATH = Path(__file__).resolve().parent / "ffmpeg-path.txt"
+if os.name == "nt" and TOOLS_PATH.exists():
+    os.environ["PATH"] = TOOLS_PATH.read_text(encoding="utf-16").strip() + os.pathsep + os.environ.get("PATH", "")
+from contextlib import contextmanager
+
+STOP_FILE = None
+
+def stopping():
+    return STOP or bool(STOP_FILE and STOP_FILE.exists())
+
+def interrupt_capture(proc):
+    if proc.poll() is None:
+        if os.name == "nt":
+            proc.terminate()
+        else:
+            proc.send_signal(signal.SIGINT)
+
+@contextmanager
+def processing_lock(path):
+    """One separation worker at a time, released by the OS even after a crash."""
+    with open(path, "a+b") as lock:
+        lock.seek(0, 2)
+        if lock.tell() == 0:
+            lock.write(b"0")
+            lock.flush()
+        if os.name == "nt":
+            import msvcrt
+            while True:
+                lock.seek(0)
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (13, 11, 36):
+                        raise
+                    time.sleep(0.2)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
 STOP = False
 ACTIVE = None
 
@@ -22,12 +70,21 @@ def stop(signum, frame):
     global STOP
     STOP = True
     if ACTIVE and ACTIVE.poll() is None:
-        ACTIVE.send_signal(signal.SIGINT)
+        interrupt_capture(ACTIVE)
 
 def run(args, log):
     global ACTIVE
     with open(log, 'ab') as out:
         ACTIVE = subprocess.Popen([str(a) for a in args], stdout=out, stderr=out)
+        while ACTIVE.poll() is None:
+            if stopping():
+                interrupt_capture(ACTIVE)
+                try:
+                    ACTIVE.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    ACTIVE.kill()
+                break
+            time.sleep(0.2)
         code = ACTIVE.wait()
         ACTIVE = None
     if code:
@@ -35,10 +92,10 @@ def run(args, log):
 
 def save(folder, state, **extra):
     path = folder / 'status.json'
-    data = json.loads(path.read_text()) if path.exists() else {}
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     data.update(state=state, updated=dt.datetime.now().isoformat(), **extra)
     tmp = folder / 'status.tmp'
-    tmp.write_text(json.dumps(data, indent=2))
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     tmp.replace(path)
     print(folder.name + ': ' + state, flush=True)
 
@@ -70,7 +127,7 @@ def split(music, folder, seconds=1800):
         name = '{}-music-part{}of{}.ogg'.format(folder.name, i, total)
         chunk.rename(staging / name)
         files.append(dict(file=name, part=i, total=total, seconds=length))
-    (staging / 'manifest.json').write_text(json.dumps(files, indent=2))
+    (staging / 'manifest.json').write_text(json.dumps(files, indent=2), encoding="utf-8")
     target = folder / 'music-parts'
     if target.exists():
         raise RuntimeError('Final parts already exist; originals and existing parts retained')
@@ -110,10 +167,11 @@ def check():
     if p.returncode:
         missing.append('Demucs / PyTorch')
     if missing:
-        raise RuntimeError('Missing: ' + ', '.join(missing) + '. Run Install.command first.')
+        raise RuntimeError('Missing: ' + ', '.join(missing) + '. Run Install.command (Mac) or Install.cmd (Windows) first.')
 
 def watch(channel, root, interval):
-    global ACTIVE
+    global ACTIVE, STOP_FILE
+    STOP_FILE = root / (channel.lower() + ".stop")
     channel = re.sub(r'^https?://(?:www\.)?twitch\.tv/', '', channel).strip('/')
     if not re.fullmatch(r'[A-Za-z0-9_]{1,25}', channel):
         raise RuntimeError('Enter a Twitch channel name or its twitch.tv URL')
@@ -126,9 +184,19 @@ def watch(channel, root, interval):
     os.write(fd, str(os.getpid()).encode())
     os.close(fd)
     try:
-        while not STOP:
+        while not stopping():
             print('Watching ' + channel + ' …', flush=True)
-            probe = subprocess.run(['streamlink', '--stream-url', 'https://twitch.tv/' + channel, 'audio_only,best'], capture_output=True, text=True)
+            try:
+                probe = subprocess.run(['streamlink', '--stream-url', 'https://twitch.tv/' + channel, 'audio_only,best'], capture_output=True, text=True, timeout=45)
+            except subprocess.TimeoutExpired:
+                print('Channel check timed out; checking again shortly.', flush=True)
+                for _ in range(interval):
+                    if stopping():
+                        break
+                    time.sleep(1)
+                continue
+            if stopping():
+                break
             if probe.returncode:
                 print('Offline or unavailable; checking again shortly. ' + probe.stderr[-300:], flush=True)
             else:
@@ -150,11 +218,12 @@ def watch(channel, root, interval):
                         worker = ['caffeinate', '-i'] + worker
                     subprocess.Popen(worker, stdout=log, stderr=log, start_new_session=True)
             for _ in range(interval):
-                if STOP:
+                if stopping():
                     break
                 time.sleep(1)
     finally:
         lock.unlink(missing_ok=True)
+        STOP_FILE.unlink(missing_ok=True)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -169,9 +238,7 @@ def main():
     args = parser.parse_args()
     if args.mode == 'process':
         # One CPU separation at a time, including across separate channel watchers.
-        import fcntl
-        with open(Path(__file__).resolve().parent / '.processing.lock', 'a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with processing_lock(Path(__file__).resolve().parent / '.processing.lock'):
             process(args.folder)
     else:
         check()
@@ -188,3 +255,4 @@ if __name__ == '__main__':
     except Exception as exc:
         print('Error: ' + str(exc), file=sys.stderr)
         sys.exit(1)
+
