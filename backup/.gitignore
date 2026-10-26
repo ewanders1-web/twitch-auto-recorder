@@ -1,0 +1,7 @@
+.venv/
+Recordings/
+__pycache__/
+streamers.json
+.processing.lock
+*.log
+.DS_Store
