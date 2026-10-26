@@ -5,3 +5,8 @@ streamers.json
 .processing.lock
 *.log
 .DS_Store
+
+
+ffmpeg-path.txt
+*.download
+__pycache__/

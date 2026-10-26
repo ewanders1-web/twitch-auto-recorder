@@ -1,11 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")"
-export PATH="$PWD/.venv/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-PYTHON=python3
-if [ -x .venv/bin/python ]; then PYTHON=.venv/bin/python; fi
-if command -v caffeinate >/dev/null; then
-  caffeinate -i "$PYTHON" interface.py
-else
-  "$PYTHON" interface.py
+if [ ! -x .venv/bin/python ]; then
+  cd "$HOME/Library/Application Support/TwitchBackupRecorder"
 fi
+export PATH="$PWD/.venv/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+if [ ! -x .venv/bin/python ]; then
+  echo 'Run Install.command first.'
+  exit 1
+fi
+exec caffeinate -i .venv/bin/python interface.py

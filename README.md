@@ -81,3 +81,8 @@ Twitch Client ID/Secret stay in browser localStorage only — they are never com
 ## Security note
 
 The helper binds **localhost only** (`127.0.0.1`). Do not bind `0.0.0.0`.
+
+
+## Independent backup recorder (Mac and Windows)
+
+Install a second recorder on each computer with its own recordings and settings. [Shareable setup page](https://ewanders1-web.github.io/twitch-auto-recorder/backup/guide.html) · [Source and instructions](backup/README.md).

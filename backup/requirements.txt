@@ -1,0 +1,8 @@
+numpy<2
+torch==2.2.2; sys_platform == 'darwin' and platform_machine == 'x86_64'
+torchaudio==2.2.2; sys_platform == 'darwin' and platform_machine == 'x86_64'
+torch==2.5.1; sys_platform != 'darwin' or platform_machine != 'x86_64'
+torchaudio==2.5.1; sys_platform != 'darwin' or platform_machine != 'x86_64'
+demucs==4.0.1
+streamlink
+soundfile
