@@ -17,6 +17,10 @@ os.environ["PATH"] = str(Path(site.USER_BASE) / "bin") + os.pathsep + os.environ
 import threading
 import webbrowser
 
+TOOLS_PATH = Path(__file__).resolve().parent / "ffmpeg-path.txt"
+if os.name == "nt" and TOOLS_PATH.exists():
+    os.environ["PATH"] = TOOLS_PATH.read_text(encoding="utf-16").strip() + os.pathsep + os.environ.get("PATH", "")
+
 BASE = Path(__file__).resolve().parent
 ROOT = BASE / 'Recordings'
 ROOT.mkdir(exist_ok=True)
@@ -25,7 +29,7 @@ PAGE_ORIGIN = 'https://ewanders1-web.github.io'
 WATCHERS = {}
 MUTEX = threading.Lock()
 PREFS = BASE / 'streamers.json'
-CHANNELS = json.loads(PREFS.read_text()) if PREFS.exists() else ['whistleface']
+CHANNELS = json.loads(PREFS.read_text(encoding="utf-8")) if PREFS.exists() else ['whistleface']
 
 def launch(args, log):
     with open(log, 'ab') as out:
@@ -38,12 +42,12 @@ def snapshot():
         if not folder.is_dir():
             continue
         try:
-            state = json.loads((folder / 'status.json').read_text())
+            state = json.loads((folder / 'status.json').read_text(encoding="utf-8"))
             state['id'] = folder.name
             source = folder / 'original.ts'
             state['bytes'] = source.stat().st_size if source.exists() else 0
             manifest = folder / 'music-parts' / 'manifest.json'
-            state['files'] = json.loads(manifest.read_text()) if manifest.exists() else []
+            state['files'] = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else []
             sessions.append(state)
         except (OSError, ValueError):
             continue
@@ -105,7 +109,7 @@ class Handler(BaseHTTPRequestHandler):
             with MUTEX:
                 return self.reply(snapshot())
         if path == '/':
-            body = (BASE / 'index.html').read_text().replace('__TOKEN__', TOKEN).encode()
+            body = (BASE / 'index.html').read_text(encoding="utf-8").replace('__TOKEN__', TOKEN).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Cache-Control', 'no-store')
@@ -147,29 +151,30 @@ class Handler(BaseHTTPRequestHandler):
                         CHANNELS.append(channel)
                     elif action == 'start':
                         if not all(shutil.which(x) for x in ['ffmpeg', 'ffprobe', 'streamlink']) or importlib.util.find_spec('demucs') is None:
-                            raise ValueError('Run Install.command first, then reopen this interface.')
+                            raise ValueError('Run Install.command (Mac) or Install.cmd (Windows), then reopen this interface.')
                         if channel not in CHANNELS:
                             raise ValueError('Add this streamer first')
                         if not active:
+                            (ROOT / (channel + '.stop')).unlink(missing_ok=True)
                             WATCHERS[channel] = launch(['watch', channel], ROOT / (channel + '-watcher.log'))
                     elif action == 'stop' and active:
-                        # Signal the watcher only; it gracefully stops its own capture and queues processing.
-                        proc.send_signal(signal.SIGINT)
+                        # A stop file works without POSIX console signals on Windows.
+                        (ROOT / (channel + '.stop')).touch()
                     elif action == 'remove':
                         if active:
                             raise ValueError('Stop watching before removing this streamer')
                         if channel in CHANNELS:
                             CHANNELS.remove(channel)
-                    PREFS.write_text(json.dumps(CHANNELS))
+                    PREFS.write_text(json.dumps(CHANNELS), encoding="utf-8")
                 elif action == 'retry':
                     folder = (ROOT / str(data.get('session', ''))).resolve()
                     if folder.parent != ROOT.resolve() or not folder.is_dir():
                         raise ValueError('Session not found')
-                    state = json.loads((folder / 'status.json').read_text())
+                    state = json.loads((folder / 'status.json').read_text(encoding="utf-8"))
                     if state['state'] not in ('processing failed', 'recorded; ready to process'):
                         raise ValueError('This session is already recording, processing or complete')
                     state['state'] = 'queued for processing'
-                    (folder / 'status.json').write_text(json.dumps(state))
+                    (folder / 'status.json').write_text(json.dumps(state), encoding="utf-8")
                     launch(['process', str(folder)], folder / 'worker.log')
                 else:
                     raise ValueError('Unknown action')
@@ -178,14 +183,20 @@ class Handler(BaseHTTPRequestHandler):
             self.reply({'error': str(exc)}, 400)
 
 if __name__ == '__main__':
+    if os.name == "nt":
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
     server = ThreadingHTTPServer(('127.0.0.1', 8766), Handler)
     print('Backup recorder: http://127.0.0.1:8766 — keep this window open.', flush=True)
     threading.Timer(0.6, lambda: webbrowser.open('http://127.0.0.1:8766')).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        for proc in WATCHERS.values():
+        for channel, proc in WATCHERS.items():
             if proc.poll() is None:
-                proc.send_signal(signal.SIGINT)
+                (ROOT / (channel + '.stop')).touch()
     finally:
         server.server_close()
+        if os.name == "nt":
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+
