@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.57</span>
+    <span class="badge">v6.58</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -559,7 +559,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.57'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.58'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -5424,7 +5424,16 @@ function renderKeepAwakeSchedInfo(){
     el.textContent=(sc.armedUsers&&sc.armedUsers.length)?'(no usual time learned yet — needs 2+ past streams on the same weekday)':'';
     return;
   }
-  el.textContent='('+wins.slice(0,4).map(function(w){ return w.username+' '+w.weekdayName+' '+w.from+'–'+w.to; }).join('; ')+(wins.length>4?'; …':'')+')';
+  let txt='('+wins.slice(0,4).map(function(w){ return w.username+' '+w.weekdayName+' '+w.from+'–'+w.to; }).join('; ')+(wins.length>4?'; …':'')+')';
+  // v6.58: Windows helper also wakes the PC from sleep at the start of these windows
+  const wk=k.wake;
+  if(wk && wk.supported && sc.enabled!==false){
+    if(wk.error) txt+=' · wake from sleep failed: '+wk.error;
+    else if(Array.isArray(wk.next) && wk.next.length) txt+=' · wakes this PC from sleep '+wk.next[0]+(wk.next.length>1?' (+'+(wk.next.length-1)+' more)':'');
+    if(wk.wakeTimersHint) txt+=' · ⚠ '+wk.wakeTimersHint;
+  }
+  el.textContent=txt;
+  el.title=(wk && wk.supported && Array.isArray(wk.next) && wk.next.length)?('Scheduled wakes: '+wk.next.join('; ')):((wk && wk.note)||'');
 }
 function saveKeepAwakeToggle(){
   const a=document.getElementById('keepAwakeToggle');

@@ -21,7 +21,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.57"
+HELPER_VERSION = "6.58"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -3898,6 +3898,7 @@ def self_test():
     _self_test_claimed_unstarted()  # v6.54
     _self_test_streamlink_update()  # v6.55
     _self_test_v656()  # v6.56
+    _self_test_v658()  # v6.58
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -7458,7 +7459,419 @@ def keep_awake_snapshot():
             "armedUsers": list(KEEP_AWAKE.get("armedUsers") or []),
             "scheduleEnabled": keep_awake_schedule_enabled(),  # v6.52
             "schedule": keep_awake_schedule_snapshot(),
+            "wake": wake_snapshot(),  # v6.58
         }
+
+
+# ─── v6.58: WAKE A SLEEPING WINDOWS PC FOR ARMED STREAMERS' USUAL GO-LIVE TIMES ─────
+# v6.52 keeps the computer awake from ~2 h before an armed streamer usually goes live, but only if
+# it is still awake at that moment — a PC that idle-slept overnight (or in the afternoon) stayed
+# asleep through whistleface's Tuesday-morning / Friday / Sunday stream and recorded nothing. On
+# Windows the helper now registers one per-user Scheduled Task (no admin) whose one-shot triggers
+# are the next learned window starts (next 8 days) with "Wake the computer to run this task" on.
+# The task runs "<pythonw> twitch-recorder-server.py --wake": it resets the idle timer, pokes the
+# helper (POST /api/keep-awake/wake → keep-awake + solo-watch re-check right away, so the v6.52 hold
+# is in place long before Windows' 2-minute unattended-wake sleep), and starts the helper if it is
+# not running. Re-registered every 15 min when the times change; removed when nothing is learned /
+# armed or the go-live toggle is off. Windows' power plan must allow wake timers ("Allow wake timers"
+# = Enable); the helper reads that setting (powercfg) and reports it, it never changes it. macOS can
+# only schedule wakes as administrator (pmset), so on a Mac this is reported as unavailable.
+WAKE_TASK = "TwitchRecorderWakeForStream"
+WAKE_ENV_OFF = (os.environ.get("TWITCH_RECORDER_WAKE_FOR_STREAM") or "").strip().lower() in (
+    "0", "off", "false", "no")
+WAKE_HORIZON_DAYS = 8
+WAKE_MAX_TRIGGERS = 24
+WAKE_MIN_LEAD_SECS = 180  # a window starting in < 3 min: we're awake now, nothing to schedule
+WAKE_REFRESH_SECS = max(60, int(os.environ.get("TWITCH_RECORDER_WAKE_REFRESH_SECS") or 900))
+WAKE_LOCK = threading.Lock()
+WAKE_STATE = {"task": None, "sig": None, "times": [], "registeredAt": None, "error": None,
+              "wakeTimers": None, "wakeTimersCheckedAt": 0.0, "lastWakeAt": None, "lastWakeFrom": None,
+              "checkedAt": None}
+_PWR_SUB_SLEEP = "238c9fa8-0aad-41ed-83f4-97be242c8f20"
+_PWR_RTCWAKE = "bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d"
+WAKE_TIMERS_HINT = ("Windows wake timers are off, so the PC can't wake itself for the stream: Control Panel → "
+                    "Power Options → Change plan settings → Change advanced power settings → Sleep → "
+                    "Allow wake timers → Enable (Plugged in).")
+
+
+def wake_for_stream_enabled():
+    return (not WAKE_ENV_OFF) and keep_awake_schedule_enabled()
+
+
+def upcoming_wake_times(users, now=None, wins=None):
+    """[(epoch, label)] of the next learned window starts for these streamers (sorted, merged)."""
+    now = time.time() if now is None else now
+    if not users:
+        return []
+    wins = learned_go_live_windows(users, now=now) if wins is None else wins
+    today, _m = _stream_day(now)
+    found = {}
+    for w in wins:
+        for off in range(-1, WAKE_HORIZON_DAYS + 1):
+            day = today + datetime.timedelta(days=off)
+            if day.weekday() != w["weekday"]:
+                continue
+            base = datetime.datetime.combine(day, datetime.time()) + datetime.timedelta(minutes=KA_SCHED_DAY_SHIFT_MINS)
+            st = (base + datetime.timedelta(minutes=w["fromMin"])).replace(second=0, microsecond=0)
+            ts = st.timestamp()
+            if ts < now + WAKE_MIN_LEAD_SECS or ts > now + WAKE_HORIZON_DAYS * 86400:
+                continue
+            lab = (f"{_WEEKDAYS[st.weekday()]} {st.strftime('%b')} {st.day} "
+                   f"{_sched_clock_label(st.hour * 60 + st.minute - KA_SCHED_DAY_SHIFT_MINS)}")
+            key = int(ts // 60)
+            if key in found:
+                if w["username"] not in found[key][2]:
+                    found[key][2].append(w["username"])
+            else:
+                found[key] = [ts, lab, [w["username"]]]
+    out = []
+    for ts, lab, us in sorted(found.values()):
+        if out and ts - out[-1][0] < 1800:  # two wakes within 30 min: the first one covers both
+            continue
+        out.append((ts, f"{lab} ({', '.join(us)})"))
+    return out[:WAKE_MAX_TRIGGERS]
+
+
+def _xml_esc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def wake_task_xml(times, pyw, script):
+    """Task Scheduler 1.2 XML: one-shot TimeTriggers (local time) that wake the computer."""
+    trig = "".join(
+        "    <TimeTrigger>\n"
+        f"      <StartBoundary>{datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%dT%H:%M:%S')}</StartBoundary>\n"
+        "      <Enabled>true</Enabled>\n"
+        "    </TimeTrigger>\n" for ts, _lab in times)
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        "  <RegistrationInfo>\n"
+        "    <Description>Twitch Auto-Recorder v6.58: wake this PC before armed streamers usually go live "
+        "(made by the helper; updated automatically).</Description>\n"
+        "  </RegistrationInfo>\n"
+        "  <Triggers>\n" + trig + "  </Triggers>\n"
+        "  <Principals>\n"
+        '    <Principal id="Author">\n'
+        "      <LogonType>InteractiveToken</LogonType>\n"
+        "      <RunLevel>LeastPrivilege</RunLevel>\n"
+        "    </Principal>\n"
+        "  </Principals>\n"
+        "  <Settings>\n"
+        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
+        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
+        "    <AllowHardTerminate>true</AllowHardTerminate>\n"
+        "    <StartWhenAvailable>false</StartWhenAvailable>\n"
+        "    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n"
+        "    <IdleSettings>\n"
+        "      <StopOnIdleEnd>false</StopOnIdleEnd>\n"
+        "      <RestartOnIdle>false</RestartOnIdle>\n"
+        "    </IdleSettings>\n"
+        "    <AllowStartOnDemand>true</AllowStartOnDemand>\n"
+        "    <Enabled>true</Enabled>\n"
+        "    <Hidden>false</Hidden>\n"
+        "    <RunOnlyIfIdle>false</RunOnlyIfIdle>\n"
+        "    <WakeToRun>true</WakeToRun>\n"
+        "    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>\n"
+        "    <Priority>7</Priority>\n"
+        "  </Settings>\n"
+        '  <Actions Context="Author">\n'
+        "    <Exec>\n"
+        f"      <Command>{_xml_esc(pyw)}</Command>\n"
+        f"      <Arguments>&quot;{_xml_esc(script)}&quot; --wake</Arguments>\n"
+        f"      <WorkingDirectory>{_xml_esc(Path(script).parent)}</WorkingDirectory>\n"
+        "    </Exec>\n"
+        "  </Actions>\n"
+        "</Task>\n")
+
+
+def parse_wake_timers(text):
+    """powercfg /query … RTCWAKE output → 'enabled' | 'disabled' | 'important-only' | None (AC value).
+    Language independent: the last two 0x… values are the AC and DC indexes."""
+    vals = re.findall(r":\s*0x([0-9a-fA-F]+)\s*$", text or "", flags=re.M)
+    if len(vals) < 2:
+        return None
+    try:
+        ac = int(vals[-2], 16)
+    except ValueError:
+        return None
+    return {0: "disabled", 1: "enabled", 2: "important-only"}.get(ac)
+
+
+def check_wake_timers(run=None):
+    if os.name != "nt" and run is None:
+        return None
+    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                             errors="replace", timeout=30, **_no_window_kw()))
+    try:
+        r = run(["powercfg", "/query", "SCHEME_CURRENT", _PWR_SUB_SLEEP, _PWR_RTCWAKE])
+        if getattr(r, "returncode", 1) != 0:
+            return None
+        return parse_wake_timers(getattr(r, "stdout", "") or "")
+    except Exception:
+        return None
+
+
+def ensure_wake_task(times, run=None, tmpdir=None, script=None, pyw=None, force=False):
+    """Register (times) or remove (no times) the wake task. Only touches schtasks when the set changed."""
+    sig = "|".join(str(int(ts)) for ts, _l in times)
+    with WAKE_LOCK:
+        if not force and sig == WAKE_STATE.get("sig") and not WAKE_STATE.get("error"):
+            WAKE_STATE["times"] = list(times)
+            return dict(WAKE_STATE)
+    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                             errors="replace", timeout=60, **_no_window_kw()))
+    err, task = None, None
+    if not times:
+        had = WAKE_STATE.get("task") or WAKE_STATE.get("sig") is None
+        if had:
+            try:
+                run(["schtasks", "/Delete", "/F", "/TN", WAKE_TASK])  # fine if it never existed
+            except Exception:
+                pass
+            if WAKE_STATE.get("task"):
+                log("wake: no upcoming go-live to wake for — wake task removed")
+    else:
+        script = str(script or Path(__file__).resolve())
+        pyw = pyw or windowless_python()
+        import tempfile as _tmp_w
+        fd, xml_path = _tmp_w.mkstemp(prefix="twitch-wake-", suffix=".xml", dir=tmpdir)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(wake_task_xml(times, pyw, script).encode("utf-16"))  # BOM + UTF-16LE
+            r = run(["schtasks", "/Create", "/F", "/TN", WAKE_TASK, "/XML", xml_path])
+            if getattr(r, "returncode", 1) == 0:
+                task = WAKE_TASK
+                log("wake: this PC will wake for " + "; ".join(l for _t, l in times[:4])
+                    + (" …" if len(times) > 4 else ""))
+            else:
+                err = "Scheduled Task: " + ((getattr(r, "stderr", "") or getattr(r, "stdout", "") or "failed").strip()[:200])
+        except Exception as e:
+            err = f"Scheduled Task: {e}"
+        finally:
+            try:
+                os.unlink(xml_path)
+            except OSError:
+                pass
+        if err:
+            log(f"wake: could not register the wake task — {err}")
+    with WAKE_LOCK:
+        WAKE_STATE.update({"task": task, "sig": sig if not err else None, "times": list(times) if task else [],
+                           "registeredAt": time.time() if task else WAKE_STATE.get("registeredAt"),
+                           "error": err, "checkedAt": time.time()})
+        return dict(WAKE_STATE)
+
+
+def wake_schedule_tick(now=None, run=None):
+    now = time.time() if now is None else now
+    times = []
+    if wake_for_stream_enabled():
+        times = upcoming_wake_times(keep_awake_armed_users(now), now=now)
+    st = ensure_wake_task(times, run=run)
+    with WAKE_LOCK:
+        if run is not None or now - float(WAKE_STATE.get("wakeTimersCheckedAt") or 0) > 6 * 3600:
+            WAKE_STATE["wakeTimersCheckedAt"] = now
+            do_check = True
+        else:
+            do_check = False
+    if do_check:
+        wt = check_wake_timers(run=run)
+        with WAKE_LOCK:
+            prev = WAKE_STATE.get("wakeTimers")
+            WAKE_STATE["wakeTimers"] = wt
+        if wt in ("disabled", "important-only") and prev != wt and times:
+            log("wake: " + WAKE_TIMERS_HINT)
+    return st
+
+
+def wake_schedule_loop():
+    time.sleep(60)
+    while True:
+        try:
+            wake_schedule_tick()
+        except Exception as e:
+            with WAKE_LOCK:
+                WAKE_STATE["error"] = str(e)[:240]
+            log(f"wake: tick error: {e}")
+        time.sleep(WAKE_REFRESH_SECS)
+
+
+def note_woken(source="task"):
+    """POST /api/keep-awake/wake (from the --wake task): hold sleep off + re-check streamers now."""
+    with WAKE_LOCK:
+        WAKE_STATE["lastWakeAt"] = time.time()
+        WAKE_STATE["lastWakeFrom"] = source
+    log(f"wake: woken by the scheduled wake ({source}) — re-checking keep-awake and armed streamers now")
+    KEEP_AWAKE_WAKE.set()
+    try:
+        SOLO_WATCH_WAKE.set()
+    except NameError:
+        pass
+    reason = None
+    try:
+        reason = keep_awake_desired()
+    except Exception:
+        pass
+    return {"ok": True, "keepAwake": reason}
+
+
+def wake_snapshot(now=None):
+    now = time.time() if now is None else now
+    with WAKE_LOCK:
+        st = dict(WAKE_STATE)
+    if os.name != "nt":
+        return {"supported": False, "enabled": wake_for_stream_enabled(),
+                "note": ("macOS only lets an administrator schedule wakes (pmset), so keep this Mac from "
+                         "sleeping (System Settings → Energy / Battery) on stream days."
+                         if sys.platform == "darwin" else "Windows only")}
+    wt = st.get("wakeTimers")
+    return {"supported": True, "enabled": wake_for_stream_enabled(), "envOff": WAKE_ENV_OFF,
+            "task": st.get("task"), "next": [l for _t, l in (st.get("times") or [])][:6],
+            "nextAt": (st.get("times") or [[None]])[0][0] if st.get("times") else None,
+            "registeredAt": st.get("registeredAt"), "error": st.get("error"),
+            "wakeTimers": wt,
+            "wakeTimersHint": WAKE_TIMERS_HINT if wt in ("disabled", "important-only") else None,
+            "lastWakeAt": st.get("lastWakeAt")}
+
+
+def wake_main(post_fn=None, alive_fn=None, start_fn=None, sleep_fn=None, tries=6):
+    """--wake (run by the wake task): reset the idle timer, poke the helper, start it if it's not running."""
+    if os.name == "nt":
+        try:
+            import ctypes  # noqa: WPS433
+            ctypes.windll.kernel32.SetThreadExecutionState(_ES_SYSTEM_REQUIRED)  # resets the idle timer once
+        except Exception:
+            pass
+    sleep_fn = sleep_fn or time.sleep
+
+    def _post():
+        req = urllib.request.Request(f"http://{HOST}:{PORT}/api/keep-awake/wake", data=b"{}", method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status == 200
+    post_fn = post_fn or _post
+    alive_fn = alive_fn or _helper_alive
+    reached, started = False, False
+    for i in range(max(1, tries)):
+        try:
+            if post_fn():
+                reached = True
+                break
+        except Exception:
+            pass
+        if i == 1 and not started and not alive_fn():
+            try:
+                if start_fn:
+                    start_fn()
+                else:
+                    logf = INSTALL_DIR / "helper.log"
+                    out = open(logf, "ab")
+                    try:
+                        subprocess.Popen([windowless_python(), str(Path(__file__).resolve())], cwd=str(INSTALL_DIR),
+                                         stdin=subprocess.DEVNULL, stdout=out, stderr=out, close_fds=True,
+                                         **({"creationflags": 0x00000008 | 0x00000200 | 0x08000000}
+                                            if os.name == "nt" else {}))
+                    finally:
+                        out.close()
+                started = True
+            except Exception:
+                pass
+        sleep_fn(10)
+    if start_fn is None:
+        try:
+            with open(INSTALL_DIR / "helper.log", "a", encoding="utf-8") as fh:
+                fh.write(f"[wake {time.strftime('%Y-%m-%d %H:%M:%S')}] scheduled wake for a usual go-live — "
+                         f"helper {'reached' if reached else 'not reached'}{' (started it)' if started else ''}\n")
+        except OSError:
+            pass
+    return 0 if reached else 1
+
+
+def _self_test_v658():
+    """v6.58: wake times from learned windows, task XML, register/remove, wake-timer parse, --wake."""
+    import tempfile as _tmp58
+    import xml.dom.minidom as _md
+    prev_state = dict(WAKE_STATE)
+    try:
+        now = datetime.datetime(2026, 10, 27, 6, 30).timestamp()  # Tue 6:30 AM local
+        # whistleface: Tue usual ~10:00 AM (window 8:00 AM–), Fri ~6:55 PM (window 4:49 PM–)
+        wins = [{"username": "whistleface", "weekday": 1, "fromMin": 10 * 60 - 300 - 120, "toMin": 10 * 60 - 300 + 90},
+                {"username": "whistleface", "weekday": 4, "fromMin": 18 * 60 + 49 - 300 - 120, "toMin": 19 * 60 + 5 - 300 + 90},
+                {"username": "otherguy", "weekday": 1, "fromMin": 10 * 60 + 10 - 300 - 120, "toMin": 12 * 60 - 300}]
+        t = upcoming_wake_times(["whistleface"], now=now, wins=wins)
+        labs = [l for _ts, l in t]
+        assert labs[0] == "Tue Oct 27 8:00 AM (whistleface)", labs
+        assert "Fri Oct 30 4:49 PM (whistleface)" in labs, labs
+        assert any(l.startswith("Tue Nov 3 8:00 AM") for l in labs), labs  # next week's Tuesday too
+        assert all(now + WAKE_MIN_LEAD_SECS <= ts <= now + WAKE_HORIZON_DAYS * 86400 for ts, _l in t)
+        assert len(labs) == len(set(int(ts) for ts, _l in t))
+        # 8:10 is within 30 min of 8:00 → merged into one wake
+        assert not any("8:10 AM" in l for l in labs), labs
+        # inside today's window already (9 AM) → today's Tuesday not scheduled
+        t2 = upcoming_wake_times(["whistleface"], now=datetime.datetime(2026, 10, 27, 9, 0).timestamp(), wins=wins[:2])
+        assert t2 and t2[0][1].startswith("Fri Oct 30 4:49 PM"), t2
+        assert upcoming_wake_times([], now=now, wins=wins) == []
+        xml = wake_task_xml(t, r"C:\Py\pythonw.exe", r"C:\Users\Eric\Twitch & Co\twitch-recorder-server.py")
+        dom = _md.parseString(xml.replace('encoding="UTF-16"', 'encoding="UTF-8"').encode("utf-8"))
+        assert dom.getElementsByTagName("WakeToRun")[0].firstChild.data == "true"
+        sb = [e.firstChild.data for e in dom.getElementsByTagName("StartBoundary")]
+        assert len(sb) == len(t) and sb[0] == "2026-10-27T08:00:00", sb
+        assert dom.getElementsByTagName("Arguments")[0].firstChild.data.endswith("--wake")
+        assert "Twitch & Co" in dom.getElementsByTagName("Arguments")[0].firstChild.data
+        calls = []
+
+        class _R:
+            def __init__(self, rc=0, out="", err=""):
+                self.returncode, self.stdout, self.stderr = rc, out, err
+
+        def run_ok(cmd):
+            calls.append(list(cmd))
+            if "/XML" in cmd:
+                raw = Path(cmd[cmd.index("/XML") + 1]).read_bytes()
+                assert raw[:2] in (b"\xff\xfe", b"\xfe\xff") and "WakeToRun" in raw.decode("utf-16")
+            if cmd[0] == "powercfg":
+                return _R(0, "Power Setting GUID: bd3b718a  (Allow wake timers)\n  Possible Setting Index: 000\n"
+                             "Current AC Power Setting Index: 0x00000000\nCurrent DC Power Setting Index: 0x00000000\n")
+            return _R(0)
+        with _tmp58.TemporaryDirectory(prefix="tar-wake-") as td:
+            WAKE_STATE.update({"task": None, "sig": None, "times": [], "error": None})
+            st = ensure_wake_task(t, run=run_ok, tmpdir=td, script=r"C:\x\twitch-recorder-server.py", pyw="pythonw.exe")
+            assert st["task"] == WAKE_TASK and calls[-1][:5] == ["schtasks", "/Create", "/F", "/TN", WAKE_TASK], calls
+            assert not list(Path(td).iterdir())  # temp XML removed
+            n = len(calls)
+            ensure_wake_task(t, run=run_ok, tmpdir=td)  # unchanged → no schtasks call
+            assert len(calls) == n
+            ensure_wake_task([], run=run_ok, tmpdir=td)  # nothing to wake for → removed
+            assert calls[-1][:2] == ["schtasks", "/Delete"] and WAKE_STATE["task"] is None
+            n = len(calls)
+            ensure_wake_task([], run=run_ok, tmpdir=td)
+            assert len(calls) == n
+            # schtasks refuses → error kept, retried next tick (sig cleared)
+            st = ensure_wake_task(t, run=lambda c: (calls.append(c), _R(1, "", "ERROR: Access is denied."))[1], tmpdir=td)
+            assert st["task"] is None and "Access is denied" in (st["error"] or "") and st["sig"] is None
+        assert parse_wake_timers("Current AC Power Setting Index: 0x00000001\nCurrent DC Power Setting Index: 0x00000000\n") == "enabled"
+        assert parse_wake_timers("Aktueller Wechselstrom-Einstellungsindex: 0x00000002\nAktueller Gleichstrom-Einstellungsindex: 0x00000000\n") == "important-only"
+        assert parse_wake_timers("nothing here") is None
+        assert check_wake_timers(run=run_ok) == "disabled"
+        # --wake: helper answers on the 1st try; helper down → started once, then reached
+        assert wake_main(post_fn=lambda: True, alive_fn=lambda: True, start_fn=lambda: None, sleep_fn=lambda s: None) == 0
+        seq, starts = [False, False, False, True], []
+        assert wake_main(post_fn=lambda: seq.pop(0), alive_fn=lambda: False, start_fn=lambda: starts.append(1),
+                         sleep_fn=lambda s: None) == 0 and starts == [1]
+        assert wake_main(post_fn=lambda: False, alive_fn=lambda: True, start_fn=lambda: starts.append(2),
+                         sleep_fn=lambda s: None, tries=3) == 1 and starts == [1]
+        r = note_woken("self-test")
+        assert r["ok"] and WAKE_STATE["lastWakeAt"]
+        KEEP_AWAKE_WAKE.clear()
+        SOLO_WATCH_WAKE.clear()
+        snap = wake_snapshot()
+        json.dumps(snap)
+        assert "supported" in snap
+    finally:
+        WAKE_STATE.clear()
+        WAKE_STATE.update(prev_state)
 
 
 def pipeline_enabled_for(username):
@@ -10012,7 +10425,9 @@ def build_status_doc(now=None):
                       # v6.52: learned go-live windows (ready check can see them)
                       "scheduleEnabled": bool(ka.get("scheduleEnabled")),
                       "goLiveWindows": [f"{w['username']} {w['weekdayName']} {w['from']}–{w['to']}"
-                                        for w in ((ka.get("schedule") or {}).get("windows") or [])]},
+                                        for w in ((ka.get("schedule") or {}).get("windows") or [])],
+                      # v6.58: scheduled wake from sleep (Windows)
+                      "wake": ka.get("wake")},
         # v6.43: unattended helper updates (ready check can see on/off, last check, last error)
         "autoUpdate": {"enabled": au.get("enabled"), "state": au.get("state"),
                        "lastCheckAt": _iso_local(au.get("lastCheckAt")), "lastResult": au.get("lastResult"),
@@ -10177,6 +10592,14 @@ def render_status_text(doc):
         L.append("Stays awake before usual go-live: " + "; ".join(ka["goLiveWindows"]))
     elif ka.get("scheduleEnabled") is False:
         L.append("Stay awake before usual go-live times: OFF")
+    wk = ka.get("wake") or {}
+    if wk.get("supported"):  # v6.58
+        if wk.get("next"):
+            L.append("Wakes from sleep for: " + "; ".join(wk["next"][:4]))
+        if wk.get("error"):
+            L.append(f"Wake-from-sleep problem: {wk['error']}")
+        if wk.get("wakeTimersHint") and wk.get("next"):
+            L.append(wk["wakeTimersHint"])
     if doc.get("recoverPending"):  # v6.53
         L.append("Cut-off recording waiting to be recovered: " + ", ".join(doc["recoverPending"]))
     for x in doc.get("recovered") or []:
@@ -10544,6 +10967,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             payload, status = api_streamlink_update(self.read_json())
             self.send_json(payload, status=status)
+            return
+        if path == "/api/keep-awake/wake":  # v6.58: the --wake task after a scheduled wake
+            if not origin_allowed(self.headers.get("Origin")):
+                self.send_json({"ok": False, "error": "origin not allowed"}, status=403)
+                return
+            self.read_json()
+            self.send_json(note_woken("task"))
             return
         if path in ("/api/drive/access/check", "/api/drive/access/open-settings"):  # v6.56
             if not origin_allowed(self.headers.get("Origin")):
@@ -11436,6 +11866,8 @@ def main():
     # v6.56: Windows — start on login + watchdog that restarts the helper if it stops
     if os.name == "nt":
         threading.Thread(target=autostart_loop, daemon=True, name="autostart").start()
+        # v6.58: wake the PC from sleep before armed streamers' usual go-live times
+        threading.Thread(target=wake_schedule_loop, daemon=True, name="wake-schedule").start()
     sl = which_streamlink()
     ff = which_ffmpeg()
     html_path = HERE / HTML_NAME
@@ -11488,4 +11920,6 @@ if __name__ == "__main__":
         sys.exit(self_test())
     if "--watchdog" in sys.argv[1:]:  # v6.56: Windows login start / crash restart
         sys.exit(watchdog_main())
+    if "--wake" in sys.argv[1:]:  # v6.58: run by the wake-for-stream Scheduled Task
+        sys.exit(wake_main())
     main()
