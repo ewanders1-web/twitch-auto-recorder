@@ -219,7 +219,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.58</span>
+    <span class="badge">v6.59</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -559,7 +559,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.58'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.59'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -5628,7 +5628,7 @@ function saveStreamlinkUpdateToggle(){
   persist();
   syncPipelinePrefs(true);
   let msg=cfg.streamlinkUpdate
-    ? 'streamlink will be upgraded automatically (pip installs only) when nothing is recording, removing voice or sending to Drive.'
+    ? 'streamlink will be upgraded automatically (pip installs only) when nothing is recording, removing voice or sending to Drive. If this computer\'s Python is too old for the newest streamlink, the helper sets up its own copy on a newer Python (v6.59).'
     : 'Automatic streamlink updates off — the helper still reports when streamlink is outdated.';
   if(helper.ok && helper.version && helperVerLt(helper.version,'6.55')) msg+=' Needs helper v6.55 — Check for updates → Install update.';
   flashOk(msg);
@@ -5642,12 +5642,18 @@ function streamlinkUpdateText(){
   if(s.state==='missing' || !inst) return 'streamlink: ⚠ not working — '+(s.hint||s.lastResult||'streamlink --version failed');
   let t='streamlink '+inst+(s.installedReleasedAt?' ('+s.installedReleasedAt+')':'');
   if(s.state==='up-to-date') t+=' — up to date';
-  else if(s.state==='python-too-old') t+=' — newest for Python '+(s.pythonVersion||'?')+'; streamlink '+(s.latest||'?')+' needs Python '+(s.latestRequiresPython||'newer');
+  else if(s.state==='python-too-old'){
+    t+=' — newest for Python '+(s.pythonVersion||'?')+'; streamlink '+(s.latest||'?')+' needs Python '+(s.latestRequiresPython||'newer');
+    if(s.lastError && /newer Python/.test(s.lastError)) t+=' — ⚠ '+s.lastError; // v6.59
+  }
+  else if(s.state==='private-waiting') t+=' — streamlink '+(s.latest||'?')+' needs a newer Python; the helper sets up its own copy when idle'+(s.waitingFor?' (waiting: '+s.waitingFor+')':''); // v6.59
+  else if(s.state==='private-building') t+=' — setting up streamlink '+(s.latest||'?')+' on a newer Python…'; // v6.59
   else if(s.state==='waiting-idle') t+=' — '+s.latestCompatible+' available, upgrades when idle'+(s.waitingFor?' (waiting: '+s.waitingFor+')':'');
   else if(s.state==='upgrading' || s.upgrading) t+=' — upgrading to '+s.latestCompatible+'…';
   else if(s.state==='outdated-manual') t+=' — ⚠ outdated ('+s.latestCompatible+' available): '+(s.hint||'update it the way it was installed');
   else if(s.state==='off') t+=' — ⚠ outdated ('+s.latestCompatible+' available; automatic streamlink updates off)';
   else if(s.state==='error') t+=' — ⚠ '+(s.lastError||s.lastResult||'check failed');
+  if(s.private && s.private.active) t+=' (helper\'s own copy, Python '+(s.private.pythonVersion||'?')+')'; // v6.59
   if(s.lastUpgradeTo) t+=' · last auto-upgrade '+(s.lastUpgradeFrom||'?')+' → '+s.lastUpgradeTo+(s.lastUpgradeAt?' at '+auClock(s.lastUpgradeAt):'');
   return t;
 }
@@ -5655,6 +5661,7 @@ function streamlinkBit(){
   const s=helper.streamlinkUpdate;
   if(!helper.ok || !s) return '';
   if(s.state==='upgrading' || s.upgrading) return ' · ⬆ updating streamlink';
+  if(s.state==='private-building') return ' · ⬆ setting up streamlink '+(s.latest||''); // v6.59
   if(s.state==='waiting-idle') return ' · ⬆ streamlink '+s.latestCompatible+' when idle';
   if(s.outdated && (s.state==='outdated-manual' || s.state==='off' || s.state==='error')) return ' · ⚠ streamlink '+s.installed+' outdated';
   return '';

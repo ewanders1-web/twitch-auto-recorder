@@ -21,7 +21,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.58"
+HELPER_VERSION = "6.59"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -184,8 +184,17 @@ RECENT_SESSIONS = {}
 RECENT_SESSIONS_KEEP_SECS = 6 * 60 * 60
 
 
-def which_streamlink():
+def which_streamlink_system():
     return shutil.which("streamlink") or shutil.which("streamlink.exe")
+
+
+def which_streamlink():
+    """v6.59: the helper's own verified streamlink (newer Python) wins over the system copy."""
+    try:
+        priv = sl_private_bin()
+    except Exception:
+        priv = None
+    return priv or which_streamlink_system()
 
 
 def which_ffmpeg():
@@ -3025,13 +3034,15 @@ def streamlink_update_enabled():
         return PIPELINE.get("streamlinkUpdate", True) is not False
 
 
-def _sl_run(cmd, timeout=60):
+def _sl_run(cmd, timeout=60, extra_env=None):
     """subprocess.run, UTF-8 safe (v6.51), no console window on Windows. Returns (rc, out)."""
     kw = {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace",
           "timeout": timeout, "stdin": subprocess.DEVNULL}
     env = os.environ.copy()
     env["PYTHONWARNINGS"] = "ignore"
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    if extra_env:
+        env.update(extra_env)
     kw["env"] = env
     if os.name == "nt" and getattr(subprocess, "CREATE_NO_WINDOW", 0):
         kw["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -3212,9 +3223,9 @@ def streamlink_latest(pyver=None, doc=None):
             "latestCompatible": best_c, "releasedAt": when}
 
 
-def _sl_verify(expected):
+def _sl_verify(expected, sl=None):
     """New streamlink works: version matches, Twitch plugin handles twitch.tv, our options exist."""
-    sl = which_streamlink()
+    sl = sl or which_streamlink()
     if not sl:
         return "streamlink disappeared after the upgrade"
     got = streamlink_cli_version(sl)
@@ -3278,6 +3289,300 @@ def wait_streamlink_upgrade(max_secs=240):
         time.sleep(0.5)
 
 
+# ---- v6.59: the helper's own streamlink on a newer Python -------------------------------------
+# Twitch breaks old streamlink releases every few months, and the newest streamlink needs Python
+# 3.10+. A Mac whose only Python is the Command Line Tools 3.9 (Silver Bullet) was stuck on
+# streamlink 7.6.0 forever: v6.55 could only say "install a newer Python". Now, when that happens
+# and "Keep streamlink up to date when idle" is on, the helper builds its own copy, once, when
+# idle: a virtual environment with the newest streamlink, on a newer Python already on the computer
+# (Homebrew, python.org, pyenv, Windows py launcher …) or, if there is none, on a standalone Python
+# fetched with uv (Astral's installer: one checksum-verified download from GitHub, no admin, nothing
+# installed system-wide). It lives in ~/.twitch-recorder/streamlink (Windows:
+# %LOCALAPPDATA%\TwitchRecorder\streamlink). It is only switched on after the same checks as a v6.55
+# upgrade (version, Twitch plugin, every option the recorder uses); from then on the normal v6.55
+# pip updater keeps it current. The helper itself keeps running on the same Python as before, so
+# a Mac's Full Disk Access for Drive is not affected. If the copy ever stops working the helper
+# switches back to the system streamlink by itself.
+SL_PRIVATE_ENV_OFF = (os.environ.get("TWITCH_RECORDER_PRIVATE_STREAMLINK") or "").strip().lower() in (
+    "0", "off", "false", "no")
+SL_PRIVATE_PY = (os.environ.get("TWITCH_RECORDER_PRIVATE_STREAMLINK_PYTHON") or "3.12").strip()
+SL_PRIVATE_MIN_FREE = 800 * 1024 * 1024
+SL_PRIVATE_KEY = "private-build"  # key in SL_UPDATE["fails"]
+_SL_PRIV_CACHE = {"mtime": None, "bin": None}
+
+
+def sl_private_root():
+    d = (os.environ.get("TWITCH_RECORDER_PRIVATE_STREAMLINK_DIR") or "").strip()
+    if d:
+        return Path(d)
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "TwitchRecorder" / "streamlink"
+    return Path.home() / ".twitch-recorder" / "streamlink"
+
+
+def _sl_venv_paths(venv):
+    venv = Path(venv)
+    if os.name == "nt":
+        return venv / "Scripts" / "python.exe", venv / "Scripts" / "streamlink.exe"
+    return venv / "bin" / "python", venv / "bin" / "streamlink"
+
+
+def sl_private_info():
+    """current.json of the private copy, or None. {dir, version, python, pythonVersion, how, at}."""
+    cur = sl_private_root() / "current.json"
+    try:
+        doc = json.loads(cur.read_text(encoding="utf-8"))
+        return doc if isinstance(doc, dict) and doc.get("dir") else None
+    except (OSError, ValueError):
+        return None
+
+
+def sl_private_bin():
+    """Path of the verified private streamlink when it is switched on, else None (cheap: mtime cache)."""
+    if SL_PRIVATE_ENV_OFF:
+        return None
+    cur = sl_private_root() / "current.json"
+    try:
+        mt = cur.stat().st_mtime
+    except OSError:
+        _SL_PRIV_CACHE.update(mtime=None, bin=None)
+        return None
+    if _SL_PRIV_CACHE.get("mtime") != mt:
+        info = sl_private_info()
+        b = None
+        if info:
+            _py, sl = _sl_venv_paths(sl_private_root() / str(info["dir"]))
+            b = str(sl)
+        _SL_PRIV_CACHE.update(mtime=mt, bin=b)
+    b = _SL_PRIV_CACHE.get("bin")
+    return b if (b and os.path.isfile(b)) else None
+
+
+def sl_private_disable(reason):
+    """Stop using the private copy (kept on disk as current.json.off for a look later)."""
+    cur = sl_private_root() / "current.json"
+    try:
+        if cur.is_file():
+            os.replace(str(cur), str(cur.with_name("current.json.off")))
+            log(f"streamlink private copy switched off ({reason}) — using the system streamlink again")
+    except OSError as e:
+        log(f"streamlink private copy: could not switch off: {e}")
+    _SL_PRIV_CACHE.update(mtime=None, bin=None)
+
+
+def _sl_python_version(py):
+    rc, out = _sl_run([py, "-c", "import sys,venv,ensurepip;print('PYV=%d.%d.%d'%tuple(sys.version_info[:3]))"],
+                      timeout=45)
+    m = re.search(r"PYV=(\d+\.\d+\.\d+)", out or "")
+    return m.group(1) if (rc == 0 and m) else None
+
+
+def _sl_python_search_list():
+    import glob as _glob
+    names = [f"python3.{m}" for m in range(20, 9, -1)] + ["python3"]
+    cands = []
+    for n in names:
+        w = shutil.which(n)
+        if w:
+            cands.append(w)
+    if os.name == "nt":
+        la = os.environ.get("LOCALAPPDATA") or ""
+        pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
+        pats = [os.path.join(la, "Programs", "Python", "Python3*", "python.exe"),
+                os.path.join(pf, "Python3*", "python.exe")]
+        for pat in pats:
+            cands += sorted(_glob.glob(pat), reverse=True)
+        w = shutil.which("python") or shutil.which("python.exe")
+        if w:
+            cands.append(w)
+    else:
+        home = str(Path.home())
+        dirs = ["/opt/homebrew/bin", "/usr/local/bin", "/Library/Frameworks/Python.framework/Versions/Current/bin"]
+        dirs += sorted(_glob.glob("/Library/Frameworks/Python.framework/Versions/3.*/bin"), reverse=True)
+        dirs += sorted(_glob.glob(os.path.join(home, ".pyenv", "versions", "3.*", "bin")), reverse=True)
+        for d in dirs:
+            for n in names:
+                c = os.path.join(d, n)
+                if os.path.isfile(c):
+                    cands.append(c)
+    seen, out = set(), []
+    for c in cands:
+        try:
+            real = os.path.realpath(c)
+        except OSError:
+            real = c
+        low = real.replace("\\", "/").lower()
+        if "/windowsapps/" in low:  # Microsoft Store alias stub — may pop the Store instead of running
+            continue
+        if real in seen or os.path.realpath(sys.executable or "") == real:
+            continue
+        seen.add(real)
+        out.append(c)
+    return out
+
+
+def sl_find_newer_python(spec):
+    """Newest Python on this computer that satisfies spec and has venv + ensurepip: (path, ver) or (None, None)."""
+    best = (None, None)
+    for c in _sl_python_search_list():
+        v = _sl_python_version(c)
+        if v and _py_satisfies(spec, v) and (best[1] is None or _sl_vtuple(v) > _sl_vtuple(best[1])):
+            best = (c, v)
+    return best
+
+
+def _uv_asset(sysname=None, machine=None):
+    import platform as _plat
+    sysname = (sysname or _plat.system()).lower()
+    machine = (machine or _plat.machine()).lower()
+    arch = "aarch64" if machine in ("arm64", "aarch64", "armv8", "armv8l") else "x86_64"
+    if sysname == "darwin":
+        return f"uv-{arch}-apple-darwin.tar.gz"
+    if sysname.startswith("win"):
+        return f"uv-{arch}-pc-windows-msvc.zip"
+    if sysname == "linux":
+        return f"uv-{arch}-unknown-linux-gnu.tar.gz"
+    return None
+
+
+def _uv_extract(data, asset, dest_dir):
+    """Write the uv binary from a release archive into dest_dir; returns its path."""
+    import io as _io_uv
+    want = "uv.exe" if asset.endswith(".zip") else "uv"
+    blob = None
+    if asset.endswith(".zip"):
+        import zipfile as _zip
+        with _zip.ZipFile(_io_uv.BytesIO(data)) as z:
+            for n in z.namelist():
+                if n.replace("\\", "/").rsplit("/", 1)[-1] == want:
+                    blob = z.read(n)
+                    break
+    else:
+        import tarfile as _tar
+        with _tar.open(fileobj=_io_uv.BytesIO(data), mode="r:gz") as t:
+            for m in t.getmembers():
+                if m.isfile() and m.name.rsplit("/", 1)[-1] == want:
+                    blob = t.extractfile(m).read()
+                    break
+    if not blob:
+        raise RuntimeError(f"{want} not found in {asset}")
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    out = dest_dir / want
+    tmp = dest_dir / (want + ".partial")
+    tmp.write_bytes(blob)
+    if os.name != "nt":
+        os.chmod(str(tmp), 0o755)
+    os.replace(str(tmp), str(out))
+    return str(out)
+
+
+def sl_get_uv(root, allow_path=True):
+    """uv already on PATH or already fetched, else download the release for this computer (sha256-checked)."""
+    import hashlib as _hl
+    if allow_path:
+        w = shutil.which("uv") or shutil.which("uv.exe")
+        if w:
+            return w
+    mine = Path(root) / "uv" / ("uv.exe" if os.name == "nt" else "uv")
+    if mine.is_file():
+        rc, _o = _sl_run([str(mine), "--version"], timeout=30)
+        if rc == 0:
+            return str(mine)
+    asset = _uv_asset()
+    if not asset:
+        raise RuntimeError("no uv download for this kind of computer")
+    base = (os.environ.get("TWITCH_RECORDER_UV_BASE_URL")
+            or "https://github.com/astral-sh/uv/releases/latest/download/").rstrip("/") + "/"
+    want = fetch_url_text(base + asset + ".sha256", timeout=30).strip().split()[0].lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", want or ""):
+        raise RuntimeError("uv checksum file looked wrong")
+    data = fetch_url_bytes(base + asset, timeout=600)
+    got = _hl.sha256(data).hexdigest()
+    if got != want:
+        raise RuntimeError(f"uv download checksum mismatch ({got[:12]}… ≠ {want[:12]}…) — not used")
+    path = _uv_extract(data, asset, mine.parent)
+    rc, out = _sl_run([path, "--version"], timeout=30)
+    if rc != 0:
+        raise RuntimeError(f"downloaded uv doesn't run: {_short(out, 160)}")
+    log(f"streamlink private copy: fetched {(out or '').strip()} ({asset}, sha256 ok)")
+    return path
+
+
+def sl_private_build(spec, version, find_python=None, get_uv=None):
+    """Build a fresh venv with streamlink==version on a Python matching spec; verify; switch to it.
+    Returns (ok, message). Never touches the system streamlink; the old private copy stays until the
+    new one is verified."""
+    find_python = find_python or sl_find_newer_python
+    get_uv = get_uv or sl_get_uv
+    root = sl_private_root()
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        free = shutil.disk_usage(str(root)).free
+        if free < SL_PRIVATE_MIN_FREE:
+            return False, f"only {free // 1048576} MB free in {root} (needs about {SL_PRIVATE_MIN_FREE // 1048576} MB)"
+    except OSError:
+        pass
+    name = "venv-" + time.strftime("%Y%m%d-%H%M%S")
+    venv = root / name
+    py_path, py_ver = find_python(spec)
+    if py_path:
+        how = f"Python {py_ver} at {py_path}"
+        rc, out = _sl_run([py_path, "-m", "venv", str(venv)], timeout=600)
+    else:
+        uv = get_uv(root)
+        how = f"standalone Python {SL_PRIVATE_PY} (uv)"
+        uv_env = {"UV_PYTHON_INSTALL_DIR": str(root / "python"), "UV_CACHE_DIR": str(root / "cache"),
+                  "UV_NO_CONFIG": "1"}
+        rc, out = _sl_run([uv, "venv", "--seed", "--managed-python", "--python", SL_PRIVATE_PY, str(venv)],
+                          timeout=900, extra_env=uv_env)
+    vpy, vsl = _sl_venv_paths(venv)
+
+    def _fail(msg):
+        shutil.rmtree(str(venv), ignore_errors=True)
+        return False, msg
+    if rc != 0 or not vpy.is_file():
+        return _fail(f"couldn't make a Python environment with {how} (exit {rc}): "
+                     f"{_short(' '.join((out or '').split()[-40:]), 240)}")
+    pv = _sl_python_version(str(vpy)) or py_ver or "?"
+    if not _py_satisfies(spec, pv):
+        return _fail(f"{how} gave Python {pv}, streamlink {version} needs {spec}")
+    rc, out = _sl_run([str(vpy), "-m", "pip", "install", "--no-input", "--disable-pip-version-check",
+                       f"streamlink=={version}"], timeout=900)
+    if rc != 0:
+        return _fail(f"pip install streamlink=={version} failed (exit {rc}): "
+                     f"{_short(' '.join((out or '').split()[-40:]), 240)}")
+    bad = _sl_verify(version, sl=str(vsl))
+    if bad:
+        return _fail(bad)
+    prev = sl_private_info()
+    doc = {"dir": name, "version": version, "python": str(vpy), "pythonVersion": pv, "how": how,
+           "at": time.time(), "helper": HELPER_VERSION}
+    tmp = root / "current.json.partial"
+    tmp.write_text(json.dumps(doc, indent=1), encoding="utf-8")
+    os.replace(str(tmp), str(root / "current.json"))
+    _SL_PRIV_CACHE.update(mtime=None, bin=None)
+    # old copies (an earlier build) go once nothing points at them; a busy file on Windows just stays
+    # earlier builds are no longer pointed at (built only when idle, so none is recording); a file that is
+    # still busy on Windows just stays until the next build
+    for d in root.glob("venv-*"):
+        if d.name != name:
+            shutil.rmtree(str(d), ignore_errors=True)
+    if prev:
+        log(f"streamlink private copy: replaced {prev.get('dir')} ({prev.get('version')})")
+    shutil.rmtree(str(root / "cache"), ignore_errors=True)  # uv's download cache (~100 MB) isn't needed after
+    return True, f"streamlink {version} on {how}"
+
+
+def sl_private_snapshot():
+    info = sl_private_info() if not SL_PRIVATE_ENV_OFF else None
+    active = bool(sl_private_bin())
+    return {"active": active, "dir": str(sl_private_root()), "envDisabled": SL_PRIVATE_ENV_OFF,
+            "version": (info or {}).get("version"), "pythonVersion": (info or {}).get("pythonVersion"),
+            "how": (info or {}).get("how"), "builtAt": (info or {}).get("at")}
+
+
 def streamlink_update_tick(now=None):
     """One step of the streamlink updater. Returns seconds until the next step."""
     now = time.time() if now is None else now
@@ -3289,6 +3594,9 @@ def streamlink_update_tick(now=None):
     due = SL_UPDATE_RETRY_SECS if had_err else SL_UPDATE_EVERY_SECS
     if force or not last or now - last >= due:
         info = streamlink_inspect()
+        if (not info.get("installed")) and sl_private_bin():  # v6.59: private copy broke → system one
+            sl_private_disable("its streamlink --version failed")
+            info = streamlink_inspect()
         try:
             lat = streamlink_latest(info.get("pythonVersion"))
             lerr = None
@@ -3324,10 +3632,13 @@ def streamlink_update_tick(now=None):
         if s.get("latest") and _sl_vtuple(s["latest"]) > _sl_vtuple(inst):
             res = (f"{inst} is the newest this computer's Python {s.get('pythonVersion') or '?'} can run — "
                    f"streamlink {s['latest']} needs Python {s.get('latestRequiresPython') or 'newer'}")
+        too_old = not res.startswith("up to date")
+        if too_old and not SL_PRIVATE_ENV_OFF and streamlink_update_enabled() and not sl_private_bin():
+            return _sl_private_tick(s, now, nxt, res)  # v6.59
         if s.get("lastResult") != res:
             log(f"streamlink update: {res}")
             STATUS_FILE_WAKE.set()
-        _sl_set(state="up-to-date" if res.startswith("up to date") else "python-too-old",
+        _sl_set(state="python-too-old" if too_old else "up-to-date",
                 lastResult=res, waitingFor=None, nextCheckAt=nxt)
         return max(1.0, nxt - now)
     if kind not in ("pip", "pip-user") or not streamlink_update_enabled():
@@ -3374,6 +3685,49 @@ def streamlink_update_tick(now=None):
     return SL_UPDATE_RETRY_SECS
 
 
+def _sl_private_tick(s, now, nxt, res):
+    """v6.59: this computer's Python can't run the newest streamlink → build the helper's own copy when idle."""
+    target = s.get("latest")
+    fails = int((s.get("fails") or {}).get(SL_PRIVATE_KEY + ":" + str(target)) or 0)
+    if fails >= SL_UPDATE_MAX_FAILS:
+        _sl_set(state="python-too-old", lastResult=res, waitingFor=None, nextCheckAt=nxt)
+        return max(1.0, nxt - now)
+    busy = update_busy_reason()
+    if busy or not update_idle_settled(now):
+        why = busy or "just finished work — waiting a few idle minutes"
+        if s.get("waitingFor") != why:
+            log(f"streamlink update: {res} — will set up streamlink {target} on a newer Python when idle ({why})")
+        _sl_set(state="private-waiting", waitingFor=why, lastResult=res, nextCheckAt=nxt)
+        STATUS_FILE_WAKE.set()
+        return AUTO_UPDATE_BUSY_SECS
+    _sl_set(state="private-building", waitingFor=None)
+    STATUS_FILE_WAKE.set()
+    log(f"streamlink update: {res} — setting up streamlink {target} on a newer Python")
+    try:
+        ok, msg = sl_private_build(s.get("latestRequiresPython") or ">=3.10", target)
+    except Exception as e:
+        ok, msg = False, f"{type(e).__name__}: {e}"
+    if ok:
+        log(f"streamlink update: now using the helper's own {msg} (verified: Twitch plugin + recorder options)")
+        info = streamlink_inspect()
+        _sl_set(state="up-to-date", installed=info.get("installed") or target, kind=info.get("kind"),
+                python=info.get("python"), pythonVersion=info.get("pythonVersion"), hint=info.get("hint"),
+                latestCompatible=target, lastResult=f"updated to {msg}", lastError=None,
+                lastUpgradeAt=time.time(), lastUpgradeFrom=s.get("installed"), lastUpgradeTo=target,
+                installedReleasedAt=None, nextCheckAt=nxt)
+        STATUS_FILE_WAKE.set()
+        return max(1.0, nxt - now)
+    with SL_UPDATE_LOCK:
+        SL_UPDATE.setdefault("fails", {})[SL_PRIVATE_KEY + ":" + str(target)] = fails + 1
+    log(f"streamlink update: couldn't set up streamlink {target} on a newer Python — {msg}; "
+        f"still using {s.get('installed')}; retry in {int(SL_UPDATE_RETRY_SECS // 60)} min")
+    _sl_set(state="python-too-old", lastResult=res, waitingFor=None,
+            lastError=f"couldn't set up streamlink {target} on a newer Python: {msg}",
+            nextCheckAt=now + SL_UPDATE_RETRY_SECS)
+    STATUS_FILE_WAKE.set()
+    return SL_UPDATE_RETRY_SECS
+
+
 def streamlink_update_loop():
     SL_UPDATE_WAKE.wait(SL_UPDATE_FIRST_SECS)
     SL_UPDATE_WAKE.clear()
@@ -3402,6 +3756,10 @@ def streamlink_update_snapshot():
     s["lastUpgradeAt"] = s.get("lastUpgradeAt") or None
     s["outdated"] = bool(s.get("installed") and s.get("latestCompatible")
                          and _sl_vtuple(s["installed"]) < _sl_vtuple(s["latestCompatible"]))
+    try:
+        s["private"] = sl_private_snapshot()  # v6.59
+    except Exception as e:
+        s["private"] = {"active": False, "error": str(e)}
     return s
 
 
@@ -3420,7 +3778,16 @@ def streamlink_status_line(s):
         line += " — up to date"
     elif st == "python-too-old":
         line += f" — newest for Python {s.get('pythonVersion') or '?'}; streamlink {s.get('latest')} needs Python " \
-                f"{s.get('latestRequiresPython') or 'newer'} (install a newer Python to get Twitch fixes)"
+                f"{s.get('latestRequiresPython') or 'newer'}"
+        if s.get("lastError") and "newer Python" in str(s.get("lastError")):
+            line += f" — {s['lastError']}"
+        elif s.get("enabled") is False or SL_PRIVATE_ENV_OFF:
+            line += " (install a newer Python to get Twitch fixes)"
+    elif st == "private-waiting":
+        line += f" — streamlink {s.get('latest')} needs Python {s.get('latestRequiresPython') or 'newer'}; " \
+                f"setting up its own copy on a newer Python when idle ({s.get('waitingFor')})"
+    elif st == "private-building":
+        line += f" — setting up streamlink {s.get('latest')} on a newer Python…"
     elif st == "waiting-idle":
         line += f" — {s.get('latestCompatible')} available, upgrading when idle ({s.get('waitingFor')})"
     elif st == "upgrading":
@@ -3431,6 +3798,9 @@ def streamlink_status_line(s):
         line += f" — OUTDATED, {s.get('latestCompatible')} available (automatic streamlink updates off)"
     elif st == "error":
         line += " — " + (s.get("lastError") or s.get("lastResult") or "check failed")
+    pv = s.get("private") or {}
+    if pv.get("active"):
+        line += f" [helper's own copy, Python {pv.get('pythonVersion') or '?'}]"
     if s.get("lastUpgradeTo"):
         line += f"; last auto-upgrade {s.get('lastUpgradeFrom')} → {s['lastUpgradeTo']} at {_iso_local(s.get('lastUpgradeAt'))}"
     return line
@@ -3470,7 +3840,9 @@ def _self_test_streamlink_update():
     assert streamlink_latest("3.12.0", doc=doc)["latestCompatible"] == "8.6.2"
     g = globals()
     saved = {k: g[k] for k in ("streamlink_inspect", "streamlink_latest", "streamlink_upgrade",
-                               "update_busy_reason", "update_idle_settled", "streamlink_cli_version")}
+                               "update_busy_reason", "update_idle_settled", "streamlink_cli_version",
+                               "sl_private_build")}
+    g["sl_private_build"] = lambda *a, **k: (False, "self-test: no private build")  # v6.59: never build for real
     with SL_UPDATE_LOCK:
         saved_state = dict(SL_UPDATE)
         saved_state["fails"] = dict(SL_UPDATE.get("fails") or {})
@@ -3550,6 +3922,153 @@ def _self_test_streamlink_update():
     t0 = time.time()
     wait_streamlink_upgrade(5)
     assert time.time() - t0 < 1
+
+
+def _self_test_v659():
+    """v6.59: private streamlink on a newer Python — uv asset names, pointer/fallback, tick decisions, build."""
+    import tempfile as _tmp59
+    assert _uv_asset("Darwin", "arm64") == "uv-aarch64-apple-darwin.tar.gz"
+    assert _uv_asset("Darwin", "x86_64") == "uv-x86_64-apple-darwin.tar.gz"
+    assert _uv_asset("Windows", "AMD64") == "uv-x86_64-pc-windows-msvc.zip"
+    assert _uv_asset("Linux", "aarch64") == "uv-aarch64-unknown-linux-gnu.tar.gz"
+    g = globals()
+    names = ("streamlink_inspect", "streamlink_latest", "streamlink_upgrade", "update_busy_reason",
+             "update_idle_settled", "streamlink_cli_version", "sl_private_build", "_sl_verify", "_sl_run")
+    saved = {k: g[k] for k in names}
+    with SL_UPDATE_LOCK:
+        saved_state = dict(SL_UPDATE)
+        saved_state["fails"] = dict(SL_UPDATE.get("fails") or {})
+    with PIPELINE_LOCK:
+        saved_pref = PIPELINE.get("streamlinkUpdate", True)
+        PIPELINE["streamlinkUpdate"] = True
+    prev_env = os.environ.get("TWITCH_RECORDER_PRIVATE_STREAMLINK_DIR")
+    doc = {"releases": {"7.6.0": [{"requires_python": ">=3.9", "upload_time": "2025-09-08T00:00:00"}],
+                        "8.6.2": [{"requires_python": ">=3.10", "upload_time": "2026-10-07T00:00:00"}]}}
+    lat_real = saved["streamlink_latest"]
+    try:
+        with _tmp59.TemporaryDirectory(prefix="tar-slpriv-") as td:
+            os.environ["TWITCH_RECORDER_PRIVATE_STREAMLINK_DIR"] = td
+            _SL_PRIV_CACHE.update(mtime=None, bin=None)
+            assert sl_private_bin() is None and which_streamlink() == which_streamlink_system()
+            # pointer → private bin wins; missing file → ignored; disable → back to system
+            venv = Path(td) / "venv-x"
+            _vpy, vsl = _sl_venv_paths(venv)
+            vsl.parent.mkdir(parents=True)
+            vsl.write_text("#!/bin/sh\n", encoding="utf-8")
+            (Path(td) / "current.json").write_text(json.dumps({"dir": "venv-x", "version": "8.6.2"}), encoding="utf-8")
+            assert sl_private_bin() == str(vsl) and which_streamlink() == str(vsl)
+            assert sl_private_snapshot()["active"] is True
+            sl_private_disable("self-test")
+            assert sl_private_bin() is None and (Path(td) / "current.json.off").is_file()
+            shutil.rmtree(str(venv))
+            # tick: Python 3.9 + newest needs 3.10 → wait while busy, build when idle, 3 failures max
+            env = {"info": {"installed": "7.6.0", "kind": "pip", "python": "/x/py", "pythonVersion": "3.9.6",
+                            "hint": None}, "busy": "recording whistleface", "ok": (True, "streamlink 8.6.2 on test")}
+            calls = []
+            g["streamlink_inspect"] = lambda sl=None: dict(env["info"])
+            g["streamlink_latest"] = lambda pyver=None, doc=None: lat_real(pyver, doc=doc_)
+            doc_ = doc
+            g["update_busy_reason"] = lambda: env["busy"]
+            g["update_idle_settled"] = lambda now=None: True
+            g["streamlink_cli_version"] = lambda sl=None: env["info"]["installed"]
+            g["streamlink_upgrade"] = lambda info, target: (_ for _ in ()).throw(AssertionError("no pip upgrade"))
+
+            def _fake_build(spec, version, **kw):
+                calls.append((spec, version))
+                return env["ok"]
+            g["sl_private_build"] = _fake_build
+
+            def _reset():
+                with SL_UPDATE_LOCK:
+                    SL_UPDATE.update(state="starting", lastCheckAt=0.0, lastError=None, lastResult=None, fails={},
+                                     waitingFor=None, lastUpgradeTo=None, checkNow=False)
+            _reset()
+            assert streamlink_update_tick() == AUTO_UPDATE_BUSY_SECS and not calls
+            assert SL_UPDATE["state"] == "private-waiting", SL_UPDATE
+            assert "newer Python when idle" in streamlink_status_line(streamlink_update_snapshot())
+            env["busy"] = None
+            streamlink_update_tick()
+            assert calls == [(">=3.10", "8.6.2")], calls
+            assert SL_UPDATE["state"] == "up-to-date" and SL_UPDATE["lastUpgradeTo"] == "8.6.2", SL_UPDATE
+            _reset()
+            calls.clear()
+            env["ok"] = (False, "no network")
+            for _i in range(SL_UPDATE_MAX_FAILS + 2):
+                streamlink_update_tick()
+            assert len(calls) == SL_UPDATE_MAX_FAILS, calls
+            assert SL_UPDATE["state"] == "python-too-old"
+            assert "couldn't set up streamlink 8.6.2" in streamlink_status_line(streamlink_update_snapshot())
+            # pref off → no build, old hint
+            _reset()
+            calls.clear()
+            with PIPELINE_LOCK:
+                PIPELINE["streamlinkUpdate"] = False
+            streamlink_update_tick()
+            assert not calls and SL_UPDATE["state"] == "python-too-old"
+            assert "install a newer Python" in streamlink_status_line(streamlink_update_snapshot())
+            with PIPELINE_LOCK:
+                PIPELINE["streamlinkUpdate"] = True
+            # build path with fakes: found Python → venv → pip → verify → pointer switched; failure leaves nothing
+            g["sl_private_build"] = saved["sl_private_build"]
+            ran = []
+
+            def _fake_run(cmd, timeout=60, extra_env=None):
+                ran.append(cmd)
+                if cmd[1:3] == ["-m", "venv"]:
+                    py, sl = _sl_venv_paths(cmd[3])
+                    py.parent.mkdir(parents=True, exist_ok=True)
+                    py.write_text("", encoding="utf-8")
+                    sl.write_text("", encoding="utf-8")
+                    return 0, ""
+                if "-c" in cmd:
+                    return 0, "PYV=3.12.4"
+                return 0, "ok"
+            g["_sl_run"] = _fake_run
+            g["_sl_verify"] = lambda expected, sl=None: None
+            ok, msg = sl_private_build(">=3.10", "8.6.2", find_python=lambda spec: ("/opt/py3.12", "3.12.4"),
+                                       get_uv=lambda root: (_ for _ in ()).throw(AssertionError("no uv")))
+            assert ok and "Python 3.12.4" in msg, msg
+            assert any(c[-1] == "streamlink==8.6.2" for c in ran), ran
+            assert sl_private_bin() and sl_private_info()["version"] == "8.6.2"
+            first = sl_private_info()["dir"]
+            g["_sl_verify"] = lambda expected, sl=None: "the new streamlink's Twitch plugin doesn't handle twitch.tv URLs"
+            time.sleep(1.1)
+            ok, msg = sl_private_build(">=3.10", "8.6.3", find_python=lambda spec: ("/opt/py3.12", "3.12.4"))
+            assert not ok and "Twitch plugin" in msg
+            assert sl_private_info()["dir"] == first and len(list(Path(td).glob("venv-*"))) == 1
+            # no newer Python → uv path with managed Python
+            g["_sl_verify"] = lambda expected, sl=None: None
+            ran.clear()
+
+            def _fake_run_uv(cmd, timeout=60, extra_env=None):
+                ran.append((cmd, extra_env))
+                if len(cmd) > 1 and cmd[1] == "venv":
+                    py, sl = _sl_venv_paths(cmd[-1])
+                    py.parent.mkdir(parents=True, exist_ok=True)
+                    py.write_text("", encoding="utf-8")
+                    sl.write_text("", encoding="utf-8")
+                    return 0, ""
+                return _fake_run(cmd, timeout)
+            g["_sl_run"] = _fake_run_uv
+            time.sleep(1.1)
+            ok, msg = sl_private_build(">=3.10", "8.6.2", find_python=lambda spec: (None, None),
+                                       get_uv=lambda root: "/fake/uv")
+            assert ok and "uv" in msg, msg
+            uvc = [r for r in ran if r[0][0] == "/fake/uv"][0]
+            assert "--managed-python" in uvc[0] and uvc[1]["UV_PYTHON_INSTALL_DIR"].startswith(td)
+            assert len(list(Path(td).glob("venv-*"))) == 1
+    finally:
+        g.update(saved)
+        if prev_env is None:
+            os.environ.pop("TWITCH_RECORDER_PRIVATE_STREAMLINK_DIR", None)
+        else:
+            os.environ["TWITCH_RECORDER_PRIVATE_STREAMLINK_DIR"] = prev_env
+        _SL_PRIV_CACHE.update(mtime=None, bin=None)
+        with SL_UPDATE_LOCK:
+            SL_UPDATE.clear()
+            SL_UPDATE.update(saved_state)
+        with PIPELINE_LOCK:
+            PIPELINE["streamlinkUpdate"] = saved_pref
 
 
 def _self_test_go_live_schedule():
@@ -3899,6 +4418,7 @@ def self_test():
     _self_test_streamlink_update()  # v6.55
     _self_test_v656()  # v6.56
     _self_test_v658()  # v6.58
+    _self_test_v659()  # v6.59
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -10440,7 +10960,7 @@ def build_status_doc(now=None):
                              if k in ("enabled", "state", "installed", "kind", "pythonVersion", "latest",
                                       "latestCompatible", "latestRequiresPython", "installedReleasedAt",
                                       "outdated", "hint", "waitingFor", "lastResult", "lastError",
-                                      "lastUpgradeFrom", "lastUpgradeTo")},
+                                      "lastUpgradeFrom", "lastUpgradeTo", "private")},
         "streamlinkLine": streamlink_status_line(streamlink_update_snapshot()),
         "recentRecordings": recent,
         # v6.49: helper watching armed streamers while the recorder page is closed
