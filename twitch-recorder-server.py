@@ -21,7 +21,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.59"
+HELPER_VERSION = "6.60"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4419,6 +4419,7 @@ def self_test():
     _self_test_v656()  # v6.56
     _self_test_v658()  # v6.58
     _self_test_v659()  # v6.59
+    _self_test_v660()  # v6.60
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -8528,6 +8529,15 @@ def drive_permission_message():
         also = (f" (if it stays blocked, also add {paths[1]})" if len(paths) > 1 else "")
     except Exception:
         also = ""
+    try:  # v6.60: launchd runs the /usr/bin/python3 shim → FDA can't apply; helper repairs it itself
+        lp = launcher_snapshot()
+        if lp.get("shim") or lp.get("repaired"):
+            return ("macOS is blocking the helper from Google Drive (Operation not permitted). The helper's "
+                    f"login item started it through {lp.get('plistProgram')} (Apple's python3 shim), which "
+                    "Full Disk Access can't cover — the helper will repair this itself and relaunch when idle "
+                    f"(or restart the helper). If it stays blocked, add {exe} under Full Disk Access{also}.")
+    except Exception:
+        pass
     return ("macOS is blocking the helper from Google Drive (Operation not permitted — Full Disk Access). "
             "Open System Settings → Privacy & Security → Full Disk Access, press +, add "
             f"{exe} (⌘⇧G to type the path){also} and turn it on — the helper re-checks every minute "
@@ -11718,12 +11728,219 @@ def fda_paths(executable=None, base_prefix=None, exists=None):
     exists = exists or os.path.exists
     exe = os.path.realpath(executable or sys.executable or "python3")
     out = [exe]
+    if executable is None:  # v6.60: the binary launchd really runs (plist ProgramArguments[0]) first
+        try:
+            lp = launcher_snapshot()
+            if lp.get("shim") and lp.get("realInterpreter"):
+                out = [lp["realInterpreter"]] + [x for x in out if x != lp["realInterpreter"]]
+            elif lp.get("plistProgram"):
+                rp = os.path.realpath(lp["plistProgram"])
+                out = [rp] + [x for x in out if x != rp]
+        except Exception:
+            pass
     pre = base_prefix if base_prefix is not None else getattr(sys, "base_prefix", "") or ""
     if pre:
         app = os.path.join(pre, "Resources", "Python.app")
         if exists(app) and app not in out:
             out.append(app)
     return out
+
+
+# ─── v6.60: macOS LaunchAgent must run the REAL python, never the /usr/bin/python3 shim ──────────
+# /usr/bin/python3 is Apple's xcode-select shim; it execs CommandLineTools' python3.9, but macOS TCC
+# attributes the launchd job to the shim, so Full Disk Access granted to python3.9 / Python.app does
+# not apply and Google Drive writes fail with EPERM. The helper repairs its own plist on startup.
+LAUNCH_AGENT_LABEL = "com.ewanders.twitch-recorder"
+LAUNCHER_FIX_ENV_OFF = (os.environ.get("TWITCH_RECORDER_FIX_LAUNCHER") or "").strip().lower() in (
+    "0", "false", "no", "off")
+LAUNCHER_STATE = {"plistPath": None, "plistProgram": None, "realInterpreter": None,
+                  "shim": False, "repaired": False, "kickScheduled": False, "error": None}
+LAUNCHER_LOCK = threading.Lock()
+
+
+def is_python_shim(path):
+    """True for /usr/bin/python3 (xcode-select tool shim) or anything else under /usr/bin."""
+    if not path:
+        return False
+    p = os.path.normpath(str(path))
+    if p.startswith("/usr/bin/"):
+        return True
+    try:
+        rp = os.path.realpath(p)
+    except OSError:
+        rp = p
+    return rp.startswith("/usr/bin/") or "xcode_select" in os.path.basename(rp)
+
+
+def real_interpreter(executable=None, base_executable=None, exists=None):
+    """The real python binary to put in a LaunchAgent (never a shim); None if unknown."""
+    exists = exists or os.path.exists
+    cands = []
+    for c in (base_executable if base_executable is not None else getattr(sys, "_base_executable", None),
+              executable if executable is not None else sys.executable):
+        if c:
+            cands.append(os.path.realpath(c))
+    if base_executable is None and executable is None:
+        pre = getattr(sys, "base_prefix", "") or ""
+        if pre:
+            v = f"{sys.version_info[0]}.{sys.version_info[1]}"
+            cands.append(os.path.join(pre, "bin", f"python{v}"))
+    for c in cands:
+        if c and not is_python_shim(c) and exists(c):
+            return c
+    return None
+
+
+def find_launch_agent_plist(home=None):
+    d = Path(home or Path.home()) / "Library" / "LaunchAgents"
+    p = d / f"{LAUNCH_AGENT_LABEL}.plist"
+    if p.exists():
+        return p
+    try:
+        import plistlib
+        for f in sorted(d.glob("*.plist")):
+            try:
+                with open(f, "rb") as fh:
+                    doc = plistlib.load(fh)
+                if any("twitch-recorder-server" in str(a) for a in (doc.get("ProgramArguments") or [])):
+                    return f
+            except Exception:
+                continue
+    except OSError:
+        pass
+    return None
+
+
+def repair_launch_agent_plist(plist_path, real=None, log_fn=None):
+    """Rewrite ProgramArguments[0] if it is a shim. Returns dict(plistProgram, realInterpreter, shim, repaired, label)."""
+    import plistlib
+    plist_path = Path(plist_path)
+    with open(plist_path, "rb") as fh:
+        doc = plistlib.load(fh)
+    args = list(doc.get("ProgramArguments") or [])
+    prog = args[0] if args else None
+    real = real or real_interpreter()
+    out = {"plistProgram": prog, "realInterpreter": real, "shim": is_python_shim(prog),
+           "repaired": False, "label": doc.get("Label") or LAUNCH_AGENT_LABEL}
+    if out["shim"] and real and not is_python_shim(real):
+        bak = plist_path.with_name(plist_path.name + ".bak")
+        if not bak.exists():
+            shutil.copy2(plist_path, bak)
+        args[0] = real
+        doc["ProgramArguments"] = args
+        tmp = plist_path.with_name(f".{plist_path.name}.tmp-{uuid.uuid4().hex[:6]}")
+        with open(tmp, "wb") as fh:
+            plistlib.dump(doc, fh)
+        os.replace(tmp, plist_path)
+        out.update(repaired=True, plistProgram=real, shim=False, previous=prog)
+        if log_fn:
+            log_fn(f"launcher: LaunchAgent ran {prog} (xcode-select shim — macOS Full Disk Access "
+                   f"can't apply); now runs {real} (backup {bak.name}); takes effect on next launch")
+    return out
+
+
+def launcher_snapshot():
+    with LAUNCHER_LOCK:
+        d = dict(LAUNCHER_STATE)
+    return {k: d.get(k) for k in ("plistProgram", "realInterpreter", "shim", "repaired")}
+
+
+def launcher_startup_repair():
+    """macOS: fix the LaunchAgent once at startup; relaunch via launchctl if Drive is FDA-blocked and idle."""
+    if sys.platform != "darwin":
+        return
+    try:
+        pl = find_launch_agent_plist()
+        if not pl:
+            with LAUNCHER_LOCK:
+                LAUNCHER_STATE.update(realInterpreter=real_interpreter())
+            return
+        if LAUNCHER_FIX_ENV_OFF:
+            import plistlib
+            with open(pl, "rb") as fh:
+                prog = (plistlib.load(fh).get("ProgramArguments") or [None])[0]
+            with LAUNCHER_LOCK:
+                LAUNCHER_STATE.update(plistPath=str(pl), plistProgram=prog,
+                                      realInterpreter=real_interpreter(), shim=is_python_shim(prog))
+            return
+        r = repair_launch_agent_plist(pl, log_fn=log)
+        with LAUNCHER_LOCK:
+            LAUNCHER_STATE.update(plistPath=str(pl), **{k: r[k] for k in
+                                  ("plistProgram", "realInterpreter", "shim", "repaired")})
+        if r["repaired"]:
+            threading.Thread(target=_launcher_kick_loop, args=(r["label"],), daemon=True,
+                             name="launcher-kick").start()
+    except Exception as e:
+        with LAUNCHER_LOCK:
+            LAUNCHER_STATE["error"] = str(e)
+        log(f"launcher repair failed: {e}")
+
+
+def _launcher_kick_loop(label):
+    """After a repair: once Drive is FDA-blocked and the helper is idle, respawn via launchd (fresh TCC)."""
+    time.sleep(90)  # let the first Drive probe run
+    for _ in range(24 * 60):
+        try:
+            if _drive_access_snapshot_base().get("kind") != "fda":
+                return  # Drive fine → next natural relaunch picks the fix up
+            if not update_busy_reason():
+                with LAUNCHER_LOCK:
+                    LAUNCHER_STATE["kickScheduled"] = True
+                log(f"launcher: Drive blocked by Full Disk Access and helper idle — relaunching via launchd")
+                subprocess.Popen(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+        except Exception as e:
+            log(f"launcher kick: {e}")
+        time.sleep(60)
+
+
+def _self_test_v660():
+    """v6.60: shim detection + plist rewrite on a temp plist."""
+    import plistlib
+    import tempfile
+    assert is_python_shim("/usr/bin/python3")
+    assert not is_python_shim("/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9")
+    assert not is_python_shim(None)
+    real = "/opt/fake/Versions/3.9/bin/python3.9"
+    assert real_interpreter(executable="/usr/bin/python3", base_executable=real,
+                            exists=lambda p: True) == real
+    assert real_interpreter(executable="/usr/bin/python3", base_executable="/usr/bin/python3",
+                            exists=lambda p: True) is None
+    with tempfile.TemporaryDirectory() as td:
+        pl = Path(td) / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+        pl.parent.mkdir(parents=True)
+        doc = {"Label": LAUNCH_AGENT_LABEL, "RunAtLoad": True, "KeepAlive": True,
+               "ProgramArguments": ["/usr/bin/python3", "/x/twitch-recorder-server.py"],
+               "EnvironmentVariables": {"A": "1"}}
+        with open(pl, "wb") as fh:
+            plistlib.dump(doc, fh)
+        assert find_launch_agent_plist(home=td) == pl
+        r = repair_launch_agent_plist(pl, real=real)
+        assert r["repaired"] and r["plistProgram"] == real and not r["shim"], r
+        with open(pl, "rb") as fh:
+            nd = plistlib.load(fh)
+        assert nd["ProgramArguments"] == [real, "/x/twitch-recorder-server.py"], nd
+        assert nd["RunAtLoad"] is True and nd["KeepAlive"] is True and nd["EnvironmentVariables"] == {"A": "1"}
+        bak = pl.with_name(pl.name + ".bak")
+        with open(bak, "rb") as fh:
+            assert plistlib.load(fh)["ProgramArguments"][0] == "/usr/bin/python3"
+        r2 = repair_launch_agent_plist(pl, real=real)
+        assert not r2["repaired"] and not r2["shim"], r2
+        with open(bak, "rb") as fh:  # backup written once
+            assert plistlib.load(fh)["ProgramArguments"][0] == "/usr/bin/python3"
+    with LAUNCHER_LOCK:
+        saved = dict(LAUNCHER_STATE)
+        LAUNCHER_STATE.update(plistProgram="/usr/bin/python3", realInterpreter=real, shim=True)
+    try:
+        msg = drive_permission_message()
+        if sys.platform == "darwin" or os.name != "nt":
+            ps = fda_paths()
+            assert ps[0] == real, ps
+            assert "repair" in msg, msg
+    finally:
+        with LAUNCHER_LOCK:
+            LAUNCHER_STATE.clear(); LAUNCHER_STATE.update(saved)
 
 
 def drive_stuck_counts():
@@ -11833,6 +12050,8 @@ def drive_access_extra(kind):
     if kind == "fda" or sys.platform == "darwin":
         paths = fda_paths()
         out.update(fdaPath=paths[0], fdaPaths=paths, settingsUrl=FDA_SETTINGS_URL)
+    if sys.platform == "darwin" or kind == "fda":
+        out["launcher"] = launcher_snapshot()  # v6.60
     return out
 
 
@@ -12383,6 +12602,7 @@ def main():
     threading.Thread(target=streamlink_update_loop, daemon=True, name="streamlink-update").start()
     # v6.56: re-check a blocked Drive every minute and send the backlog once access works
     threading.Thread(target=drive_access_loop, daemon=True, name="drive-access").start()
+    launcher_startup_repair()  # v6.60: LaunchAgent → real python, not the /usr/bin/python3 shim
     # v6.56: Windows — start on login + watchdog that restarts the helper if it stops
     if os.name == "nt":
         threading.Thread(target=autostart_loop, daemon=True, name="autostart").start()
