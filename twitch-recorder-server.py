@@ -21,7 +21,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.60"
+HELPER_VERSION = "6.61"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4420,6 +4420,7 @@ def self_test():
     _self_test_v658()  # v6.58
     _self_test_v659()  # v6.59
     _self_test_v660()  # v6.60
+    _self_test_v661()  # v6.61
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -4528,6 +4529,7 @@ def _pipeline_health_summary():
         "oneCopy": one_copy_enabled(),  # v6.50
         "sending": bool(DELIVERY_STATE.get("busy")),
         "driveFound": bool(detect_drive_roots()),
+        "voiceRetry": _pipeline_retry_snapshot(),  # v6.61
     }
 
 
@@ -6753,6 +6755,36 @@ def chunked_demucs_no_vocals(job_id, src, work, duration, progress, pct_lo=20.0,
                 _DEMUCS_DEVICE_STATE["mps_failed"] = True
                 log(f"drive-music job={job_id}: demucs on mps failed — falling back to cpu")
                 progress(f"{label}: MPS failed, retrying on CPU…", None)
+        # v6.61: one demucs run dying (memory pressure, a killed process, a sleep/wake blip) no longer
+        # throws away hours of finished chunks — the same chunk is tried again on the CPU first.
+        tries = 0
+        while stem_wav is None and tries < DEMUCS_CHUNK_RETRIES and not _pipeline_error_is_permanent(last_err):
+            tries += 1
+            log(f"drive-music job={job_id}: demucs chunk {i + 1}/{n} failed — trying it again on cpu "
+                f"(retry {tries}/{DEMUCS_CHUNK_RETRIES}): {(last_err or 'unknown')[-200:]}")
+            progress(f"{label} failed — trying that chunk again…", None)
+            _CHUNK_RETRY_STATS["retries"] += 1
+            t_end = time.time() + DEMUCS_CHUNK_RETRY_PAUSE_SECS
+            while time.time() < t_end:
+                _check_cancel(job_id)
+                time.sleep(0.5)
+            shutil.rmtree(out_dir, ignore_errors=True)
+            env = dict(os.environ)
+            env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+            cmd = base_cmd + [
+                "-n", "htdemucs", "--two-stems=vocals", "--segment", DEMUCS_SEGMENT,
+                "-j", "1", "-d", "cpu", "--clip-mode", "clamp",
+                "--filename", "{stem}.{ext}", "-o", str(out_dir), str(chunk),
+            ]
+            state["pct"] = 0.0
+            rc, tail = _job_run_proc(job_id, cmd, line_cb=on_line, env=env)
+            cand = out_dir / "htdemucs" / "no_vocals.wav"
+            if rc == 0 and cand.is_file():
+                stem_wav = cand
+                _CHUNK_RETRY_STATS["saved"] += 1
+                log(f"drive-music job={job_id}: demucs chunk {i + 1}/{n} worked on retry {tries}")
+            else:
+                last_err = tail[-500:]
         if stem_wav is None:
             log(f"drive-music job={job_id}: demucs failed on chunk {i + 1}/{n}: {last_err or 'unknown'}")
             raise RuntimeError(friendly_demucs_error(last_err, f"demucs (chunk {i + 1}/{n})"))  # v6.56
@@ -9121,7 +9153,9 @@ def _split_and_deliver(job_id, music_path, source, progress, pct=95):
     return base, names, part_secs, st, msg
 
 
-def pipeline_worker(job_id):
+def _pipeline_attempt(job_id):
+    """One try at original-wait → voice removal → encode → split → Drive. Raises on failure
+    (v6.61: pipeline_worker decides whether to try again)."""
     work = None
     slot_held = False
     progress = _pipeline_progress(job_id)
@@ -9141,7 +9175,11 @@ def pipeline_worker(job_id):
             raise RuntimeError("no finished segments on disk")
         wait_for_originals(job_id, [p.name for p in paths], progress)  # v6.38: original → Drive first
         existing = find_existing_sibling(paths[0].name, "music") if len(paths) == 1 else None
-        if existing and not redo:
+        made = _job_get(job_id, "musicMade")  # v6.61: an earlier try already finished voice removal
+        if made and (REC_DIR / basename_of(made)).is_file():
+            music_path = REC_DIR / basename_of(made)
+            _set_music_job(job_id, status="running", info="reused the -music file from the earlier try")
+        elif existing and not redo:
             music_path = existing
             _set_music_job(job_id, status="running", info="reused existing -music file")
         else:
@@ -9192,8 +9230,9 @@ def pipeline_worker(job_id):
             dest = _unique_music_dest(paths[0].name)
             atomic_publish(tmp_out, dest)
             music_path = dest
-            _set_music_job(job_id, outputName=dest.name,
+            _set_music_job(job_id, outputName=dest.name, musicMade=dest.name,  # v6.61
                            outputUrl="/api/download/" + urllib.parse.quote(dest.name))
+            _pending_job_note(segs[0], musicMade=dest.name)
             # Free the demucs slot before split/delivery so the next job can start.
             DEMUCS_SLOTS.release()
             slot_held = False
@@ -9203,22 +9242,15 @@ def pipeline_worker(job_id):
         _set_music_job(job_id, outputName=Path(music_path).name,
                        outputUrl="/api/download/" + urllib.parse.quote(Path(music_path).name))
         base, names, part_secs, st, msg = _split_and_deliver(job_id, music_path, "stream", progress)
+        tries = int(_job_get(job_id, "autoRetries") or 0)
+        if tries:
+            msg += f" (worked on automatic try {tries + 1})"
+            with PIPELINE_LOCK:
+                PIPELINE_RETRY_STATS["recovered"] = int(PIPELINE_RETRY_STATS.get("recovered") or 0) + 1
         _set_music_job(job_id, status="done", phase="done", progress=msg, progressPct=100,
-                       deliveryStatus=st, error=None, finishedAt=time.time())
+                       deliveryStatus=st, error=None, finishedAt=time.time(), retryAt=None)
         log(f"pipeline done job={job_id} music={Path(music_path).name} parts={len(names)} delivery={st}")
-    except _JobCancelled:
-        _finalize_cancelled_music_job(job_id)
-        log(f"pipeline cancelled job={job_id}")
-    except Exception as e:
-        msg = str(e) or type(e).__name__
-        log(f"pipeline error job={job_id}: {msg}")
-        _set_music_job(job_id, status="error", progress="Error", error=msg, finishedAt=time.time())
     finally:
-        # v6.44: job reached an end state in this process — no resume needed after a restart
-        try:
-            _pending_job_drop(segs[0] if segs else None)
-        except Exception:
-            pass
         if slot_held:
             try:
                 DEMUCS_SLOTS.release()
@@ -9227,6 +9259,168 @@ def pipeline_worker(job_id):
         if work is not None:
             shutil.rmtree(work, ignore_errors=True)
             _unregister_work_path(work)
+
+
+# ─── v6.61: AFTER-STREAM VOICE REMOVAL TRIES AGAIN BY ITSELF ─────────────────────────────────────
+# A 4-hour stream is ~24 demucs runs. One of them dying (macOS memory pressure killing it, a sleep /
+# wake blip, Drive for Desktop briefly locking a file, ffmpeg hiccup) used to fail the whole job:
+# every finished chunk was thrown away, the job was marked "error", and that stream never got its
+# music-only parts in Drive unless someone pressed Retry. Now (1) a failed chunk is tried once more on
+# the CPU before giving up, and (2) a failed after-stream job waits and starts again on its own
+# (10 min, then 1 h), keeping the -music file if voice removal had already finished. Errors that a
+# retry can't fix (ffmpeg missing, torchaudio has no audio backend, recording gone) stop at once.
+# The retry count is kept in .drive-pipeline.json pendingJobs, so a helper restart doesn't reset it.
+def _parse_retry_delays(raw, default=(600.0, 3600.0)):
+    out = []
+    for x in str(raw or "").replace(";", ",").split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            out.append(max(0.0, float(x)))
+        except ValueError:
+            return tuple(default)
+    return tuple(out) if out else tuple(default)
+
+
+PIPELINE_RETRY_DELAYS = _parse_retry_delays(os.environ.get("TWITCH_RECORDER_PIPELINE_RETRY_SECS"))
+try:
+    PIPELINE_RETRIES = max(0, int(os.environ.get("TWITCH_RECORDER_PIPELINE_RETRIES") or 2))
+except ValueError:
+    PIPELINE_RETRIES = 2
+try:
+    DEMUCS_CHUNK_RETRIES = max(0, int(os.environ.get("TWITCH_RECORDER_DEMUCS_CHUNK_RETRIES") or 1))
+except ValueError:
+    DEMUCS_CHUNK_RETRIES = 1
+DEMUCS_CHUNK_RETRY_PAUSE_SECS = _env_secs("TWITCH_RECORDER_DEMUCS_CHUNK_RETRY_PAUSE_SECS", 20, 0)
+PIPELINE_RETRY_STATS = {"scheduled": 0, "recovered": 0, "gaveUp": 0, "permanent": 0,
+                        "lastError": None, "lastAt": 0.0, "lastName": None}
+_CHUNK_RETRY_STATS = {"retries": 0, "saved": 0}
+_PERMANENT_PIPELINE_ERRORS = (
+    "no finished segments on disk", "ffmpeg not found", "ffmpeg not installed",
+    "no audio backend", "appropriate backend", "torchcodec", "could not save its audio file",
+    "mono audio", "demucs not installed", "demucs is not installed",
+)
+
+
+def _pipeline_error_is_permanent(msg):
+    low = str(msg or "").lower()
+    return any(h in low for h in _PERMANENT_PIPELINE_ERRORS)
+
+
+def _pipeline_retry_delay(n):
+    """Seconds to wait before automatic try n+1 (n = retries already used, 0-based)."""
+    if not PIPELINE_RETRY_DELAYS:
+        return 600.0
+    return float(PIPELINE_RETRY_DELAYS[min(n, len(PIPELINE_RETRY_DELAYS) - 1)])
+
+
+def _pending_job_note(first, **kw):
+    """Add fields to an existing pendingJobs entry (no-op when there isn't one). Never raises."""
+    if not first:
+        return
+    try:
+        with PIPELINE_LOCK:
+            ent = (PIPELINE.get("pendingJobs") or {}).get(first)
+            if not isinstance(ent, dict):
+                return
+            ent.update(kw)
+        _pipeline_save()
+    except Exception as e:
+        log(f"pipeline pending-note failed: {e}")
+
+
+def _pending_job_field(first, key, default=None):
+    with PIPELINE_LOCK:
+        ent = (PIPELINE.get("pendingJobs") or {}).get(first)
+        return ent.get(key, default) if isinstance(ent, dict) else default
+
+
+def _fmt_clock(ts):
+    try:
+        return time.strftime("%I:%M %p", time.localtime(ts)).lstrip("0")
+    except Exception:
+        return ""
+
+
+def pipeline_worker(job_id):
+    segs = list(_job_get(job_id, "segments") or [])
+    first = segs[0] if segs else None
+    retries = int(_pending_job_field(first, "errorRetries", 0) or 0)  # survives a helper restart
+    made = _pending_job_field(first, "musicMade")
+    if made and not _job_get(job_id, "musicMade"):
+        _set_music_job(job_id, musicMade=made)
+    _set_music_job(job_id, autoRetries=retries)
+    keep_pending = False
+    try:
+        while True:
+            try:
+                _pipeline_attempt(job_id)
+                return
+            except _JobCancelled:
+                _finalize_cancelled_music_job(job_id)
+                log(f"pipeline cancelled job={job_id}")
+                return
+            except Exception as e:
+                msg = str(e) or type(e).__name__
+                log(f"pipeline error job={job_id}: {msg}")
+                permanent = _pipeline_error_is_permanent(msg)
+                if permanent or retries >= PIPELINE_RETRIES:
+                    with PIPELINE_LOCK:
+                        PIPELINE_RETRY_STATS["permanent" if permanent else "gaveUp"] += 1
+                        PIPELINE_RETRY_STATS.update(lastError=msg[:300], lastAt=time.time(), lastName=first)
+                    if retries and not permanent:
+                        msg = f"{msg} (failed {retries + 1} times — press Retry to try again)"
+                    _set_music_job(job_id, status="error", progress="Error", error=msg,
+                                   finishedAt=time.time(), retryAt=None)
+                    return
+                delay = _pipeline_retry_delay(retries)
+                retries += 1
+                at = time.time() + delay
+                with PIPELINE_LOCK:
+                    PIPELINE_RETRY_STATS["scheduled"] += 1
+                    PIPELINE_RETRY_STATS.update(lastError=msg[:300], lastAt=time.time(), lastName=first)
+                _pending_job_note(first, errorRetries=retries, lastError=msg[:300], retryAt=at)
+                short = msg if len(msg) <= 160 else msg[:157] + "…"
+                wait_msg = (f"Voice removal failed ({short}) — trying again by itself at {_fmt_clock(at)} "
+                            f"(try {retries + 1} of {PIPELINE_RETRIES + 1})")
+                _set_music_job(job_id, status="queued", phase="retry-wait", progress=wait_msg,
+                               lastError=msg, retryAt=at, autoRetries=retries, error=None)
+                log(f"pipeline job={job_id}: retry {retries}/{PIPELINE_RETRIES} in {delay:.0f}s")
+                keep_pending = True  # a restart during the wait resumes the job
+                try:
+                    while time.time() < at:
+                        _check_cancel(job_id)
+                        time.sleep(0.5)
+                except _JobCancelled:
+                    keep_pending = False
+                    _finalize_cancelled_music_job(job_id)
+                    log(f"pipeline cancelled job={job_id} (while waiting to retry)")
+                    return
+                keep_pending = False
+                _set_music_job(job_id, status="queued", phase="wait", retryAt=None,
+                               progress=f"Trying voice removal again (try {retries + 1} of {PIPELINE_RETRIES + 1})…")
+    finally:
+        # v6.44: job reached an end state in this process — no resume needed after a restart
+        if not keep_pending:
+            try:
+                _pending_job_drop(first)
+            except Exception:
+                pass
+
+
+def _pipeline_retry_snapshot():
+    with PIPELINE_LOCK:
+        out = dict(PIPELINE_RETRY_STATS)
+    out.update(maxRetries=PIPELINE_RETRIES, delays=list(PIPELINE_RETRY_DELAYS),
+               chunkRetries=DEMUCS_CHUNK_RETRIES, chunkRetriesUsed=_CHUNK_RETRY_STATS["retries"],
+               chunksSaved=_CHUNK_RETRY_STATS["saved"])
+    with MUSIC_JOBS_LOCK:
+        out["waiting"] = [{"name": j.get("name"), "retryAt": j.get("retryAt"), "tries": j.get("autoRetries"),
+                           "lastError": (j.get("lastError") or "")[:200]}
+                          for j in MUSIC_JOBS.values()
+                          if j.get("phase") == "retry-wait" and (j.get("status") or "") == "queued"]
+    return out
 
 
 def split_worker(job_id):
@@ -9277,6 +9471,9 @@ def _pending_job_put(first, username, segs, redo, reason):
         pj[first] = {"segments": list(segs), "username": username, "redo": bool(redo),
                      "reason": reason, "queuedAt": prev.get("queuedAt") or time.time(),
                      "attempts": int(prev.get("attempts") or 0) + 1}
+        for k in ("errorRetries", "lastError", "musicMade"):  # v6.61: keep the auto-retry state
+            if prev.get(k) is not None:
+                pj[first][k] = prev.get(k)
     _pipeline_save()
 
 
@@ -11893,6 +12090,112 @@ def _launcher_kick_loop(label):
         except Exception as e:
             log(f"launcher kick: {e}")
         time.sleep(60)
+
+
+def _self_test_v661():
+    """v6.61: a failed demucs chunk is retried; a failed after-stream job waits and tries again,
+    keeps its retry count in pendingJobs, gives up after the limit, and stops at once on errors a
+    retry can't fix. Temp recordings dir; no real demucs / ffmpeg runs."""
+    global REC_DIR, PIPELINE_FILE, PIPELINE_RETRY_DELAYS, _pipeline_attempt, _job_run_proc
+    global which_ffmpeg, demucs_cmd_base, _demucs_devices, DEMUCS_CHUNK_RETRY_PAUSE_SECS
+    import tempfile as _tmp661
+    assert _parse_retry_delays("") == (600.0, 3600.0)
+    assert _parse_retry_delays("5, 30") == (5.0, 30.0)
+    assert _parse_retry_delays("x") == (600.0, 3600.0)
+    assert _pipeline_error_is_permanent("no finished segments on disk")
+    assert _pipeline_error_is_permanent("Voice removal could not save its audio file (torchaudio has no audio backend …)")
+    assert not _pipeline_error_is_permanent("demucs (chunk 3/24) failed: Killed: 9")
+    prev = (REC_DIR, PIPELINE_FILE, PIPELINE_RETRY_DELAYS, _pipeline_attempt, _job_run_proc,
+            which_ffmpeg, demucs_cmd_base, _demucs_devices, DEMUCS_CHUNK_RETRY_PAUSE_SECS)
+    with PIPELINE_LOCK:
+        prev_pj = dict(PIPELINE.get("pendingJobs") or {})
+        prev_stats = dict(PIPELINE_RETRY_STATS)
+    try:
+        with _tmp661.TemporaryDirectory(prefix="tar-661-") as td:
+            REC_DIR = Path(td)
+            PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
+            PIPELINE_RETRY_DELAYS = (0.0, 0.0)
+            DEMUCS_CHUNK_RETRY_PAUSE_SECS = 0.0
+            # (1) chunk retry: first demucs run dies, the retry on cpu works
+            calls = {"demucs": 0}
+
+            def fake_proc(job_id, cmd, line_cb=None, env=None, timeout=None):
+                if "segment" in cmd:
+                    out = Path(cmd[-1].replace("%04d", "0000"))
+                    out.write_bytes(b"f")
+                    return 0, ""
+                if "--two-stems=vocals" in cmd:
+                    calls["demucs"] += 1
+                    if calls["demucs"] == 1:
+                        return -9, "Killed: 9"
+                    o = Path(cmd[cmd.index("-o") + 1]) / "htdemucs"
+                    o.mkdir(parents=True, exist_ok=True)
+                    (o / "no_vocals.wav").write_bytes(b"w")
+                    return 0, ""
+                Path(cmd[-1]).write_bytes(b"c")
+                return 0, ""
+            _job_run_proc = fake_proc
+            which_ffmpeg = lambda: "ffmpeg"
+            demucs_cmd_base = lambda: ["demucs"]
+            _demucs_devices = lambda: ["cpu"]
+            jid = uuid.uuid4().hex[:12]
+            with MUSIC_JOBS_LOCK:
+                MUSIC_JOBS[jid] = {"jobId": jid, "status": "running"}
+            work = REC_DIR / "work"
+            work.mkdir()
+            src = REC_DIR / "x.ogg"
+            src.write_bytes(b"x")
+            outs = chunked_demucs_no_vocals(jid, src, work, 60, lambda *a, **k: None)
+            assert len(outs) == 1 and calls["demucs"] == 2, (outs, calls)
+            # (2) job retry: fail, then succeed
+            seq = {"n": 0}
+            first = "selftest661-Fri-2026-10-30T19-00-00.ogg"
+
+            def attempt(job_id, plan):
+                seq["n"] += 1
+                if plan[seq["n"] - 1]:
+                    raise RuntimeError(plan[seq["n"] - 1])
+                _set_music_job(job_id, status="done", phase="done", progress="Sent to Drive (1 part)")
+
+            def run(plan):
+                seq["n"] = 0
+                j = uuid.uuid4().hex[:12]
+                with MUSIC_JOBS_LOCK:
+                    MUSIC_JOBS[j] = {"jobId": j, "status": "queued", "segments": [first], "name": first}
+                with PIPELINE_LOCK:
+                    PIPELINE.setdefault("pendingJobs", {})[first] = {"segments": [first], "attempts": 1,
+                                                                    "queuedAt": time.time()}
+                globals()["_pipeline_attempt"] = lambda job_id: attempt(job_id, plan)
+                pipeline_worker(j)
+                with MUSIC_JOBS_LOCK:
+                    job = dict(MUSIC_JOBS.pop(j))
+                with PIPELINE_LOCK:
+                    left = first in (PIPELINE.get("pendingJobs") or {})
+                return job, left
+            job, left = run(["demucs (chunk 2/24) failed: Killed: 9", None])
+            assert job["status"] == "done" and seq["n"] == 2 and job["autoRetries"] == 1 and not left, job
+            job, left = run(["boom", "boom", "boom", None])
+            assert job["status"] == "error" and seq["n"] == 3 and "failed 3 times" in job["error"] and not left, job
+            job, left = run(["ffmpeg not found", None])
+            assert job["status"] == "error" and seq["n"] == 1, job
+            # pendingJobs keeps the retry count across a re-put (helper restart → resume)
+            with PIPELINE_LOCK:
+                PIPELINE.setdefault("pendingJobs", {})[first] = {"segments": [first], "attempts": 1,
+                                                                "errorRetries": 1, "musicMade": "m.ogg"}
+            _pending_job_put(first, "selftest661", [first], False, "resumed after helper restart")
+            with PIPELINE_LOCK:
+                ent = dict(PIPELINE["pendingJobs"][first])
+            assert ent["errorRetries"] == 1 and ent["musicMade"] == "m.ogg" and ent["attempts"] == 2, ent
+            snap = _pipeline_retry_snapshot()
+            assert snap["maxRetries"] == PIPELINE_RETRIES and snap["scheduled"] >= 3 and snap["gaveUp"] >= 1, snap
+            with MUSIC_JOBS_LOCK:
+                MUSIC_JOBS.pop(jid, None)
+    finally:
+        (REC_DIR, PIPELINE_FILE, PIPELINE_RETRY_DELAYS, _pipeline_attempt, _job_run_proc,
+         which_ffmpeg, demucs_cmd_base, _demucs_devices, DEMUCS_CHUNK_RETRY_PAUSE_SECS) = prev
+        with PIPELINE_LOCK:
+            PIPELINE["pendingJobs"] = prev_pj
+            PIPELINE_RETRY_STATS.clear(); PIPELINE_RETRY_STATS.update(prev_stats)
 
 
 def _self_test_v660():
