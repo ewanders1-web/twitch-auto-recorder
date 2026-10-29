@@ -32,6 +32,8 @@
   .streamer-row{display:grid;grid-template-columns:auto 1fr auto;gap:.85rem;background:#22222a;padding:.95rem 1rem;border-radius:.85rem;margin-bottom:.55rem;border:1px solid #30303a;align-items:start;}
   .s-dot{width:12px;height:12px;border-radius:50%;flex-shrink:0;margin-top:.35rem;box-shadow:0 0 0 4px rgba(255,255,255,.03);} 
   .s-name{flex:1;font-size:.98rem;font-weight:700;}
+  .s-name a{color:inherit;text-decoration:none;border-bottom:1px dotted #6b7280;}
+  .s-name a:hover{color:#c4b5fd;border-bottom-color:#c4b5fd;}
   .s-status{font-size:.74rem;color:#9ca3af;}
   .s-live{color:#ff6b6b;font-weight:700;}
   .s-rec{color:#ff6b6b;font-weight:800;}
@@ -219,7 +221,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.58</span>
+    <span class="badge">v6.59</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -342,6 +344,7 @@
     <div class="arm-pick">
       <select id="armPickSel"></select>
       <button class="btn btn-purple btn-sm" onclick="armCaptureFromPicker()">🎧 Arm for selected</button>
+      <button class="btn btn-purple btn-sm" onclick="openAndArmFromPicker()" title="Open the selected streamer's Twitch tab and arm capture for it in one click">↗🎧 Open + Arm selected</button>
     </div>
 
     <div id="needArmBanner" class="alert alert-err hidden" role="status"></div>
@@ -2831,7 +2834,7 @@ function renderStreamers(){
     <div class="streamer-row">
       <div class="s-dot" style="background:${s.color}"></div>
       <div>
-        <div class="s-name">${s.username}
+        <div class="s-name"><a href="https://www.twitch.tv/${s.username}" target="_blank" rel="noopener" title="Open ${s.username} on Twitch in a new tab">${s.username}</a>
           ${isHome?'<span class="s-home"> ★ HOME</span>':''}
           ${s.isLive?'<span class="s-live"> ● LIVE</span>':'<span class="s-status"> offline</span>'}
           ${isRecording(s)?'<span class="s-rec"> ● REC</span>':''}
@@ -2869,7 +2872,8 @@ function renderStreamers(){
           : (s.captureArmed
           ? `<span class="state-chip" style="background:rgba(16,185,129,.18);color:#6ee7b7;border:1px solid rgba(16,185,129,.35)">ARMED</span>
              <button class="btn btn-gray btn-sm" onclick="disarmCapture('${s.username}')">Disarm</button>`
-          : `<button class="btn btn-purple btn-sm" onclick="armCapture('${s.username}')">🎧 Arm</button>`)}
+          : `<button class="btn btn-purple btn-sm" onclick="openAndArm('${s.username}')" title="Open this streamer's Twitch tab and arm capture for it in one click — then pick that tab in the share picker">↗🎧 Open + Arm</button>
+             <button class="btn btn-purple btn-sm" onclick="armCapture('${s.username}')">🎧 Arm</button>`)}
         <button class="btn btn-red btn-sm" onclick="removeStreamer('${s.username}')">✕</button>
       </div>
     </div>`;
@@ -3601,6 +3605,35 @@ function armCaptureFromPicker(){
   const name=document.getElementById('armPickSel')?.value;
   if(!name){flashErr('Add a streamer first, then Arm their Twitch tab.');return;}
   armCapture(name);
+}
+
+// v6.59: one click opens the streamer's Twitch tab AND arms tab capture for
+// them. window.open and armCapture both run inside the same click gesture, so
+// Chrome still grants getDisplayMedia user activation; the user then picks
+// the just-opened tab in the share picker. Also flips Auto-Rec on if it was
+// off, so the armed capture actually records when the streamer goes live.
+function openAndArm(username){
+  const s=findStreamer(username);
+  if(!s){flashErr('Unknown streamer.');return;}
+  if(!s.autoRec){
+    s.autoRec=true;
+    persist();
+    flashOk('Auto-Rec switched on for '+s.username+'.');
+  }
+  let tab=null;
+  try{ tab=window.open('https://www.twitch.tv/'+s.username, '_blank'); }catch(e){}
+  if(!tab){
+    flashErr('Chrome blocked opening the Twitch tab for '+s.username+' — allow popups for this page, or open twitch.tv/'+s.username+' yourself, then pick that tab in the share picker.');
+  }
+  tarRequestUnmute(s.username, 'open-arm');
+  armCapture(s.username);
+  flashOk('Pick the '+s.username+' tab in the share picker — the one that just opened — and check "Share tab audio".');
+}
+
+function openAndArmFromPicker(){
+  const name=document.getElementById('armPickSel')?.value;
+  if(!name){flashErr('Add a streamer first, then Open + Arm their Twitch tab.');return;}
+  openAndArm(name);
 }
 
 function disarmCapture(username){
