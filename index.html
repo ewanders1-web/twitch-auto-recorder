@@ -32,8 +32,6 @@
   .streamer-row{display:grid;grid-template-columns:auto 1fr auto;gap:.85rem;background:#22222a;padding:.95rem 1rem;border-radius:.85rem;margin-bottom:.55rem;border:1px solid #30303a;align-items:start;}
   .s-dot{width:12px;height:12px;border-radius:50%;flex-shrink:0;margin-top:.35rem;box-shadow:0 0 0 4px rgba(255,255,255,.03);} 
   .s-name{flex:1;font-size:.98rem;font-weight:700;}
-  .s-name a{color:inherit;text-decoration:none;border-bottom:1px dotted #6b7280;}
-  .s-name a:hover{color:#c4b5fd;border-bottom-color:#c4b5fd;}
   .s-status{font-size:.74rem;color:#9ca3af;}
   .s-live{color:#ff6b6b;font-weight:700;}
   .s-rec{color:#ff6b6b;font-weight:800;}
@@ -41,6 +39,7 @@
   .s-home{color:#fcd34d;font-weight:700;font-size:.72rem;margin-left:.35rem;}
   .btn-home{background:#3a3420;color:#fcd34d;border:1px solid #6b5a1e;}
   .btn-home.is-home{background:#fcd34d;color:#1a1408;border-color:#fcd34d;font-weight:800;}
+  .home-opts{display:inline-flex;gap:.55rem;flex-wrap:wrap;align-items:center}.home-opts.is-off{opacity:.45}.home-opts select,.home-opts input[type=text]{font-size:.75rem;padding:.1rem .25rem}
   .home-bar{display:flex;align-items:center;gap:.65rem;flex-wrap:wrap;margin-bottom:.75rem;font-size:.8rem;color:#c4b5fd;}
   .update-box{background:#22222a;border:1px solid #31313a;border-radius:.85rem;padding:.85rem 1rem;margin-top:1rem;}
   .update-box .verline{font-size:.8rem;color:#a1a1aa;margin:.35rem 0 .55rem;}
@@ -221,7 +220,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.59</span>
+    <span class="badge">v6.63</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -272,6 +271,8 @@
     <div id="driveAccessBanner" class="alert alert-err hidden" role="status"></div>
     <!-- v6.56: sticky when the local helper can't be reached (not running / crashed) -->
     <div id="helperDownBanner" class="alert alert-err hidden" role="status"></div>
+    <!-- v6.63: this open page is an older build than the helper (tab left open across an auto-update) -->
+    <div id="pageStaleBanner" class="alert alert-info hidden" role="status"></div>
 
     <!-- live now banners -->
     <div id="liveNowBox"></div>
@@ -344,7 +345,6 @@
     <div class="arm-pick">
       <select id="armPickSel"></select>
       <button class="btn btn-purple btn-sm" onclick="armCaptureFromPicker()">🎧 Arm for selected</button>
-      <button class="btn btn-purple btn-sm" onclick="openAndArmFromPicker()" title="Open the selected streamer's Twitch tab and arm capture for it in one click">↗🎧 Open + Arm selected</button>
     </div>
 
     <div id="needArmBanner" class="alert alert-err hidden" role="status"></div>
@@ -390,6 +390,18 @@
         <input type="checkbox" id="returnHomeToggle" checked onchange="saveReturnHomeToggle()"> Return home after set
       </label>
       <button class="btn btn-gray btn-sm" id="clearHomeBtn" onclick="clearHomeStreamer()" title="Clear home streamer">Clear home</button>
+      <span class="home-opts" id="homeOpts">
+        <label title="Switch after: grace delay after the guest/DJ goes offline before switching home. If the guest comes back live during the delay (stream hiccup), the return is cancelled.">Switch after
+          <select id="homeSwitchDelay" onchange="saveHomeOptions()"><option value="0">Right away</option><option value="1">1 min</option><option value="2">2 min</option><option value="5">5 min</option></select></label>
+        <label title="Wait for home: if home is not live when the set ends, keep a pending return and start home as soon as it goes live within this window (uses the normal live poll — no extra Twitch calls).">Wait for home
+          <select id="homeWaitMins" onchange="saveHomeOptions()"><option value="0">Off</option><option value="15">15 min</option><option value="30">30 min</option><option value="60">60 min</option><option value="120">120 min</option><option value="tonight">Until home goes live tonight (max 6 h)</option></select></label>
+        <label title="Arm home if Auto-Rec is off: a return turns on home's Auto-Rec instead of skipping it."><input type="checkbox" id="homeArmIfOff" onchange="saveHomeOptions()"> Arm home if Auto-Rec is off</label>
+        <label title="Backup home: optional comma-separated fallback streamers (must be in your list). If home is not live on return, the first live backup is used. Wait for home still prefers home (you get a notice if home goes live while a backup records).">Backup
+          <input type="text" id="homeBackups" placeholder="name1, name2" style="width:9rem" onchange="saveHomeOptions()"></label>
+        <label title="Only return for: any non-home streamer (default), or only streamers marked ♪ Guest on their row.">Only return for
+          <select id="homeOnlyGuests" onchange="saveHomeOptions()"><option value="any">Any non-home streamer</option><option value="guests">Only streamers I mark as guests</option></select></label>
+      </span>
+      <span id="homeReturnStatus" class="hidden" style="color:#fcd34d"></span>
     </div>
     <div id="streamerList"></div>
     <div class="add-row">
@@ -562,9 +574,9 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.58'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.63'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
-let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
+let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
 let helper = { ok:false, streamlink:false, ffmpeg:false, seamless:false, demucs:false, version:'', diskVersion:'', pendingRestart:false, demucsHint:'', recordingsDir:'', installHint:'', updateRepo:'', active:[], lastErrors:{}, diskFree:null, diskTotal:null, diskWarn:false, diskBlock:false, musicDemucsQueue:null, orphanTempsCleared:0, orphanTempsBytes:0 };
 let musicJobs = {}; // name -> {jobId, status, progress, error, outputName, vocalsName}
@@ -689,7 +701,7 @@ function persist(){
       clientSecret: cfg.clientSecret||'',
       interval: cfg.interval||30,
       fmtMime: chosenFmt ? chosenFmt.mime : (restoredFmtMime||null),
-      streamers: streamers.map(s=>({username:s.username, armed:!!s.autoRec, color:s.color, drivePipe:s.drivePipe!==false, driveOrig:s.driveOrig!==false})),
+      streamers: streamers.map(s=>({username:s.username, armed:!!s.autoRec, color:s.color, drivePipe:s.drivePipe!==false, driveOrig:s.driveOrig!==false, guest:s.isGuest===true})),
       notifyOptIn: !!cfg.notifyOptIn,
       helperQuality: cfg.helperQuality==='audio_only'?'audio_only':'best',
       seamlessRecordings: cfg.seamlessRecordings!==false,
@@ -706,6 +718,11 @@ function persist(){
       oneCopy: cfg.oneCopy!==false, // v6.50
       homeStreamer: String(cfg.homeStreamer||'').toLowerCase(),
       returnHomeAfterSet: cfg.returnHomeAfterSet!==false,
+      homeWaitMins: normHomeWait(cfg.homeWaitMins), // v6.62
+      homeSwitchDelayMins: normHomeDelay(cfg.homeSwitchDelayMins), // v6.62
+      homeArmIfOff: cfg.homeArmIfOff===true, // v6.62
+      homeBackups: String(cfg.homeBackups||''), // v6.62
+      homeOnlyGuests: cfg.homeOnlyGuests===true, // v6.62
       // v6.35: Google Drive card (same persist key)
       driveLastPath: String(cfg.driveLastPath||''),
       driveOutMode: cfg.driveOutMode||'subfolder',
@@ -759,6 +776,12 @@ function restoreSettings(){
     cfg.homeStreamer=data.homeStreamer?String(data.homeStreamer).toLowerCase():'';
     if(typeof data.returnHomeAfterSet==='boolean') cfg.returnHomeAfterSet=data.returnHomeAfterSet;
     else cfg.returnHomeAfterSet=true;
+    // v6.62: more return-home options (defaults keep old behavior + 2 min delay / 60 min wait)
+    cfg.homeWaitMins=normHomeWait(data.homeWaitMins);
+    cfg.homeSwitchDelayMins=normHomeDelay(data.homeSwitchDelayMins);
+    cfg.homeArmIfOff=data.homeArmIfOff===true;
+    cfg.homeBackups=typeof data.homeBackups==='string'?data.homeBackups:'';
+    cfg.homeOnlyGuests=data.homeOnlyGuests===true;
     // v6.35: Google Drive card
     cfg.driveLastPath=typeof data.driveLastPath==='string'?data.driveLastPath:'';
     cfg.driveOutMode=['subfolder','sibling','recordings'].indexOf(data.driveOutMode)>=0?data.driveOutMode:'subfolder';
@@ -775,6 +798,7 @@ function restoreSettings(){
         );
         st.drivePipe=s.drivePipe!==false; // v6.36 default on
         st.driveOrig=s.driveOrig!==false; // v6.38 default on
+        st.isGuest=s.guest===true; // v6.62 guest marking for Only return for
         return st;
       });
     }
@@ -1518,6 +1542,7 @@ function pingHelperAndStatus(){
   updateStatusUI();
   renderStreamers();
   maybePageAutoUpdate(); // v6.43: one-time nudge for helpers that can't update themselves
+  try{ checkPageStale(); }catch(e){ console.warn('[page-stale]', e); } // v6.63
   // Fresh connect / reconnect: merge disk files and immediately kick live Auto-Rec
   if(helper.ok && !wasOk){
     driveRefresh().catch(function(){}); // v6.35
@@ -2612,6 +2637,19 @@ function updateHomeStreamerUI(){
   if(tog) tog.checked=cfg.returnHomeAfterSet!==false;
   const clr=document.getElementById('clearHomeBtn');
   if(clr) clr.disabled=!cfg.homeStreamer;
+  // v6.62 options
+  const on=cfg.returnHomeAfterSet!==false;
+  const opts=document.getElementById('homeOpts');
+  if(opts){
+    opts.classList.toggle('is-off', !on);
+    opts.querySelectorAll('select,input').forEach(function(x){ x.disabled=!on; });
+  }
+  const sd=document.getElementById('homeSwitchDelay'); if(sd) sd.value=String(normHomeDelay(cfg.homeSwitchDelayMins));
+  const wm=document.getElementById('homeWaitMins'); if(wm) wm.value=String(normHomeWait(cfg.homeWaitMins));
+  const ar=document.getElementById('homeArmIfOff'); if(ar) ar.checked=cfg.homeArmIfOff===true;
+  const bk=document.getElementById('homeBackups'); if(bk && document.activeElement!==bk) bk.value=cfg.homeBackups||'';
+  const og=document.getElementById('homeOnlyGuests'); if(og) og.value=cfg.homeOnlyGuests?'guests':'any';
+  renderHomeReturnStatus();
 }
 function toggleHomeStreamer(username){
   const n=String(username||'').toLowerCase();
@@ -2638,10 +2676,135 @@ function clearHomeStreamer(){
 function saveReturnHomeToggle(){
   const el=document.getElementById('returnHomeToggle');
   cfg.returnHomeAfterSet=el?!!el.checked:true;
+  if(!cfg.returnHomeAfterSet) clearHomeReturn('');
   persist();
+  updateHomeStreamerUI();
   flashOk(cfg.returnHomeAfterSet
     ? 'Return home after set ON — when a guest/DJ goes offline, Auto-Rec starts home if live.'
     : 'Return home after set OFF.');
+}
+/* v6.62: more Return-home options.
+ * Switch after (grace delay, cancelled if the guest comes back live), Wait for home (pending
+ * return started from the normal live poll — no extra Helix calls), Arm home if Auto-Rec is off,
+ * Backup home list, Only return for marked guests. Page-only: with the page closed the helper's
+ * solo watch (v6.49) still starts any Auto-Rec streamer — home included — when it goes live. */
+const HOME_WAIT_TONIGHT_MINS=360;
+let homeReturn=null; // {phase:'delay'|'wait', ended, dueAt, until, backup, homeLiveNotified}
+function normHomeWait(v){
+  if(v==='tonight') return 'tonight';
+  const n=Number(v);
+  return [0,15,30,60,120].indexOf(n)>=0 ? n : 60;
+}
+function normHomeDelay(v){
+  const n=Number(v);
+  return [0,1,2,5].indexOf(n)>=0 ? n : 2;
+}
+function homeWaitWindowMs(){
+  const w=normHomeWait(cfg.homeWaitMins);
+  return (w==='tonight'?HOME_WAIT_TONIGHT_MINS:w)*60000;
+}
+function parseHomeBackups(raw){
+  const home=String(cfg.homeStreamer||'').toLowerCase();
+  const out=[], bad=[];
+  String(raw||'').split(',').forEach(function(part){
+    const u=part.trim().toLowerCase().replace(/^@/,'');
+    if(!u) return;
+    if(!findStreamer(u) || u===home){ if(bad.indexOf(u)<0) bad.push(u); return; }
+    if(out.indexOf(u)<0) out.push(u);
+  });
+  return {list:out, bad:bad};
+}
+function saveHomeOptions(){
+  const sd=document.getElementById('homeSwitchDelay');
+  const wm=document.getElementById('homeWaitMins');
+  const ar=document.getElementById('homeArmIfOff');
+  const bk=document.getElementById('homeBackups');
+  const og=document.getElementById('homeOnlyGuests');
+  if(sd) cfg.homeSwitchDelayMins=normHomeDelay(sd.value);
+  if(wm) cfg.homeWaitMins=normHomeWait(wm.value);
+  if(ar) cfg.homeArmIfOff=!!ar.checked;
+  if(og) cfg.homeOnlyGuests=og.value==='guests';
+  if(bk){
+    const r=parseHomeBackups(bk.value);
+    cfg.homeBackups=r.list.join(', ');
+    bk.value=cfg.homeBackups;
+    if(r.bad.length) flashErr('Backup home ignored (not in your streamer list, or is home): '+r.bad.join(', '));
+  }
+  if(homeReturn && homeReturn.phase==='wait' && normHomeWait(cfg.homeWaitMins)===0) clearHomeReturn('');
+  persist();
+  updateHomeStreamerUI();
+}
+function toggleGuestStreamer(username){
+  const s=findStreamer(String(username||'').toLowerCase());
+  if(!s) return;
+  s.isGuest=!s.isGuest;
+  persist();
+  renderStreamers();
+  flashOk(s.isGuest ? s.username+' marked as guest — their set ending triggers Return home.' : s.username+' is no longer marked as guest.');
+}
+function fmtClock(ms){ return new Date(ms).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}); }
+function renderHomeReturnStatus(){
+  const el=document.getElementById('homeReturnStatus');
+  if(!el) return;
+  if(!homeReturn){ el.classList.add('hidden'); el.innerHTML=''; return; }
+  const home=String(cfg.homeStreamer||'');
+  let t;
+  if(homeReturn.phase==='delay') t='Returning to '+home+' at '+fmtClock(homeReturn.dueAt)+' (if '+homeReturn.ended+' stays offline)';
+  else t='Waiting for '+home+' to go live · until '+fmtClock(homeReturn.until)+(homeReturn.backup?' · backup '+homeReturn.backup+' recording':'');
+  el.innerHTML='⏳ '+t+' · <a href="#" onclick="cancelHomeReturn();return false;" style="color:#bf94ff">Cancel</a>';
+  el.classList.remove('hidden');
+}
+function clearHomeReturn(msg){
+  if(!homeReturn) return;
+  homeReturn=null;
+  if(msg) flashOk(msg);
+  renderHomeReturnStatus();
+}
+function cancelHomeReturn(){ clearHomeReturn('Return home cancelled.'); }
+/** Start u for a return. Arms Auto-Rec when "Arm home if Auto-Rec is off" is on; else skips. */
+function startForReturn(u, label){
+  const hs=findStreamer(u);
+  if(!hs || !hs.isLive) return null;
+  if(isRecording(hs)) return Promise.resolve(); // already on it — no double start
+  if(!hs.autoRec){
+    if(cfg.homeArmIfOff!==true) return null;
+    hs.autoRec=true;
+    persist();
+    if(typeof syncPipelinePrefs==='function') syncPipelinePrefs(false);
+  }
+  flashOk('Returning to '+label+' '+u);
+  fireNotify('tar-home', 'Returning to '+label+' '+u, 'Set ended — starting Auto-Rec for '+u);
+  hs.lastStartFailFlash=0;
+  hs.needArmNotified=false;
+  return Promise.resolve().then(function(){ return startRec(u, true); });
+}
+function executeHomeReturn(ended){
+  const home=String(cfg.homeStreamer||'').toLowerCase();
+  const hs=findStreamer(home);
+  if(!hs){ clearHomeReturn(''); return null; }
+  homeReturn=null;
+  if(hs.isLive){
+    const p=startForReturn(home, 'home streamer');
+    renderHomeReturnStatus();
+    return p;
+  }
+  let p=null, backup='';
+  const bl=parseHomeBackups(cfg.homeBackups).list;
+  for(const b of bl){
+    if(b===ended) continue;
+    const bs=findStreamer(b);
+    if(bs && bs.isLive){
+      p=startForReturn(b, 'backup home');
+      if(p){ backup=b; break; }
+    }
+  }
+  const win=homeWaitWindowMs();
+  if(win>0){
+    homeReturn={phase:'wait', ended:ended, until:Date.now()+win, backup:backup, homeLiveNotified:false};
+    if(!backup) flashOk(home+' is offline — waiting for them to go live until '+fmtClock(homeReturn.until)+'.');
+  }
+  renderHomeReturnStatus();
+  return p;
 }
 /** After a non-home streamer goes offline (set ended), kick home Auto-Rec if eligible. */
 function maybeReturnHome(endedUsername){
@@ -2650,16 +2813,48 @@ function maybeReturnHome(endedUsername){
   if(!home) return null;
   const ended=String(endedUsername||'').toLowerCase();
   if(ended && ended===home) return null; // home itself ended
+  if(!findStreamer(home)) return null;
+  if(cfg.homeOnlyGuests===true){
+    const es=findStreamer(ended);
+    if(!es || !es.isGuest) return null;
+  }
+  const delay=normHomeDelay(cfg.homeSwitchDelayMins)*60000;
+  if(delay>0){
+    homeReturn={phase:'delay', ended:ended, dueAt:Date.now()+delay};
+    renderHomeReturnStatus();
+    return null; // tickHomeReturn() fires it from a later poll
+  }
+  return executeHomeReturn(ended);
+}
+/** Called once per live poll after all statuses are applied. Returns a start Promise or null. */
+function tickHomeReturn(){
+  if(!homeReturn) return null;
+  if(cfg.returnHomeAfterSet===false || !cfg.homeStreamer){ clearHomeReturn(''); return null; }
+  const now=Date.now();
+  const home=String(cfg.homeStreamer).toLowerCase();
   const hs=findStreamer(home);
-  if(!hs) return null;
+  if(!hs){ clearHomeReturn(''); return null; }
+  if(homeReturn.phase==='delay'){
+    const es=findStreamer(homeReturn.ended);
+    if(es && es.isLive){ clearHomeReturn(homeReturn.ended+' is back live — return home cancelled.'); return null; }
+    if(now<homeReturn.dueAt){ renderHomeReturnStatus(); return null; }
+    return executeHomeReturn(homeReturn.ended);
+  }
+  // phase 'wait'
+  if(now>homeReturn.until){ clearHomeReturn('Stopped waiting for '+home+' (window ended).'); return null; }
   if(!hs.isLive) return null;
-  if(!hs.autoRec) return null;
-  if(isRecording(hs)) return null; // already on home — do not steal focus / double-start
-  flashOk('Returning to home streamer '+home);
-  fireNotify('tar-home', 'Returning to home streamer '+home, 'Set ended — starting Auto-Rec for '+home);
-  hs.lastStartFailFlash=0;
-  hs.needArmNotified=false;
-  return Promise.resolve().then(function(){ return startRec(home, true); });
+  const b=homeReturn.backup;
+  const bs=b?findStreamer(b):null;
+  if(bs && isRecording(bs)){
+    // Prefer home, but never stop a recording backup — just tell the user.
+    fireNotify('tar-home', home+' is live', 'Backup '+b+' is still recording — switch manually if you want home.');
+    clearHomeReturn(home+' is live now — backup '+b+' keeps recording (not stopped).');
+    return null;
+  }
+  homeReturn=null;
+  const p=startForReturn(home, 'home streamer');
+  renderHomeReturnStatus();
+  return p;
 }
 
 // ─── GITHUB AUTO-UPDATE (v6.25) ───────────────────────
@@ -2834,7 +3029,7 @@ function renderStreamers(){
     <div class="streamer-row">
       <div class="s-dot" style="background:${s.color}"></div>
       <div>
-        <div class="s-name"><a href="https://www.twitch.tv/${s.username}" target="_blank" rel="noopener" title="Open ${s.username} on Twitch in a new tab">${s.username}</a>
+        <div class="s-name">${s.username}
           ${isHome?'<span class="s-home"> ★ HOME</span>':''}
           ${s.isLive?'<span class="s-live"> ● LIVE</span>':'<span class="s-status"> offline</span>'}
           ${isRecording(s)?'<span class="s-rec"> ● REC</span>':''}
@@ -2846,6 +3041,7 @@ function renderStreamers(){
       </div>
       <div class="streamer-controls">
         <button class="btn btn-sm btn-home ${isHome?'is-home':''}" onclick="toggleHomeStreamer('${s.username}')" title="${isHome?'Clear home streamer':'Set as home streamer (return after guest/DJ set)'}">${isHome?'★ Home':'☆ Home'}</button>
+        ${isHome?'':`<button class="btn btn-sm btn-home ${s.isGuest?'is-home':''}" onclick="toggleGuestStreamer('${s.username}')" title="${s.isGuest?'Unmark guest':'Mark as guest/DJ (used when Only return for = marked guests)'}">${s.isGuest?'♪ Guest':'♩ Guest'}</button>`}
         <div class="s-arm">
           Auto-Rec
           <label class="switch">
@@ -2872,8 +3068,7 @@ function renderStreamers(){
           : (s.captureArmed
           ? `<span class="state-chip" style="background:rgba(16,185,129,.18);color:#6ee7b7;border:1px solid rgba(16,185,129,.35)">ARMED</span>
              <button class="btn btn-gray btn-sm" onclick="disarmCapture('${s.username}')">Disarm</button>`
-          : `<button class="btn btn-purple btn-sm" onclick="openAndArm('${s.username}')" title="Open this streamer's Twitch tab and arm capture for it in one click — then pick that tab in the share picker">↗🎧 Open + Arm</button>
-             <button class="btn btn-purple btn-sm" onclick="armCapture('${s.username}')">🎧 Arm</button>`)}
+          : `<button class="btn btn-purple btn-sm" onclick="armCapture('${s.username}')">🎧 Arm</button>`)}
         <button class="btn btn-red btn-sm" onclick="removeStreamer('${s.username}')">✕</button>
       </div>
     </div>`;
@@ -3184,6 +3379,9 @@ async function pollAll(){
           notePollError(e);
         }
       }
+    }
+    if(liveByLogin){ // v6.62: pending return-home (delay / wait for home)
+      try{ const hp=tickHomeReturn(); if(hp) starts.push(hp); }catch(e){ console.warn('home return', e); }
     }
     // Kick Auto-Rec starts in parallel — don't serialize ~8s helper POSTs behind Helix.
     if(starts.length) await Promise.allSettled(starts);
@@ -3607,35 +3805,6 @@ function armCaptureFromPicker(){
   armCapture(name);
 }
 
-// v6.59: one click opens the streamer's Twitch tab AND arms tab capture for
-// them. window.open and armCapture both run inside the same click gesture, so
-// Chrome still grants getDisplayMedia user activation; the user then picks
-// the just-opened tab in the share picker. Also flips Auto-Rec on if it was
-// off, so the armed capture actually records when the streamer goes live.
-function openAndArm(username){
-  const s=findStreamer(username);
-  if(!s){flashErr('Unknown streamer.');return;}
-  if(!s.autoRec){
-    s.autoRec=true;
-    persist();
-    flashOk('Auto-Rec switched on for '+s.username+'.');
-  }
-  let tab=null;
-  try{ tab=window.open('https://www.twitch.tv/'+s.username, '_blank'); }catch(e){}
-  if(!tab){
-    flashErr('Chrome blocked opening the Twitch tab for '+s.username+' — allow popups for this page, or open twitch.tv/'+s.username+' yourself, then pick that tab in the share picker.');
-  }
-  tarRequestUnmute(s.username, 'open-arm');
-  armCapture(s.username);
-  flashOk('Pick the '+s.username+' tab in the share picker — the one that just opened — and check "Share tab audio".');
-}
-
-function openAndArmFromPicker(){
-  const name=document.getElementById('armPickSel')?.value;
-  if(!name){flashErr('Add a streamer first, then Open + Arm their Twitch tab.');return;}
-  openAndArm(name);
-}
-
 function disarmCapture(username){
   const s=findStreamer(username);
   if(!s) return;
@@ -3936,6 +4105,7 @@ function patchEbmlDuration(bytes,durationSeconds){
 
 // ─── RECORDING (per streamer) ────────────────────────
 async function startRec(forStreamer, isAuto){
+  if(!isAuto && homeReturn) clearHomeReturn('Pending return home cleared (manual start).'); // v6.62
   // Manual Start Now (no username): pick who to start — never silently no-op.
   if(!forStreamer){
     if(helperReady()){
@@ -5661,7 +5831,7 @@ function saveStreamlinkUpdateToggle(){
   persist();
   syncPipelinePrefs(true);
   let msg=cfg.streamlinkUpdate
-    ? 'streamlink will be upgraded automatically (pip installs only) when nothing is recording, removing voice or sending to Drive.'
+    ? 'streamlink will be upgraded automatically (pip installs only) when nothing is recording, removing voice or sending to Drive. If this computer\'s Python is too old for the newest streamlink, the helper sets up its own copy on a newer Python (v6.59).'
     : 'Automatic streamlink updates off — the helper still reports when streamlink is outdated.';
   if(helper.ok && helper.version && helperVerLt(helper.version,'6.55')) msg+=' Needs helper v6.55 — Check for updates → Install update.';
   flashOk(msg);
@@ -5675,12 +5845,18 @@ function streamlinkUpdateText(){
   if(s.state==='missing' || !inst) return 'streamlink: ⚠ not working — '+(s.hint||s.lastResult||'streamlink --version failed');
   let t='streamlink '+inst+(s.installedReleasedAt?' ('+s.installedReleasedAt+')':'');
   if(s.state==='up-to-date') t+=' — up to date';
-  else if(s.state==='python-too-old') t+=' — newest for Python '+(s.pythonVersion||'?')+'; streamlink '+(s.latest||'?')+' needs Python '+(s.latestRequiresPython||'newer');
+  else if(s.state==='python-too-old'){
+    t+=' — newest for Python '+(s.pythonVersion||'?')+'; streamlink '+(s.latest||'?')+' needs Python '+(s.latestRequiresPython||'newer');
+    if(s.lastError && /newer Python/.test(s.lastError)) t+=' — ⚠ '+s.lastError; // v6.59
+  }
+  else if(s.state==='private-waiting') t+=' — streamlink '+(s.latest||'?')+' needs a newer Python; the helper sets up its own copy when idle'+(s.waitingFor?' (waiting: '+s.waitingFor+')':''); // v6.59
+  else if(s.state==='private-building') t+=' — setting up streamlink '+(s.latest||'?')+' on a newer Python…'; // v6.59
   else if(s.state==='waiting-idle') t+=' — '+s.latestCompatible+' available, upgrades when idle'+(s.waitingFor?' (waiting: '+s.waitingFor+')':'');
   else if(s.state==='upgrading' || s.upgrading) t+=' — upgrading to '+s.latestCompatible+'…';
   else if(s.state==='outdated-manual') t+=' — ⚠ outdated ('+s.latestCompatible+' available): '+(s.hint||'update it the way it was installed');
   else if(s.state==='off') t+=' — ⚠ outdated ('+s.latestCompatible+' available; automatic streamlink updates off)';
   else if(s.state==='error') t+=' — ⚠ '+(s.lastError||s.lastResult||'check failed');
+  if(s.private && s.private.active) t+=' (helper\'s own copy, Python '+(s.private.pythonVersion||'?')+')'; // v6.59
   if(s.lastUpgradeTo) t+=' · last auto-upgrade '+(s.lastUpgradeFrom||'?')+' → '+s.lastUpgradeTo+(s.lastUpgradeAt?' at '+auClock(s.lastUpgradeAt):'');
   return t;
 }
@@ -5688,6 +5864,7 @@ function streamlinkBit(){
   const s=helper.streamlinkUpdate;
   if(!helper.ok || !s) return '';
   if(s.state==='upgrading' || s.upgrading) return ' · ⬆ updating streamlink';
+  if(s.state==='private-building') return ' · ⬆ setting up streamlink '+(s.latest||''); // v6.59
   if(s.state==='waiting-idle') return ' · ⬆ streamlink '+s.latestCompatible+' when idle';
   if(s.outdated && (s.state==='outdated-manual' || s.state==='off' || s.state==='error')) return ' · ⚠ streamlink '+s.installed+' outdated';
   return '';
@@ -5772,6 +5949,98 @@ async function maybePageAutoUpdate(){
     pageAutoUpdate.checking=false;
   }
 }
+// ─── v6.63: AN OLD OPEN PAGE RELOADS ITSELF WHEN IDLE ──────────
+// The helper updates itself when idle (v6.43), but a recorder tab left open for days keeps running
+// the page code it loaded — page-side fixes (return home, Auto-Rec decisions, banners) never run
+// until someone refreshes. When the connected helper is newer than this page, show a banner and,
+// with "Install helper updates automatically" on, reload once nothing is going on.
+var pageStale={ since:0, target:'', lastBusyAt:0, lastActAt:Date.now(), loadedAt:Date.now(), reloading:false };
+const PAGE_RELOAD_KEY='tar-page-reload-v1'; // {from, target, at, n} — loop guard, survives the reload
+['pointerdown','keydown','wheel','touchstart'].forEach(function(ev){
+  try{ window.addEventListener(ev, function(){ pageStale.lastActAt=Date.now(); }, {capture:true, passive:true}); }catch(e){}
+});
+function pageReloadGuard(){
+  try{ const g=JSON.parse(localStorage.getItem(PAGE_RELOAD_KEY)||'null'); return (g && typeof g==='object')?g:null; }catch(e){ return null; }
+}
+function pageStaleTarget(){
+  if(!helper.ok || !helper.version) return '';
+  let t=helper.version;
+  // HTML is served from disk: an installed-but-not-restarted update already has the newer page
+  if(helper.diskVersion && _versionIsNewer(helper.diskVersion, t)) t=helper.diskVersion;
+  return _versionIsNewer(t, UI_VERSION)?t:'';
+}
+function pageStaleBusy(){
+  const b=pageAutoUpdateBusy();
+  if(b) return b;
+  if(streamers.some(function(s){ return s && (s.rec || s.captureArmed); })) return 'tab capture armed'; // a reload drops shared tabs
+  if(typeof homeReturn!=='undefined' && homeReturn) return 'waiting to return home';
+  if(helperDropNotified) return 'helper reconnecting';
+  const ae=document.activeElement;
+  if(ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName||'') && ae.type!=='checkbox' && ae.type!=='button') return 'typing';
+  return null;
+}
+function pageHelperUrl(){
+  const h=String(location.hostname||'');
+  if(location.protocol!=='file:' && (h==='127.0.0.1' || h==='localhost')) return '';
+  return 'http://127.0.0.1:8765/';
+}
+function renderPageStaleBanner(target, note){
+  const ban=document.getElementById('pageStaleBanner');
+  if(!ban) return;
+  if(!target){ ban.classList.add('hidden'); ban.innerHTML=''; return; }
+  const alt=pageHelperUrl();
+  ban.innerHTML='⬆ <strong>This page is v'+driveEsc(UI_VERSION)+'</strong> but the helper is <strong>v'+driveEsc(target)+'</strong> — '
+    +'fixes in the newer page aren&#39;t running in this tab until it reloads. '
+    +(note?driveEsc(note)+' ':'')
+    +'<button class="btn btn-gray btn-sm" onclick="reloadStalePage(true)">Reload page now</button>'
+    +(alt?(' <a href="'+alt+'" target="_blank" rel="noopener" style="color:#bf94ff">open the helper&#39;s copy</a>'):'');
+  ban.classList.remove('hidden');
+}
+function reloadStalePage(manual){
+  if(pageStale.reloading) return;
+  if(manual){
+    const why=pageStaleBusy();
+    if(why==='tab capture armed' || why==='recording' || why==='streamer live / recording'){
+      if(!confirm('Reloading now stops tab-capture recordings and un-arms shared tabs on this page ('+why+'). Helper recordings keep going. Reload anyway?')) return;
+    }
+  }
+  const target=pageStale.target||pageStaleTarget();
+  const g=pageReloadGuard();
+  const n=(g && g.from===UI_VERSION && g.target===target)?(Number(g.n)||0)+1:1;
+  try{ localStorage.setItem(PAGE_RELOAD_KEY, JSON.stringify({from:UI_VERSION, target:target, at:Date.now(), n:n})); }catch(e){}
+  try{ persist(); }catch(e){}
+  pageStale.reloading=true;
+  console.log('[page-stale] reloading v'+UI_VERSION+' → v'+target+(manual?' (button)':' (idle)'));
+  try{
+    if(location.protocol==='file:'){ location.reload(); return; }
+    const u=new URL(location.href);
+    u.searchParams.set('tarv', target); // new URL = past any cached copy (GitHub Pages caches ~10 min)
+    location.replace(u.toString());
+  }catch(e){ location.reload(); }
+}
+function checkPageStale(){
+  const now=Date.now();
+  const target=pageStaleTarget();
+  if(!target){ pageStale.since=0; pageStale.target=''; renderPageStaleBanner(''); return; }
+  if(pageStale.target!==target){ pageStale.target=target; pageStale.since=now; }
+  const busy=pageStaleBusy();
+  if(busy) pageStale.lastBusyAt=now;
+  const g=pageReloadGuard();
+  // Already reloaded for this exact version and still old → the server handed back an old copy; don't loop.
+  const tried=!!(g && g.from===UI_VERSION && g.target===target && (Number(g.n)||0)>=1);
+  let note='';
+  if(tried) note='A reload still loaded the old page here'+(pageHelperUrl()?' — this copy comes from '+(location.protocol==='file:'?'a file on disk':location.host)+'.':'.');
+  else if(cfg.autoUpdate===false) note='(Automatic reload is off with "Install helper updates automatically".)';
+  else if(busy) note='It reloads itself once nothing is going on (now: '+busy+').';
+  else note='It reloads itself in a few minutes if nothing is going on.';
+  renderPageStaleBanner(target, note);
+  if(tried || cfg.autoUpdate===false || busy || pageStale.reloading) return;
+  if(now-pageStale.loadedAt < 2*60000) return;       // let a fresh page settle
+  if(now-pageStale.since < 2*60000) return;          // newer for 2+ min (not a restart blip)
+  if(now-pageStale.lastBusyAt < 3*60000) return;     // 3 min since anything was going on
+  if(now-pageStale.lastActAt < 3*60000) return;      // nobody clicking/typing for 3 min
+  reloadStalePage(false);
+}
 function keepAwakeBit(){
   const k=helper.keepAwake;
   if(!helper.ok || !k) return '';
@@ -5785,7 +6054,8 @@ function healthPath(){
   // v6.49: soloWatch=0|1 so the helper keeps (or stops) watching when this page closes
   const armed=streamers.filter(function(s){ return s && s.autoRec; }).map(function(s){ return s.username; });
   const sw=cfg.soloWatch!==false?'1':'0';
-  return '/api/health?armed='+encodeURIComponent(armed.join(','))+'&soloWatch='+sw;
+  // v6.63: page=UI_VERSION so the helper's status file shows which page build is open
+  return '/api/health?armed='+encodeURIComponent(armed.join(','))+'&soloWatch='+sw+'&page='+encodeURIComponent(UI_VERSION);
 }
 function saveDriveOrigToggle(){
   const el=document.getElementById('driveOrigToggle');

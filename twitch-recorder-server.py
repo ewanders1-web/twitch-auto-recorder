@@ -21,7 +21,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.62"
+HELPER_VERSION = "6.63"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4421,6 +4421,7 @@ def self_test():
     _self_test_v659()  # v6.59
     _self_test_v660()  # v6.60
     _self_test_v661()  # v6.61
+    _self_test_v663()  # v6.63
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -10941,7 +10942,23 @@ def status_file_enabled():
         return PIPELINE.get("statusToDrive", True) is not False
 
 
-def note_page_seen(raw_armed):
+def _clean_page_version(raw):
+    """v6.63: the page's own version from the heartbeat (?page=6.63); None when absent/garbage."""
+    v = str(raw or "").strip()
+    if not v or len(v) > 16 or not re.match(r"^\d+(\.\d+){0,3}$", v):
+        return None
+    return v
+
+
+def page_version_outdated(page_version, helper_version=None):
+    """v6.63: True when the open recorder page is an older build than this helper."""
+    pv = _clean_page_version(page_version)
+    if not pv:
+        return False
+    return _parse_version_tuple(pv) < _parse_version_tuple(helper_version or HELPER_VERSION)
+
+
+def note_page_seen(raw_armed, page_version=None):
     users = []
     for part in str(raw_armed or "").split(","):
         u = safe_username(part)
@@ -10953,6 +10970,10 @@ def note_page_seen(raw_armed):
         changed = users != PAGE_SEEN.get("armed")
         PAGE_SEEN["at"] = time.time()
         PAGE_SEEN["armed"] = users
+        pv = _clean_page_version(page_version)  # v6.63
+        if pv and pv != PAGE_SEEN.get("version"):
+            PAGE_SEEN["version"] = pv
+            changed = True
     # v6.49: persist armed list for solo-watch (empty = user cleared Auto-Rec — clear disk too)
     try:
         solo_watch_set_armed_users(users, explicit_empty=True)
@@ -11062,6 +11083,7 @@ def build_status_doc(now=None):
     with STATUS_FILE_LOCK:
         page_at = float(PAGE_SEEN.get("at") or 0.0)
         armed = list(PAGE_SEEN.get("armed") or [])
+        page_ver = PAGE_SEEN.get("version")  # v6.63
     page_open = bool(page_at) and now - page_at < PAGE_HEARTBEAT_STALE_SECS  # v6.46
     recording = []
     for u, a in sorted(active_items):
@@ -11118,6 +11140,9 @@ def build_status_doc(now=None):
         "recorderPageOpen": page_open,
         "recorderPageLastSeen": _iso_local(page_at) if page_at else None,
         "autoRecArmed": armed if page_open else [],
+        # v6.63: which build the open page runs (an old tab misses page-side fixes until reloaded)
+        "recorderPageVersion": page_ver if page_open else None,
+        "recorderPageOutdated": bool(page_open and page_version_outdated(page_ver)),
         "recording": recording,
         "lastErrors": {u: _short(e) for u, e in last_errors.items()},
         "voiceRemoval": {"running": int(q.get("running") or 0), "waiting": int(q.get("waiting") or 0)},
@@ -11216,7 +11241,15 @@ def render_status_text(doc):
     L.append(disk)
     if doc.get("recorderPageOpen"):
         armed = doc.get("autoRecArmed") or []
-        L.append("Recorder page: open; Auto-Rec armed for " + (", ".join(armed) if armed else "nobody"))
+        pv = doc.get("recorderPageVersion")  # v6.63
+        pv_txt = ""
+        if pv and doc.get("recorderPageOutdated"):
+            how = ("it reloads itself when idle, or refresh it" if not page_version_outdated(pv, "6.63")
+                   else "refresh it once — pages older than v6.63 don't reload themselves")
+            pv_txt = f" (page v{pv} is OLDER than helper v{doc['helperVersion']} — {how})"
+        elif pv:
+            pv_txt = f" (page v{pv})"
+        L.append("Recorder page: open" + pv_txt + "; Auto-Rec armed for " + (", ".join(armed) if armed else "nobody"))
     else:
         seen = doc.get("recorderPageLastSeen")
         sw = doc.get("soloWatch") or {}
@@ -11573,7 +11606,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError as e:
                 self.send_text(f"Could not read {HTML_NAME}: {e}", status=500)
                 return
-            self.send_text(data, status=200, content_type="text/html; charset=utf-8")
+            # v6.63: never let the browser reuse an old copy after an auto-update
+            self.send_response(200)
+            self._cors()
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, must-revalidate")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
             return
         if path == "/api/health":
             # v6.40: ?armed=a,b — page heartbeat of Auto-Rec streamers (keep-awake while armed)
@@ -11582,7 +11622,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 q = urllib.parse.parse_qs(parsed.query or "", keep_blank_values=True)
                 if "armed" in q:
                     note_armed_heartbeat(q.get("armed", [""])[0])
-                    note_page_seen(q.get("armed", [""])[0])  # v6.41 status file
+                    note_page_seen(q.get("armed", [""])[0], (q.get("page") or [""])[0])  # v6.41 status file; v6.63 page version
                 if "soloWatch" in q:
                     raw_sw = (q.get("soloWatch") or ["1"])[0]
                     on = str(raw_sw).strip().lower() not in ("0", "false", "off", "no")
@@ -12090,6 +12130,50 @@ def _launcher_kick_loop(label):
         except Exception as e:
             log(f"launcher kick: {e}")
         time.sleep(60)
+
+
+def _self_test_v663():
+    """v6.63: page version from the heartbeat is cleaned, compared, and shown in the status doc/text."""
+    assert _clean_page_version("6.63") == "6.63"
+    assert _clean_page_version(" 6.9 ") == "6.9"
+    for bad in ("", None, "abc", "6.63<script>", "1" * 20, "6..1"):
+        assert _clean_page_version(bad) is None, bad
+    assert page_version_outdated("6.58", "6.63") is True
+    assert page_version_outdated("6.63", "6.63") is False
+    assert page_version_outdated("6.64", "6.63") is False
+    assert page_version_outdated("6.9", "6.10") is True  # numeric, not string, compare
+    assert page_version_outdated(None, "6.63") is False
+    with STATUS_FILE_LOCK:
+        prev = dict(PAGE_SEEN)
+    prev_users = None
+    with SOLO_WATCH_LOCK:
+        prev_users = dict(SOLO_WATCH.get("users") or {})
+    global solo_watch_save_locked
+    real_save = solo_watch_save_locked
+    solo_watch_save_locked = lambda: None  # don't touch the real solo-watch file
+    try:
+        note_page_seen("whistleface", "6.58")
+        with STATUS_FILE_LOCK:
+            assert PAGE_SEEN.get("version") == "6.58"
+        note_page_seen("whistleface", "junk!")  # garbage keeps the last good value
+        with STATUS_FILE_LOCK:
+            assert PAGE_SEEN.get("version") == "6.58"
+        doc = {"computer": "T", "updatedAt": "x", "staleAfterSecs": 900, "helperVersion": "6.63",
+               "helperStartedAt": "x", "streamlink": True, "ffmpeg": True, "demucs": True,
+               "recorderPageOpen": True, "autoRecArmed": ["whistleface"],
+               "recorderPageVersion": "6.58", "recorderPageOutdated": True}
+        txt = "\n".join(render_status_text(doc).splitlines()[:8])
+        assert "page v6.58 is OLDER than helper v6.63" in txt, txt
+        doc["recorderPageVersion"], doc["recorderPageOutdated"] = "6.63", False
+        txt = "\n".join(render_status_text(doc).splitlines()[:8])
+        assert "(page v6.63)" in txt and "OLDER" not in txt, txt
+    finally:
+        solo_watch_save_locked = real_save
+        with STATUS_FILE_LOCK:
+            PAGE_SEEN.clear()
+            PAGE_SEEN.update(prev)
+        with SOLO_WATCH_LOCK:
+            SOLO_WATCH["users"] = prev_users
 
 
 def _self_test_v661():

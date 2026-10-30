@@ -220,7 +220,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.62</span>
+    <span class="badge">v6.63</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -271,6 +271,8 @@
     <div id="driveAccessBanner" class="alert alert-err hidden" role="status"></div>
     <!-- v6.56: sticky when the local helper can't be reached (not running / crashed) -->
     <div id="helperDownBanner" class="alert alert-err hidden" role="status"></div>
+    <!-- v6.63: this open page is an older build than the helper (tab left open across an auto-update) -->
+    <div id="pageStaleBanner" class="alert alert-info hidden" role="status"></div>
 
     <!-- live now banners -->
     <div id="liveNowBox"></div>
@@ -572,7 +574,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.62'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.63'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -1540,6 +1542,7 @@ function pingHelperAndStatus(){
   updateStatusUI();
   renderStreamers();
   maybePageAutoUpdate(); // v6.43: one-time nudge for helpers that can't update themselves
+  try{ checkPageStale(); }catch(e){ console.warn('[page-stale]', e); } // v6.63
   // Fresh connect / reconnect: merge disk files and immediately kick live Auto-Rec
   if(helper.ok && !wasOk){
     driveRefresh().catch(function(){}); // v6.35
@@ -5946,6 +5949,98 @@ async function maybePageAutoUpdate(){
     pageAutoUpdate.checking=false;
   }
 }
+// ─── v6.63: AN OLD OPEN PAGE RELOADS ITSELF WHEN IDLE ──────────
+// The helper updates itself when idle (v6.43), but a recorder tab left open for days keeps running
+// the page code it loaded — page-side fixes (return home, Auto-Rec decisions, banners) never run
+// until someone refreshes. When the connected helper is newer than this page, show a banner and,
+// with "Install helper updates automatically" on, reload once nothing is going on.
+var pageStale={ since:0, target:'', lastBusyAt:0, lastActAt:Date.now(), loadedAt:Date.now(), reloading:false };
+const PAGE_RELOAD_KEY='tar-page-reload-v1'; // {from, target, at, n} — loop guard, survives the reload
+['pointerdown','keydown','wheel','touchstart'].forEach(function(ev){
+  try{ window.addEventListener(ev, function(){ pageStale.lastActAt=Date.now(); }, {capture:true, passive:true}); }catch(e){}
+});
+function pageReloadGuard(){
+  try{ const g=JSON.parse(localStorage.getItem(PAGE_RELOAD_KEY)||'null'); return (g && typeof g==='object')?g:null; }catch(e){ return null; }
+}
+function pageStaleTarget(){
+  if(!helper.ok || !helper.version) return '';
+  let t=helper.version;
+  // HTML is served from disk: an installed-but-not-restarted update already has the newer page
+  if(helper.diskVersion && _versionIsNewer(helper.diskVersion, t)) t=helper.diskVersion;
+  return _versionIsNewer(t, UI_VERSION)?t:'';
+}
+function pageStaleBusy(){
+  const b=pageAutoUpdateBusy();
+  if(b) return b;
+  if(streamers.some(function(s){ return s && (s.rec || s.captureArmed); })) return 'tab capture armed'; // a reload drops shared tabs
+  if(typeof homeReturn!=='undefined' && homeReturn) return 'waiting to return home';
+  if(helperDropNotified) return 'helper reconnecting';
+  const ae=document.activeElement;
+  if(ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName||'') && ae.type!=='checkbox' && ae.type!=='button') return 'typing';
+  return null;
+}
+function pageHelperUrl(){
+  const h=String(location.hostname||'');
+  if(location.protocol!=='file:' && (h==='127.0.0.1' || h==='localhost')) return '';
+  return 'http://127.0.0.1:8765/';
+}
+function renderPageStaleBanner(target, note){
+  const ban=document.getElementById('pageStaleBanner');
+  if(!ban) return;
+  if(!target){ ban.classList.add('hidden'); ban.innerHTML=''; return; }
+  const alt=pageHelperUrl();
+  ban.innerHTML='⬆ <strong>This page is v'+driveEsc(UI_VERSION)+'</strong> but the helper is <strong>v'+driveEsc(target)+'</strong> — '
+    +'fixes in the newer page aren&#39;t running in this tab until it reloads. '
+    +(note?driveEsc(note)+' ':'')
+    +'<button class="btn btn-gray btn-sm" onclick="reloadStalePage(true)">Reload page now</button>'
+    +(alt?(' <a href="'+alt+'" target="_blank" rel="noopener" style="color:#bf94ff">open the helper&#39;s copy</a>'):'');
+  ban.classList.remove('hidden');
+}
+function reloadStalePage(manual){
+  if(pageStale.reloading) return;
+  if(manual){
+    const why=pageStaleBusy();
+    if(why==='tab capture armed' || why==='recording' || why==='streamer live / recording'){
+      if(!confirm('Reloading now stops tab-capture recordings and un-arms shared tabs on this page ('+why+'). Helper recordings keep going. Reload anyway?')) return;
+    }
+  }
+  const target=pageStale.target||pageStaleTarget();
+  const g=pageReloadGuard();
+  const n=(g && g.from===UI_VERSION && g.target===target)?(Number(g.n)||0)+1:1;
+  try{ localStorage.setItem(PAGE_RELOAD_KEY, JSON.stringify({from:UI_VERSION, target:target, at:Date.now(), n:n})); }catch(e){}
+  try{ persist(); }catch(e){}
+  pageStale.reloading=true;
+  console.log('[page-stale] reloading v'+UI_VERSION+' → v'+target+(manual?' (button)':' (idle)'));
+  try{
+    if(location.protocol==='file:'){ location.reload(); return; }
+    const u=new URL(location.href);
+    u.searchParams.set('tarv', target); // new URL = past any cached copy (GitHub Pages caches ~10 min)
+    location.replace(u.toString());
+  }catch(e){ location.reload(); }
+}
+function checkPageStale(){
+  const now=Date.now();
+  const target=pageStaleTarget();
+  if(!target){ pageStale.since=0; pageStale.target=''; renderPageStaleBanner(''); return; }
+  if(pageStale.target!==target){ pageStale.target=target; pageStale.since=now; }
+  const busy=pageStaleBusy();
+  if(busy) pageStale.lastBusyAt=now;
+  const g=pageReloadGuard();
+  // Already reloaded for this exact version and still old → the server handed back an old copy; don't loop.
+  const tried=!!(g && g.from===UI_VERSION && g.target===target && (Number(g.n)||0)>=1);
+  let note='';
+  if(tried) note='A reload still loaded the old page here'+(pageHelperUrl()?' — this copy comes from '+(location.protocol==='file:'?'a file on disk':location.host)+'.':'.');
+  else if(cfg.autoUpdate===false) note='(Automatic reload is off with "Install helper updates automatically".)';
+  else if(busy) note='It reloads itself once nothing is going on (now: '+busy+').';
+  else note='It reloads itself in a few minutes if nothing is going on.';
+  renderPageStaleBanner(target, note);
+  if(tried || cfg.autoUpdate===false || busy || pageStale.reloading) return;
+  if(now-pageStale.loadedAt < 2*60000) return;       // let a fresh page settle
+  if(now-pageStale.since < 2*60000) return;          // newer for 2+ min (not a restart blip)
+  if(now-pageStale.lastBusyAt < 3*60000) return;     // 3 min since anything was going on
+  if(now-pageStale.lastActAt < 3*60000) return;      // nobody clicking/typing for 3 min
+  reloadStalePage(false);
+}
 function keepAwakeBit(){
   const k=helper.keepAwake;
   if(!helper.ok || !k) return '';
@@ -5959,7 +6054,8 @@ function healthPath(){
   // v6.49: soloWatch=0|1 so the helper keeps (or stops) watching when this page closes
   const armed=streamers.filter(function(s){ return s && s.autoRec; }).map(function(s){ return s.username; });
   const sw=cfg.soloWatch!==false?'1':'0';
-  return '/api/health?armed='+encodeURIComponent(armed.join(','))+'&soloWatch='+sw;
+  // v6.63: page=UI_VERSION so the helper's status file shows which page build is open
+  return '/api/health?armed='+encodeURIComponent(armed.join(','))+'&soloWatch='+sw+'&page='+encodeURIComponent(UI_VERSION);
 }
 function saveDriveOrigToggle(){
   const el=document.getElementById('driveOrigToggle');
