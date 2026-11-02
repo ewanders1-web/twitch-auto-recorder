@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import socket  # v6.38: computer name for no-clobber Drive copies
+import posixpath  # v6.65: macOS plist / Full Disk Access paths are POSIX data on every OS
 import ntpath  # v6.38: Windows Drive for Desktop detection (unit-testable on any OS)
 import time
 import datetime  # v6.41: local timestamps in the Drive status file
@@ -21,7 +22,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.64"
+HELPER_VERSION = "6.65"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4431,6 +4432,7 @@ def self_test():
     _self_test_v661()  # v6.61
     _self_test_v663()  # v6.63
     _self_test_v664()  # v6.64
+    _self_test_v665()  # v6.65
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -12017,6 +12019,32 @@ DRIVE_ACCESS = {"lastProbeAt": 0.0, "lastProbeOk": None, "lastProbeError": None,
                 "blockedSince": 0.0, "restoredAt": 0.0, "lastKick": None}
 
 
+def _mac_path_real(p):
+    """v6.65: resolve a macOS (POSIX) path without letting Windows' os.path rewrite it.
+
+    On Windows os.path.realpath('/Library/...') becomes 'C:\\Library\\...' — that broke the
+    v6.56 self-test on Windows PCs and blocked auto-updates. POSIX-looking paths (leading '/') use
+    posixpath; they are only resolved against the real filesystem on macOS/Linux."""
+    p = str(p)
+    if p.startswith("/"):
+        if os.name == "nt" or os.path is not posixpath:
+            return posixpath.normpath(p)
+        try:
+            return posixpath.realpath(p)
+        except OSError:
+            return posixpath.normpath(p)
+    try:
+        return os.path.realpath(p)
+    except OSError:
+        return p
+
+
+def _mac_join(base, *parts):
+    """v6.65: join onto a POSIX base with '/', never '\\'."""
+    base = str(base)
+    return posixpath.join(base, *parts) if base.startswith("/") else os.path.join(base, *parts)
+
+
 def fda_paths(executable=None, base_prefix=None, exists=None):
     """Paths to add under Full Disk Access (pure-ish, unit-testable).
 
@@ -12024,7 +12052,7 @@ def fda_paths(executable=None, base_prefix=None, exists=None):
     framework Python also its Python.app, because that stub re-launches Python.app and macOS may
     check either one."""
     exists = exists or os.path.exists
-    exe = os.path.realpath(executable or sys.executable or "python3")
+    exe = _mac_path_real(executable or sys.executable or "python3")  # v6.65
     out = [exe]
     if executable is None:  # v6.60: the binary launchd really runs (plist ProgramArguments[0]) first
         try:
@@ -12032,13 +12060,13 @@ def fda_paths(executable=None, base_prefix=None, exists=None):
             if lp.get("shim") and lp.get("realInterpreter"):
                 out = [lp["realInterpreter"]] + [x for x in out if x != lp["realInterpreter"]]
             elif lp.get("plistProgram"):
-                rp = os.path.realpath(lp["plistProgram"])
+                rp = _mac_path_real(lp["plistProgram"])  # v6.65
                 out = [rp] + [x for x in out if x != rp]
         except Exception:
             pass
     pre = base_prefix if base_prefix is not None else getattr(sys, "base_prefix", "") or ""
     if pre:
-        app = os.path.join(pre, "Resources", "Python.app")
+        app = _mac_join(pre, "Resources", "Python.app")  # v6.65
         if exists(app) and app not in out:
             out.append(app)
     return out
@@ -12060,14 +12088,14 @@ def is_python_shim(path):
     """True for /usr/bin/python3 (xcode-select tool shim) or anything else under /usr/bin."""
     if not path:
         return False
-    p = os.path.normpath(str(path))
+    p = str(path)
+    if p.startswith("/"):  # v6.65: plist values are POSIX paths — never os.path (ntpath on Windows)
+        p = posixpath.normpath(p)
     if p.startswith("/usr/bin/"):
         return True
-    try:
-        rp = os.path.realpath(p)
-    except OSError:
-        rp = p
-    return rp.startswith("/usr/bin/") or "xcode_select" in os.path.basename(rp)
+    rp = _mac_path_real(p)
+    base = posixpath.basename(rp) if rp.startswith("/") else os.path.basename(rp)
+    return rp.startswith("/usr/bin/") or "xcode_select" in base
 
 
 def real_interpreter(executable=None, base_executable=None, exists=None):
@@ -12077,12 +12105,12 @@ def real_interpreter(executable=None, base_executable=None, exists=None):
     for c in (base_executable if base_executable is not None else getattr(sys, "_base_executable", None),
               executable if executable is not None else sys.executable):
         if c:
-            cands.append(os.path.realpath(c))
+            cands.append(_mac_path_real(c))  # v6.65
     if base_executable is None and executable is None:
         pre = getattr(sys, "base_prefix", "") or ""
         if pre:
             v = f"{sys.version_info[0]}.{sys.version_info[1]}"
-            cands.append(os.path.join(pre, "bin", f"python{v}"))
+            cands.append(_mac_join(pre, "bin", f"python{v}"))  # v6.65
     for c in cands:
         if c and not is_python_shim(c) and exists(c):
             return c
@@ -12453,6 +12481,28 @@ def _self_test_v660():
     finally:
         with LAUNCHER_LOCK:
             LAUNCHER_STATE.clear(); LAUNCHER_STATE.update(saved)
+
+
+def _self_test_v665():
+    """v6.65: macOS plist / Full Disk Access path logic must give the same answers when os.path is
+    ntpath (Windows). A Windows helper runs this self-test on every downloaded update; v6.64's
+    v6.56 FDA test failed there ('C:\\Library\\...') and blocked auto-update."""
+    pre = "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9"
+    real = "/opt/fake/Versions/3.9/bin/python3.9"
+    saved_path = os.path
+    try:
+        for mod in (ntpath, saved_path):
+            os.path = mod
+            ps = fda_paths(pre + "/bin/python3.9", pre, exists=lambda p: True)
+            assert ps == [pre + "/bin/python3.9", pre + "/Resources/Python.app"], (mod.__name__, ps)
+            assert is_python_shim("/usr/bin/python3") and is_python_shim("/usr/bin/../bin/python3")
+            assert not is_python_shim(pre + "/bin/python3.9"), mod.__name__
+            assert real_interpreter(executable="/usr/bin/python3", base_executable=real,
+                                    exists=lambda p: True) == real, mod.__name__
+            assert real_interpreter(executable="/usr/bin/python3", base_executable="/usr/bin/python3",
+                                    exists=lambda p: True) is None
+    finally:
+        os.path = saved_path
 
 
 def drive_stuck_counts():
