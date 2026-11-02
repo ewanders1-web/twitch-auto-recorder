@@ -220,7 +220,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.63</span>
+    <span class="badge">v6.64</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -574,7 +574,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.63'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.64'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -614,6 +614,12 @@ let helperPingChain = Promise.resolve();
 let chosenFmt = null, recordings = [], restoredFmtMime = null;
 let needsRearmNotice = false; // MediaStreams cannot be persisted across reloads
 let lastPollErrAt = 0;
+// v6.64: can this page see Twitch go-lives? Reported to the helper (?tw=) so it keeps watching
+// armed streamers itself while the page can't (Connect failed after a reboot/wake before Wi-Fi was
+// up, Helix keeps failing, no Client ID/Secret here). A failed Connect also retries by itself.
+const TW_PAGE_T0 = Date.now();
+let twConnecting = false, twUserOff = false, twConnectedAt = 0, twLastOkAt = 0, twPollFailing = false;
+let twRetryTimer = null, twRetryN = 0, twRetryAt = 0;
 
 // Streamer list:
 // { username, broadcasterId, color, autoRec, isLive, liveData,
@@ -2340,7 +2346,7 @@ function updateHelperBar(){
   const dot=document.getElementById('helperDot');
   const txt=document.getElementById('helperTxt');
   if(!dot||!txt) return;
-  const pendingBit=(helper.pendingRestart?(' · restart pending (disk v'+(helper.diskVersion||'?')+')'):'')+keepAwakeBit()+autoUpdateBit()+streamlinkBit(); // v6.40 keep-awake bit · v6.43 auto-update bit · v6.55 streamlink bit
+  const pendingBit=(helper.pendingRestart?(' · restart pending (disk v'+(helper.diskVersion||'?')+')'):'')+keepAwakeBit()+autoUpdateBit()+streamlinkBit()+twitchWatchBit(); // v6.64 twitch-watch bit · v6.40 keep-awake bit · v6.43 auto-update bit · v6.55 streamlink bit
   if(helper.ok && helper.streamlink){
     const diskBit=(helper.diskFree!=null)?(' · '+fmtDiskBytes(helper.diskFree)+' free'):'';
     const demucsBit=helper.demucs?'':(voiceReady()?' · voice removal: Fast (no demucs)':' · demucs missing');
@@ -3120,9 +3126,13 @@ async function getBroadcasterId(login){
 }
 
 // ─── CONNECT ─────────────────────────────────────────
-async function connectAPI(){
-  saveCreds(); saveInterval();
+async function connectAPI(auto){
+  if(auto!==true){ saveCreds(); saveInterval(); twRetryN=0; }
+  twUserOff=false; // v6.64
+  if(twRetryTimer){ clearTimeout(twRetryTimer); twRetryTimer=null; twRetryAt=0; }
   if(!cfg.clientId||!cfg.clientSecret){setupMsg('error','Enter Client ID and Secret.');return;}
+  if(twConnecting) return;
+  twConnecting=true;
   setApiDot('spin','Connecting…'); setupMsg('info','Testing…');
   pingHelperAndStatus().catch(()=>{});
   try{
@@ -3132,16 +3142,66 @@ async function connectAPI(){
       if(!s.broadcasterId) s.broadcasterId=await getBroadcasterId(s.username).catch(()=>null);
     }
     connected=true;
+    twConnecting=false; twConnectedAt=Date.now(); twLastOkAt=0; twRetryN=0; twPollFailing=false; // v6.64
     setApiDot('ok',`Connected — polling ${streamers.length} streamer(s) every ${cfg.interval}s`);
     setupMsg('ok','✅ Connected! Polling started.');
     startPolling();
     await loadSchedule();
     renderStreamers();
-  }catch(e){setApiDot('err','Failed'); setupMsg('error','❌ '+e.message);}
+  }catch(e){
+    twConnecting=false;
+    const wait=scheduleTwReconnect(); // v6.64: a failed Connect (offline after wake/reboot) retries by itself
+    setApiDot('err','Not connected — '+(e&&e.message?e.message:'failed')+(wait?(' · trying again in '+fmtTwWait(wait)+(helperWatchingForPage()?'; helper is watching armed streamers meanwhile':'')):''));
+    setupMsg('error','❌ '+(e&&e.message?e.message:e)+(wait?(' — trying again by itself in '+fmtTwWait(wait)+'.'):''));
+  }finally{
+    twConnecting=false;
+  }
+}
+// v6.64: retry a failed Connect (20 s, 40 s, 80 s … max 5 min) while Client ID/Secret are saved
+function scheduleTwReconnect(){
+  if(twUserOff || connected || !cfg.clientId || !cfg.clientSecret) return 0;
+  if(twRetryTimer) clearTimeout(twRetryTimer);
+  const ms=Math.min(300000, 20000*Math.pow(2, Math.min(twRetryN, 4)));
+  twRetryN++;
+  twRetryAt=Date.now()+ms;
+  twRetryTimer=setTimeout(function(){ twRetryTimer=null; twRetryAt=0; if(!connected && !twUserOff) connectAPI(true); }, ms);
+  return ms;
+}
+function retryTwConnectSoon(){
+  if(connected || twUserOff || twConnecting || !cfg.clientId || !cfg.clientSecret) return;
+  if(!twRetryTimer) return; // only after a failed Connect
+  if(twRetryTimer){ clearTimeout(twRetryTimer); twRetryTimer=null; twRetryAt=0; }
+  connectAPI(true);
+}
+function fmtTwWait(ms){
+  const s=Math.max(1, Math.round(ms/1000));
+  return s<90?(s+' s'):(Math.round(s/60)+' min');
+}
+function twitchWatchState(){
+  if(!cfg.clientId || !cfg.clientSecret) return 'nocreds';
+  if(!connected){
+    if(twUserOff) return 'user-off';
+    if(twConnecting || Date.now()-TW_PAGE_T0<60000) return 'wait';
+    return 'off';
+  }
+  const staleMs=Math.max(150000, 3*Math.max(15, cfg.interval||30)*1000);
+  if(!twLastOkAt) return (Date.now()-twConnectedAt<staleMs)?'wait':'err';
+  return (Date.now()-twLastOkAt>staleMs)?'err':'ok';
+}
+function helperWatchingForPage(){
+  const sw=helper.soloWatch;
+  return !!(helper.ok && sw && sw.active && sw.reason==='page-cant-see-twitch');
+}
+function twitchWatchBit(){
+  if(!helperWatchingForPage()) return '';
+  const who=(helper.soloWatch.users||[]).slice(0,4).join(', ');
+  return ' · 👀 helper watching '+(who||'armed streamers')+' (this page can\'t check Twitch)';
 }
 
 function disconnectAPI(){
   stopPolling(); token=null; tokenExpiry=0; connected=false;
+  twUserOff=true; twLastOkAt=0; twPollFailing=false; // v6.64: on purpose — no auto-retry
+  if(twRetryTimer){ clearTimeout(twRetryTimer); twRetryTimer=null; twRetryAt=0; }
   streamers.forEach(s=>{s.isLive=false;s.liveData=null;});
   setApiDot('','Not connected');document.getElementById('apiDot').className='dot';
   updateStatusUI();
@@ -3206,6 +3266,13 @@ async function fetchStreamsByLogins(logins){
   return liveByLogin;
 }
 
+function notePollOk(){
+  twLastOkAt=Date.now();
+  if(twPollFailing){
+    twPollFailing=false;
+    setApiDot('ok',`Connected — polling ${streamers.length} streamer(s) every ${cfg.interval}s`);
+  }
+}
 function notePollError(e){
   const now=Date.now();
   if(now-lastPollErrAt>=60000){
@@ -3364,9 +3431,13 @@ async function pollAll(){
     if(streamers.length){
       try{
         liveByLogin=await fetchStreamsByLogins(streamers.map(s=>s.username));
+        notePollOk(); // v6.64
       }catch(e){
+        twPollFailing=true;
         notePollError(e);
       }
+    }else{
+      notePollOk();
     }
     await helperP;
     if(liveByLogin){
@@ -6055,7 +6126,8 @@ function healthPath(){
   const armed=streamers.filter(function(s){ return s && s.autoRec; }).map(function(s){ return s.username; });
   const sw=cfg.soloWatch!==false?'1':'0';
   // v6.63: page=UI_VERSION so the helper's status file shows which page build is open
-  return '/api/health?armed='+encodeURIComponent(armed.join(','))+'&soloWatch='+sw+'&page='+encodeURIComponent(UI_VERSION);
+  // v6.64: tw=ok|wait|off|err|nocreds|user-off — helper watches by itself while this page can't see Twitch
+  return '/api/health?armed='+encodeURIComponent(armed.join(','))+'&soloWatch='+sw+'&page='+encodeURIComponent(UI_VERSION)+'&tw='+twitchWatchState();
 }
 function saveDriveOrigToggle(){
   const el=document.getElementById('driveOrigToggle');
@@ -6307,7 +6379,10 @@ setInterval(function(){
   });
 }, 1000);
 recoverIdbRecordings();
-if(cfg.clientId && cfg.clientSecret) connectAPI();
+if(cfg.clientId && cfg.clientSecret) connectAPI(true);
+// v6.64: network back / tab shown again → retry a failed Connect right away
+window.addEventListener('online', function(){ retryTwConnectSoon(); });
+document.addEventListener('visibilitychange', function(){ if(!document.hidden) retryTwConnectSoon(); });
 
 </script>
 </body>

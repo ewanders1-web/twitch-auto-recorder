@@ -21,7 +21,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.63"
+HELPER_VERSION = "6.64"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -80,6 +80,14 @@ RESTART_GRACE_BACKOFFS = (15, 20, 30)  # once normal retries are used up; caps a
 # v6.46: same window as status-file recorderPageOpen — after this, the page is gone
 # and restart_grace_applies treats the helper as running alone.
 PAGE_HEARTBEAT_STALE_SECS = float(os.environ.get("TWITCH_RECORDER_PAGE_STALE_SECS") or 120)
+# v6.64: an OPEN recorder page that can't check Twitch (Connect failed after a reboot/wake before
+# Wi-Fi was up, poll errors for minutes, no Client ID/Secret on this browser) used to switch the
+# helper's own watching off just by heartbeating — nobody noticed a go-live. The page now reports
+# ?tw=ok|wait|off|err|nocreds|user-off and the helper keeps watching armed streamers itself while
+# the page says it can't see Twitch. TWITCH_RECORDER_SOLO_COVER_PAGE=0 restores the old behaviour.
+SOLO_COVER_PAGE = str(os.environ.get("TWITCH_RECORDER_SOLO_COVER_PAGE") or "1").strip().lower() not in ("0", "false", "off", "no")
+PAGE_TWITCH_STATES = ("ok", "wait", "off", "err", "nocreds", "user-off")
+PAGE_TWITCH_COVER = ("off", "err", "nocreds")  # page can't see go-lives → helper watches
 # v6.49: when the recorder page is closed/stale, the helper itself polls whether
 # persisted Auto-Rec armed streamers are live and starts recording (same path as /api/record).
 # Env: TWITCH_RECORDER_SOLO_WATCH_SECS (default 60; 0 disables). Startup delay gives the page
@@ -4422,6 +4430,7 @@ def self_test():
     _self_test_v660()  # v6.60
     _self_test_v661()  # v6.61
     _self_test_v663()  # v6.63
+    _self_test_v664()  # v6.64
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -7864,7 +7873,9 @@ def keep_awake_armed_users(now=None):
     with STATUS_FILE_LOCK:
         at = float(PAGE_SEEN.get("at") or 0.0)
         page_armed = list(PAGE_SEEN.get("armed") or [])
-    if at and now - at <= PAGE_HEARTBEAT_STALE_SECS:
+        page_tw = PAGE_SEEN.get("twitch")
+    # v6.64: an unconfigured page (no Twitch creds, nobody armed) doesn't override the saved list
+    if at and now - at <= PAGE_HEARTBEAT_STALE_SECS and not (page_tw == "nocreds" and not page_armed):
         return page_armed
     with SOLO_WATCH_LOCK:
         return list((SOLO_WATCH.get("users") or {}).keys())
@@ -10727,6 +10738,11 @@ def solo_watch_should_run(now=None, helper_started_at=None):
         if not seen_at:
             return False, "startup-delay"
     if not page_heartbeat_is_stale(now):
+        # v6.64: the page is open but says it can't see Twitch → keep watching anyway
+        with STATUS_FILE_LOCK:
+            tw = PAGE_SEEN.get("twitch")
+        if SOLO_COVER_PAGE and tw in PAGE_TWITCH_COVER:
+            return True, "page-cant-see-twitch"
         return False, "page-open"
     return True, "page-closed"
 
@@ -10744,6 +10760,8 @@ def solo_watch_snapshot():
             "startedByHelper": started,
             "intervalSecs": SOLO_WATCH_SECS,
             "startupDelaySecs": SOLO_WATCH_STARTUP_DELAY_SECS,
+            "reason": SOLO_WATCH.get("reason"),  # v6.64: page-closed / page-cant-see-twitch / page-open …
+            "coverPage": SOLO_COVER_PAGE,  # v6.64
         }
 
 
@@ -10872,14 +10890,22 @@ def solo_watch_tick():
     solo_watch_prune_started()
     now = time.time()
     should, reason = solo_watch_should_run(now)
+    with STATUS_FILE_LOCK:
+        page_tw = PAGE_SEEN.get("twitch")
     with SOLO_WATCH_LOCK:
         was_active = bool(SOLO_WATCH.get("active"))
+        prev_reason = SOLO_WATCH.get("reason")
         SOLO_WATCH["active"] = bool(should)
+        SOLO_WATCH["reason"] = reason  # v6.64
         users = dict(SOLO_WATCH.get("users") or {})
-        if should and not was_active:
+        if should and (not was_active or reason != prev_reason):
             names = ", ".join(sorted(users.keys())[:8])
             more = "…" if len(users) > 8 else ""
-            log(f"solo watch: page closed — watching {names}{more}")
+            if reason == "page-cant-see-twitch":
+                log(f"solo watch: recorder page is open but {page_twitch_label(page_tw)} — "
+                    f"helper watching {names}{more} itself")
+            else:
+                log(f"solo watch: page closed — watching {names}{more}")
             SOLO_WATCH["loggedWatching"] = True
         elif not should and was_active:
             log(f"solo watch: idle ({reason})")
@@ -10958,7 +10984,22 @@ def page_version_outdated(page_version, helper_version=None):
     return _parse_version_tuple(pv) < _parse_version_tuple(helper_version or HELPER_VERSION)
 
 
-def note_page_seen(raw_armed, page_version=None):
+def _clean_page_twitch(raw):
+    """v6.64: the page's Twitch live-check state from the heartbeat (?tw=…); None when absent (older page)."""
+    v = str(raw or "").strip().lower()
+    return v if v in PAGE_TWITCH_STATES else None
+
+
+def page_twitch_label(state):
+    """v6.64: plain words for the page's Twitch state (status file / log)."""
+    return {
+        "off": "not connected to Twitch",
+        "err": "its Twitch checks keep failing",
+        "nocreds": "no Twitch Client ID/Secret in this browser",
+    }.get(state or "", state or "")
+
+
+def note_page_seen(raw_armed, page_version=None, page_twitch=None):
     users = []
     for part in str(raw_armed or "").split(","):
         u = safe_username(part)
@@ -10974,9 +11015,15 @@ def note_page_seen(raw_armed, page_version=None):
         if pv and pv != PAGE_SEEN.get("version"):
             PAGE_SEEN["version"] = pv
             changed = True
+        tw = _clean_page_twitch(page_twitch)  # v6.64 (None = page too old to say)
+        if tw != PAGE_SEEN.get("twitch"):
+            changed = True
+        PAGE_SEEN["twitch"] = tw
     # v6.49: persist armed list for solo-watch (empty = user cleared Auto-Rec — clear disk too)
+    # v6.64: …except from a page with no Twitch setup at all (another browser / the Pages link
+    # opened fresh): its empty list says nothing about what this computer should record.
     try:
-        solo_watch_set_armed_users(users, explicit_empty=True)
+        solo_watch_set_armed_users(users, explicit_empty=not (tw == "nocreds" and not users))
     except Exception as e:
         log(f"solo watch armed sync failed: {e}")
     if changed:
@@ -11084,6 +11131,7 @@ def build_status_doc(now=None):
         page_at = float(PAGE_SEEN.get("at") or 0.0)
         armed = list(PAGE_SEEN.get("armed") or [])
         page_ver = PAGE_SEEN.get("version")  # v6.63
+        page_tw = PAGE_SEEN.get("twitch")  # v6.64
     page_open = bool(page_at) and now - page_at < PAGE_HEARTBEAT_STALE_SECS  # v6.46
     recording = []
     for u, a in sorted(active_items):
@@ -11143,6 +11191,8 @@ def build_status_doc(now=None):
         # v6.63: which build the open page runs (an old tab misses page-side fixes until reloaded)
         "recorderPageVersion": page_ver if page_open else None,
         "recorderPageOutdated": bool(page_open and page_version_outdated(page_ver)),
+        # v6.64: can the open page see Twitch go-lives? (ok/wait/off/err/nocreds/user-off; None = old page)
+        "recorderPageTwitch": page_tw if page_open else None,
         "recording": recording,
         "lastErrors": {u: _short(e) for u, e in last_errors.items()},
         "voiceRemoval": {"running": int(q.get("running") or 0), "waiting": int(q.get("waiting") or 0)},
@@ -11250,6 +11300,16 @@ def render_status_text(doc):
         elif pv:
             pv_txt = f" (page v{pv})"
         L.append("Recorder page: open" + pv_txt + "; Auto-Rec armed for " + (", ".join(armed) if armed else "nobody"))
+        ptw = doc.get("recorderPageTwitch")  # v6.64
+        sw = doc.get("soloWatch") or {}
+        if ptw in PAGE_TWITCH_COVER:
+            if sw.get("active") and sw.get("users"):
+                who = ", ".join((sw.get("users") or [])[:8])
+                L.append(f"  ⚠ the page can't check Twitch ({page_twitch_label(ptw)}) — helper watching {who} on its own")
+            else:
+                L.append(f"  ⚠ the page can't check Twitch ({page_twitch_label(ptw)}) — open it and Connect")
+        elif ptw == "user-off":
+            L.append("  the page was Disconnected from Twitch by hand — Auto-Rec is not checking for go-lives")
     else:
         seen = doc.get("recorderPageLastSeen")
         sw = doc.get("soloWatch") or {}
@@ -11622,7 +11682,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 q = urllib.parse.parse_qs(parsed.query or "", keep_blank_values=True)
                 if "armed" in q:
                     note_armed_heartbeat(q.get("armed", [""])[0])
-                    note_page_seen(q.get("armed", [""])[0], (q.get("page") or [""])[0])  # v6.41 status file; v6.63 page version
+                    note_page_seen(q.get("armed", [""])[0], (q.get("page") or [""])[0],
+                                   (q.get("tw") or [""])[0])  # v6.41 status file; v6.63 page version; v6.64 Twitch state
                 if "soloWatch" in q:
                     raw_sw = (q.get("soloWatch") or ["1"])[0]
                     on = str(raw_sw).strip().lower() not in ("0", "false", "off", "no")
@@ -12174,6 +12235,70 @@ def _self_test_v663():
             PAGE_SEEN.update(prev)
         with SOLO_WATCH_LOCK:
             SOLO_WATCH["users"] = prev_users
+
+
+def _self_test_v664():
+    """v6.64: an open page that can't see Twitch no longer switches the helper's own watching off."""
+    global solo_watch_save_locked, SOLO_COVER_PAGE
+    for raw, want in (("ok", "ok"), ("ERR", "err"), (" off ", "off"), ("nocreds", "nocreds"),
+                      ("user-off", "user-off"), ("wait", "wait"), ("", None), (None, None), ("<x>", None)):
+        assert _clean_page_twitch(raw) == want, (raw, _clean_page_twitch(raw))
+    with STATUS_FILE_LOCK:
+        prev = dict(PAGE_SEEN)
+    with SOLO_WATCH_LOCK:
+        prev_sw = {k: SOLO_WATCH.get(k) for k in ("users", "enabled", "reason", "active")}
+    real_save = solo_watch_save_locked
+    prev_cover = SOLO_COVER_PAGE
+    solo_watch_save_locked = lambda: None
+    try:
+        SOLO_COVER_PAGE = True
+        with SOLO_WATCH_LOCK:
+            SOLO_WATCH["enabled"] = True
+        t = time.time()
+        old = t - 999
+        note_page_seen("whistleface", "6.64", "ok")
+        assert solo_watch_should_run(now=t, helper_started_at=old) == (False, "page-open")
+        note_page_seen("whistleface", "6.64", "wait")  # still connecting — page covers
+        assert solo_watch_should_run(now=t, helper_started_at=old) == (False, "page-open")
+        note_page_seen("whistleface", "6.63", "")  # older page: unknown → old behaviour
+        assert solo_watch_should_run(now=t, helper_started_at=old) == (False, "page-open")
+        for st in ("off", "err", "nocreds"):
+            note_page_seen("whistleface", "6.64", st)
+            assert solo_watch_should_run(now=t, helper_started_at=old) == (True, "page-cant-see-twitch"), st
+        note_page_seen("whistleface", "6.64", "user-off")  # Disconnect pressed on purpose
+        assert solo_watch_should_run(now=t, helper_started_at=old) == (False, "page-open")
+        SOLO_COVER_PAGE = False
+        note_page_seen("whistleface", "6.64", "off")
+        assert solo_watch_should_run(now=t, helper_started_at=old) == (False, "page-open")
+        SOLO_COVER_PAGE = True
+        # a fresh, unconfigured page (no creds, no streamers) must not wipe the persisted armed list
+        note_page_seen("", "6.64", "nocreds")
+        with SOLO_WATCH_LOCK:
+            assert "whistleface" in (SOLO_WATCH.get("users") or {}), SOLO_WATCH.get("users")
+        assert solo_watch_should_run(now=t, helper_started_at=old) == (True, "page-cant-see-twitch")
+        # …but a configured page that turned Auto-Rec off for everyone still clears it
+        note_page_seen("", "6.64", "ok")
+        with SOLO_WATCH_LOCK:
+            assert not (SOLO_WATCH.get("users") or {}), SOLO_WATCH.get("users")
+        doc = {"computer": "T", "updatedAt": "x", "staleAfterSecs": 900, "helperVersion": "6.64",
+               "helperStartedAt": "x", "streamlink": True, "ffmpeg": True, "demucs": True,
+               "recorderPageOpen": True, "autoRecArmed": ["whistleface"], "recorderPageVersion": "6.64",
+               "recorderPageTwitch": "off",
+               "soloWatch": {"active": True, "users": ["whistleface"], "enabled": True}}
+        txt = render_status_text(doc)
+        assert "can't check Twitch (not connected to Twitch) — helper watching whistleface" in txt, txt
+        doc["recorderPageTwitch"] = "ok"
+        assert "can't check Twitch" not in render_status_text(doc)
+        assert "coverPage" in solo_watch_snapshot()
+    finally:
+        solo_watch_save_locked = real_save
+        SOLO_COVER_PAGE = prev_cover
+        with STATUS_FILE_LOCK:
+            PAGE_SEEN.clear()
+            PAGE_SEEN.update(prev)
+        with SOLO_WATCH_LOCK:
+            for k, v in prev_sw.items():
+                SOLO_WATCH[k] = v
 
 
 def _self_test_v661():
