@@ -22,7 +22,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.65"
+HELPER_VERSION = "6.66"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -207,7 +207,14 @@ def which_streamlink():
 
 
 def which_ffmpeg():
-    return shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    """v6.66: a system ffmpeg first, else the helper's own verified portable copy (if it set one up)."""
+    ff = which_ffmpeg_system()
+    if ff:
+        return ff
+    try:
+        return ff_private_bin()
+    except Exception:
+        return None
 
 
 def which_demucs():
@@ -1238,6 +1245,7 @@ def build_cmd(username, quality):
         out = unique_recording_path(username, "ogg")
         cmd = [
             sl,
+        ] + (["--ffmpeg-ffmpeg", ff] if ff != which_ffmpeg_system() else []) + [  # v6.66: helper's own ffmpeg
             "--force",
             "--loglevel",
             "info",  # v6.57: ad-break lines ("pausing stream output") must reach stderr
@@ -2159,7 +2167,7 @@ def watch_and_resume(username, quality, gen, proc):
 def start_record(username, quality, started_by=None):
     sl = which_streamlink()
     if not sl:
-        err = "streamlink not found — install with: pip install streamlink"
+        err = "streamlink not found — " + sl_install_hint()  # v6.66
         set_last_error(username, err)
         return {"ok": False, "error": err}
     quality = quality if quality in ("audio_only", "best") else "audio_only"
@@ -2838,6 +2846,8 @@ def update_busy_reason():
         reason = "receiving an upload"
     if not reason and SL_UPGRADING.is_set():  # v6.55
         reason = "updating streamlink"
+    if not reason and FF_SETUP_BUSY.is_set():  # v6.66
+        reason = "setting up ffmpeg"
     if reason:
         _auto_update_set(lastBusyAt=time.time())
     return reason
@@ -3598,6 +3608,7 @@ def streamlink_update_tick(now=None):
     with SL_UPDATE_LOCK:
         last = float(SL_UPDATE.get("lastCheckAt") or 0.0)
         had_err = bool(SL_UPDATE.get("lastError")) and SL_UPDATE.get("state") == "error"
+        had_err = had_err or SL_UPDATE.get("state") == "missing"  # v6.66: re-check hourly (was a 1 s no-op spin)
         force = bool(SL_UPDATE.get("checkNow"))
         SL_UPDATE["checkNow"] = False
     due = SL_UPDATE_RETRY_SECS if had_err else SL_UPDATE_EVERY_SECS
@@ -3631,6 +3642,11 @@ def streamlink_update_tick(now=None):
         s = dict(SL_UPDATE)
     inst, best, kind = s.get("installed"), s.get("latestCompatible"), s.get("kind")
     nxt = last + SL_UPDATE_EVERY_SECS
+    if kind == "missing" and sl_provision_allowed():
+        if which_streamlink():  # installed meanwhile → look again first
+            _sl_set(checkNow=True)
+            return 1.0
+        return _sl_missing_tick(s, now, last)  # v6.66
     if kind == "missing" or not inst:
         # a --version that failed/timed out (busy computer at boot) is re-checked within the hour
         _sl_set(state="missing", lastResult="streamlink not found" if kind == "missing" else
@@ -3778,8 +3794,16 @@ def streamlink_status_line(s):
         return "streamlink: version not checked yet (first check a few minutes after the helper starts)"
     inst = s.get("installed")
     st = s.get("state")
+    if not inst and st == "private-waiting":  # v6.66
+        return (f"streamlink: NOT INSTALLED — the helper sets up its own streamlink {s.get('latest') or ''} "
+                f"when idle ({s.get('waitingFor')})")
+    if not inst and st == "private-building":
+        return f"streamlink: NOT INSTALLED — setting up the helper's own streamlink {s.get('latest') or ''} now…"
     if st == "missing" or not inst:
-        return "streamlink: NOT WORKING — " + (s.get("hint") or "streamlink --version failed")
+        line = "streamlink: NOT WORKING — " + (s.get("hint") or "streamlink --version failed")
+        if s.get("lastError") and "by itself" in str(s.get("lastError")):
+            line += " — " + str(s["lastError"])
+        return line
     line = f"streamlink {inst}"
     if s.get("installedReleasedAt"):
         line += f" (released {s['installedReleasedAt']})"
@@ -3810,7 +3834,9 @@ def streamlink_status_line(s):
     pv = s.get("private") or {}
     if pv.get("active"):
         line += f" [helper's own copy, Python {pv.get('pythonVersion') or '?'}]"
-    if s.get("lastUpgradeTo"):
+    if s.get("lastUpgradeTo") and s.get("lastUpgradeFrom") == "none":  # v6.66: wasn't installed before
+        line += f"; set up by the helper at {_iso_local(s.get('lastUpgradeAt'))}"
+    elif s.get("lastUpgradeTo"):
         line += f"; last auto-upgrade {s.get('lastUpgradeFrom')} → {s['lastUpgradeTo']} at {_iso_local(s.get('lastUpgradeAt'))}"
     return line
 
@@ -3828,6 +3854,499 @@ def api_streamlink_update(body):
         _sl_set(checkNow=True)
     SL_UPDATE_WAKE.set()
     return {"ok": True, "streamlinkUpdate": streamlink_update_snapshot()}, 200
+
+
+# ---- v6.66: the helper sets up missing streamlink / ffmpeg by itself -----------------------------
+# A computer that never had streamlink or ffmpeg installed (ANDERSONSRIG: Windows, helper running,
+# but no streamlink and no ffmpeg) could not record at all — the helper only said "pip install
+# streamlink" on a screen nobody looks at, and armed streamers like lilypita were never recorded.
+# Now, when idle (same rules as the other self-updates) and with no admin rights:
+#   * streamlink missing → the v6.59 private copy is built anyway (venv with the newest streamlink on
+#     the helper's own Python if it is new enough, another Python on the computer, or a uv-fetched
+#     standalone Python), verified, and used;
+#   * ffmpeg missing (Windows / Linux) → a portable static ffmpeg + ffprobe build (BtbN FFmpeg-Builds
+#     on GitHub, newest release branch; the download is checked against the release's
+#     checksums.sha256) is put in %LOCALAPPDATA%\TwitchRecorder\ffmpeg (Linux ~/.twitch-recorder/ffmpeg),
+#     verified (ffmpeg -version + a 1-second OGG encode) and used; a system ffmpeg always wins.
+#     macOS has no checksum-published static build, so a Mac just says "brew install ffmpeg".
+# Env TWITCH_RECORDER_PROVISION_TOOLS=0 turns both off (TWITCH_RECORDER_PRIVATE_FFMPEG=0 just ffmpeg).
+def _env_off(name):
+    return (os.environ.get(name) or "").strip().lower() in ("0", "off", "false", "no")
+
+
+TOOLS_PROVISION_ENV_OFF = _env_off("TWITCH_RECORDER_PROVISION_TOOLS")
+FF_PRIVATE_ENV_OFF = TOOLS_PROVISION_ENV_OFF or _env_off("TWITCH_RECORDER_PRIVATE_FFMPEG")
+FF_BASE_URL = (os.environ.get("TWITCH_RECORDER_FFMPEG_BASE_URL")
+               or "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/").rstrip("/") + "/"
+FF_SETUP_FIRST_SECS = _env_secs("TWITCH_RECORDER_FFMPEG_SETUP_FIRST_SECS", 300, 1)
+FF_SETUP_RETRY_SECS = _env_secs("TWITCH_RECORDER_FFMPEG_SETUP_RETRY_SECS", 3600, 5)
+FF_SETUP_CHECK_SECS = 15 * 60  # cheap PATH re-check while ffmpeg is present
+FF_SETUP_MAX_FAILS = 3  # per asset; then wait for a newer build (or a helper restart)
+FF_PRIVATE_MIN_FREE = 900 * 1024 * 1024  # ~200 MB download + ~250 MB unpacked + headroom
+FF_SETUP_LOCK = threading.Lock()
+FF_SETUP_WAKE = threading.Event()
+FF_SETUP_BUSY = threading.Event()  # set while downloading / unpacking / verifying
+FF_SETUP = {"state": "starting", "asset": None, "version": None, "lastCheckAt": 0.0, "nextCheckAt": 0.0,
+            "lastResult": None, "lastError": None, "waitingFor": None, "installedAt": None, "fails": {}}
+_FF_PRIV_CACHE = {"mtime": None, "bin": None}
+_FF_PATH_ADDED = [None]  # private ffmpeg dir appended to PATH (demucs / streamlink children find it)
+
+
+def _ff_set(**kw):
+    with FF_SETUP_LOCK:
+        FF_SETUP.update(kw)
+
+
+def ff_private_root():
+    d = (os.environ.get("TWITCH_RECORDER_PRIVATE_FFMPEG_DIR") or "").strip()
+    if d:
+        return Path(d)
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "TwitchRecorder" / "ffmpeg"
+    return Path.home() / ".twitch-recorder" / "ffmpeg"
+
+
+def _ff_exe_names(nt=None):
+    nt = (os.name == "nt") if nt is None else nt
+    return ("ffmpeg.exe", "ffprobe.exe") if nt else ("ffmpeg", "ffprobe")
+
+
+def _ff_path_without(path_str, d):
+    if not d or not path_str:
+        return path_str
+    key = os.path.normcase(str(d).rstrip("\\/"))
+    return os.pathsep.join(p for p in path_str.split(os.pathsep) if os.path.normcase(p.rstrip("\\/")) != key)
+
+
+def _ff_path_add(d):
+    d = str(d)
+    cur = os.environ.get("PATH") or ""
+    if os.path.normcase(d.rstrip("\\/")) not in [os.path.normcase(p.rstrip("\\/")) for p in cur.split(os.pathsep)]:
+        os.environ["PATH"] = (cur + os.pathsep + d) if cur else d  # appended: a system ffmpeg still wins
+    _FF_PATH_ADDED[0] = d
+
+
+def which_ffmpeg_system():
+    path = _ff_path_without(os.environ.get("PATH"), _FF_PATH_ADDED[0])
+    return shutil.which("ffmpeg", path=path) or shutil.which("ffmpeg.exe", path=path)
+
+
+def ff_private_info():
+    try:
+        doc = json.loads((ff_private_root() / "current.json").read_text(encoding="utf-8"))
+        return doc if isinstance(doc, dict) and doc.get("dir") else None
+    except (OSError, ValueError):
+        return None
+
+
+def ff_private_bin():
+    """Path of the helper's own verified ffmpeg when it is switched on, else None (mtime cache)."""
+    if FF_PRIVATE_ENV_OFF:
+        return None
+    cur = ff_private_root() / "current.json"
+    try:
+        mt = cur.stat().st_mtime
+    except OSError:
+        _FF_PRIV_CACHE.update(mtime=None, bin=None)
+        return None
+    if _FF_PRIV_CACHE.get("mtime") != mt:
+        info = ff_private_info()
+        b = str(ff_private_root() / str(info["dir"]) / _ff_exe_names()[0]) if info else None
+        _FF_PRIV_CACHE.update(mtime=mt, bin=b)
+    b = _FF_PRIV_CACHE.get("bin")
+    if b and os.path.isfile(b):
+        if _FF_PATH_ADDED[0] != os.path.dirname(b):
+            _ff_path_add(os.path.dirname(b))
+        return b
+    return None
+
+
+def ff_private_disable(reason):
+    cur = ff_private_root() / "current.json"
+    try:
+        if cur.is_file():
+            os.replace(str(cur), str(cur.with_name("current.json.off")))
+            log(f"ffmpeg private copy switched off ({reason})")
+    except OSError as e:
+        log(f"ffmpeg private copy: could not switch off: {e}")
+    _FF_PRIV_CACHE.update(mtime=None, bin=None)
+
+
+def ff_platform(sysname=None, machine=None):
+    """BtbN build name part for this computer: win64 / winarm64 / linux64 / linuxarm64, or None (macOS …)."""
+    import platform as _plat
+    sysname = (sysname or _plat.system()).lower()
+    machine = (machine or _plat.machine()).lower()
+    arm = machine in ("arm64", "aarch64", "armv8", "armv8l")
+    if sysname.startswith("win"):
+        return "winarm64" if arm else "win64"
+    if sysname == "linux" and (arm or machine in ("x86_64", "amd64")):
+        return "linuxarm64" if arm else "linux64"
+    return None
+
+
+def ff_pick_asset(checksums_text, plat):
+    """From checksums.sha256 → (asset, sha256, version): newest nX.Y release-branch gpl build, else master."""
+    ext = "zip" if plat.startswith("win") else "tar.xz"
+    rx = re.compile(r"^ffmpeg-n(\d+(?:\.\d+)*)-latest-" + re.escape(plat) + r"-gpl-\1\." + re.escape(ext) + r"$")
+    best, master = None, None
+    for ln in (checksums_text or "").splitlines():
+        parts = ln.strip().split()
+        if len(parts) != 2 or not re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+            continue
+        sha, name = parts[0].lower(), parts[1].lstrip("*")
+        m = rx.match(name)
+        if m and (best is None or _sl_vtuple(m.group(1)) > _sl_vtuple(best[2])):
+            best = (name, sha, m.group(1))
+        elif name == f"ffmpeg-master-latest-{plat}-gpl.{ext}":
+            master = (name, sha, "master")
+    return best or master or (None, None, None)
+
+
+def _ff_download(url, dest, want_sha, timeout=900):
+    """Stream url → dest (sha256 checked while writing). Raises on mismatch; never leaves a bad file."""
+    import hashlib as _hl
+    dest = Path(dest)
+    tmp = dest.with_name(dest.name + ".partial")
+    h = _hl.sha256()
+    req = urllib.request.Request(url, headers={"User-Agent": f"TwitchAutoRecorder/{HELPER_VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as fh:
+            end = time.time() + timeout
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                h.update(chunk)
+                fh.write(chunk)
+                if time.time() > end:
+                    raise RuntimeError(f"download took longer than {int(timeout // 60)} min")
+        got = h.hexdigest()
+        if got != want_sha:
+            raise RuntimeError(f"ffmpeg download checksum mismatch ({got[:12]}… ≠ {want_sha[:12]}…) — not used")
+        os.replace(str(tmp), str(dest))
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return str(dest)
+
+
+def _ff_extract(archive, asset, dest_dir):
+    """Copy bin/ffmpeg(.exe) + bin/ffprobe(.exe) out of a BtbN archive into dest_dir. Returns ffmpeg path."""
+    nt_names = asset.endswith(".zip")
+    want = _ff_exe_names(nt_names)
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    got = {}
+
+    def _take(name, fobj):
+        out = dest_dir / name
+        with open(out, "wb") as fh:
+            shutil.copyfileobj(fobj, fh, 1 << 20)
+        if os.name != "nt":
+            os.chmod(str(out), 0o755)
+        got[name] = str(out)
+    if nt_names:
+        import zipfile as _zip
+        with _zip.ZipFile(str(archive)) as z:
+            for n in z.namelist():
+                parts = n.replace("\\", "/").split("/")
+                if len(parts) >= 2 and parts[-2] == "bin" and parts[-1] in want and parts[-1] not in got:
+                    with z.open(n) as src:
+                        _take(parts[-1], src)
+    else:
+        import tarfile as _tar
+        with _tar.open(str(archive), mode="r:*") as t:
+            for m in t.getmembers():
+                parts = m.name.split("/")
+                if m.isfile() and len(parts) >= 2 and parts[-2] == "bin" and parts[-1] in want \
+                        and parts[-1] not in got:
+                    _take(parts[-1], t.extractfile(m))
+    if want[0] not in got:
+        raise RuntimeError(f"{want[0]} not found in {asset}")
+    return got[want[0]]
+
+
+def _ff_verify(ff):
+    """Return (version, None) when this ffmpeg runs and can write OGG audio, else (None, problem)."""
+    import tempfile as _tmpff
+    rc, out = _sl_run([ff, "-hide_banner", "-version"], timeout=60)
+    m = re.search(r"ffmpeg version (\S+)", out or "")
+    if rc != 0 or not m:
+        return None, f"ffmpeg -version failed (exit {rc}): {_short(out, 160)}"
+    with _tmpff.TemporaryDirectory(prefix="tar-ffcheck-") as td:
+        last = ""
+        for codec in (["-c:a", "libvorbis", "-q:a", "5"], ["-c:a", "libopus", "-b:a", "128k"]):
+            o = os.path.join(td, "check.ogg")
+            rc, last = _sl_run([ff, "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-f", "lavfi",
+                                "-i", "sine=frequency=440:duration=1"] + codec + [o], timeout=120)
+            if rc == 0 and os.path.isfile(o) and os.path.getsize(o) > 0:
+                return m.group(1), None
+        return None, f"ffmpeg can't write OGG audio: {_short(last, 160)}"
+
+
+def ff_private_build(plat=None, fetch_text=None, download=None, verify=None):
+    """Download + verify + switch to the helper's own ffmpeg. Returns (ok, message). Old copy stays until
+    the new one is verified."""
+    plat = plat or ff_platform()
+    fetch_text = fetch_text or (lambda url: fetch_url_text(url, timeout=30))
+    download = download or _ff_download
+    verify = verify or _ff_verify
+    if not plat:
+        return False, "no portable ffmpeg for this kind of computer"
+    root = ff_private_root()
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        free = shutil.disk_usage(str(root)).free
+        if free < FF_PRIVATE_MIN_FREE:
+            return False, f"only {free // 1048576} MB free in {root} (needs about {FF_PRIVATE_MIN_FREE // 1048576} MB)"
+    except OSError:
+        pass
+    asset, sha, ver = ff_pick_asset(fetch_text(FF_BASE_URL + "checksums.sha256"), plat)
+    if not asset:
+        return False, f"no {plat} ffmpeg build listed in checksums.sha256"
+    _ff_set(asset=asset)
+    arc = root / ("download-" + asset)
+    name = "build-" + time.strftime("%Y%m%d-%H%M%S")
+    bdir = root / name
+    try:
+        download(FF_BASE_URL + asset, arc, sha)
+        ff = _ff_extract(arc, asset, bdir)
+    except Exception as e:
+        shutil.rmtree(str(bdir), ignore_errors=True)
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            arc.unlink()
+        except OSError:
+            pass
+    fver, bad = verify(ff)
+    if bad:
+        shutil.rmtree(str(bdir), ignore_errors=True)
+        return False, bad
+    prev = ff_private_info()
+    doc = {"dir": name, "version": fver, "asset": asset, "sha256": sha, "at": time.time(), "helper": HELPER_VERSION}
+    tmp = root / "current.json.partial"
+    tmp.write_text(json.dumps(doc, indent=1), encoding="utf-8")
+    os.replace(str(tmp), str(root / "current.json"))
+    _FF_PRIV_CACHE.update(mtime=None, bin=None)
+    for d in root.glob("build-*"):
+        if d.name != name:
+            shutil.rmtree(str(d), ignore_errors=True)  # a busy .exe on Windows just stays until next time
+    if prev:
+        log(f"ffmpeg private copy: replaced {prev.get('dir')} ({prev.get('version')})")
+    return True, f"ffmpeg {fver} ({asset}, sha256 ok)"
+
+
+def ffmpeg_setup_tick(now=None):
+    """One step of the missing-ffmpeg setup. Returns seconds until the next step."""
+    now = time.time() if now is None else now
+    _ff_set(lastCheckAt=now)
+    if which_ffmpeg_system():
+        _ff_set(state="system", waitingFor=None, lastError=None, nextCheckAt=now + FF_SETUP_CHECK_SECS)
+        return FF_SETUP_CHECK_SECS
+    pb = ff_private_bin()
+    if pb:
+        with FF_SETUP_LOCK:
+            known = FF_SETUP.get("state") == "private" and FF_SETUP.get("binChecked") == pb
+        if not known:
+            v, bad = _ff_verify(pb)
+            if bad:
+                ff_private_disable(bad)
+                pb = None
+            else:
+                info = ff_private_info() or {}
+                _ff_set(state="private", version=v, asset=info.get("asset"), installedAt=info.get("at"),
+                        binChecked=pb, waitingFor=None, lastError=None)
+        if pb:
+            _ff_set(nextCheckAt=now + FF_SETUP_CHECK_SECS)
+            return FF_SETUP_CHECK_SECS
+    if FF_PRIVATE_ENV_OFF:
+        _ff_set(state="off", waitingFor=None, nextCheckAt=now + FF_SETUP_CHECK_SECS,
+                lastResult="ffmpeg not found (automatic ffmpeg setup off)")
+        return FF_SETUP_CHECK_SECS
+    plat = ff_platform()
+    if not plat:
+        hint = "brew install ffmpeg" if sys.platform == "darwin" else "install ffmpeg"
+        _ff_set(state="unsupported", waitingFor=None, nextCheckAt=now + FF_SETUP_CHECK_SECS,
+                lastResult=f"ffmpeg not found — {hint}")
+        return FF_SETUP_CHECK_SECS
+    with FF_SETUP_LOCK:
+        fails = dict(FF_SETUP.get("fails") or {})
+        asset = FF_SETUP.get("asset")
+    if asset and int(fails.get(asset) or 0) >= FF_SETUP_MAX_FAILS:
+        _ff_set(state="error", waitingFor=None, nextCheckAt=now + FF_SETUP_RETRY_SECS * 6)
+        return FF_SETUP_RETRY_SECS * 6
+    busy = update_busy_reason()
+    if busy or not update_idle_settled(now):
+        why = busy or "just finished work — waiting a few idle minutes"
+        with FF_SETUP_LOCK:
+            changed = FF_SETUP.get("waitingFor") != why
+        if changed:
+            log(f"ffmpeg setup: ffmpeg not found — will set up the helper's own copy when idle ({why})")
+        _ff_set(state="waiting-idle", waitingFor=why, lastResult="ffmpeg not found",
+                nextCheckAt=now + AUTO_UPDATE_BUSY_SECS)
+        STATUS_FILE_WAKE.set()
+        return AUTO_UPDATE_BUSY_SECS
+    _ff_set(state="downloading", waitingFor=None)
+    STATUS_FILE_WAKE.set()
+    log(f"ffmpeg setup: ffmpeg not found — setting up a portable ffmpeg in {ff_private_root()}")
+    FF_SETUP_BUSY.set()
+    try:
+        ok, msg = ff_private_build(plat)
+    except Exception as e:
+        ok, msg = False, f"{type(e).__name__}: {e}"
+    finally:
+        FF_SETUP_BUSY.clear()
+    if ok:
+        info = ff_private_info() or {}
+        log(f"ffmpeg setup: now using the helper's own {msg}")
+        _ff_set(state="private", version=info.get("version"), asset=info.get("asset"), installedAt=info.get("at"),
+                binChecked=ff_private_bin(), lastResult=f"set up {msg}", lastError=None,
+                nextCheckAt=now + FF_SETUP_CHECK_SECS)
+        STATUS_FILE_WAKE.set()
+        return FF_SETUP_CHECK_SECS
+    with FF_SETUP_LOCK:
+        a = FF_SETUP.get("asset") or "?"
+        FF_SETUP.setdefault("fails", {})[a] = int((FF_SETUP.get("fails") or {}).get(a) or 0) + 1
+    log(f"ffmpeg setup: couldn't set up ffmpeg — {msg}; retry in {int(FF_SETUP_RETRY_SECS // 60)} min")
+    _ff_set(state="error", lastError=f"couldn't set up ffmpeg: {msg}", lastResult="ffmpeg not found",
+            nextCheckAt=now + FF_SETUP_RETRY_SECS)
+    STATUS_FILE_WAKE.set()
+    return FF_SETUP_RETRY_SECS
+
+
+def ffmpeg_setup_loop():
+    FF_SETUP_WAKE.wait(FF_SETUP_FIRST_SECS)
+    FF_SETUP_WAKE.clear()
+    while True:
+        wait = FF_SETUP_CHECK_SECS
+        try:
+            wait = ffmpeg_setup_tick()
+        except Exception as e:
+            log(f"ffmpeg setup loop error: {e}")
+            _ff_set(state="error", lastError=f"ffmpeg setup error: {e}")
+            wait = FF_SETUP_RETRY_SECS
+        FF_SETUP_WAKE.wait(max(1.0, float(wait)))
+        FF_SETUP_WAKE.clear()
+
+
+def ffmpeg_setup_snapshot():
+    with FF_SETUP_LOCK:
+        s = dict(FF_SETUP)
+    s.pop("fails", None)
+    s.pop("binChecked", None)
+    s["envDisabled"] = FF_PRIVATE_ENV_OFF
+    s["busy"] = FF_SETUP_BUSY.is_set()
+    s["dir"] = str(ff_private_root())
+    try:
+        s["path"] = which_ffmpeg()
+        s["private"] = bool(s["path"]) and s["path"] == ff_private_bin()
+    except Exception:
+        s["path"], s["private"] = None, False
+    return s
+
+
+def ffmpeg_status_line(s):
+    """One plain-English line for the Recorder status file."""
+    s = s or {}
+    st = s.get("state")
+    if s.get("path") and s.get("private"):
+        return f"ffmpeg {s.get('version') or ''}".rstrip() + f" — the helper's own copy ({s.get('asset') or '?'})"
+    if s.get("path"):
+        return "ffmpeg: installed"
+    if st == "waiting-idle":
+        return f"ffmpeg: NOT FOUND — the helper sets up its own copy when idle ({s.get('waitingFor')})"
+    if st == "downloading":
+        return "ffmpeg: NOT FOUND — downloading a portable ffmpeg now…"
+    if st == "error":
+        return "ffmpeg: NOT FOUND — " + (s.get("lastError") or "setup failed") + " (recordings are .ts until fixed)"
+    if st in ("unsupported", "off"):
+        return "ffmpeg: NOT FOUND — " + (s.get("lastResult") or "install ffmpeg") + " (recordings are .ts)"
+    return "ffmpeg: NOT FOUND — first automatic setup check a few minutes after the helper starts"
+
+
+def _sl_find_python_any(spec):
+    """v6.66 (no streamlink at all): the helper's own Python first, if it is new enough, then the others."""
+    exe = sys.executable or ""
+    if exe and os.name == "nt" and os.path.basename(exe).lower() == "pythonw.exe":
+        alt = os.path.join(os.path.dirname(exe), "python.exe")
+        if os.path.isfile(alt):
+            exe = alt
+    if exe and "/windowsapps/" not in exe.replace("\\", "/").lower():
+        v = _sl_python_version(exe)
+        if v and _py_satisfies(spec, v):
+            return exe, v
+    return sl_find_newer_python(spec)
+
+
+def sl_provision_allowed():
+    return not (TOOLS_PROVISION_ENV_OFF or SL_PRIVATE_ENV_OFF or SL_UPDATE_ENV_OFF)
+
+
+def _sl_missing_tick(s, now, last):
+    """v6.66: streamlink isn't installed at all → build the helper's own copy when idle."""
+    target = s.get("latest")
+    key = SL_PRIVATE_KEY + ":missing:" + str(target)
+    fails = int((s.get("fails") or {}).get(key) or 0)
+    if not target or fails >= SL_UPDATE_MAX_FAILS:
+        _sl_set(state="missing", lastResult="streamlink not found", waitingFor=None,
+                nextCheckAt=last + SL_UPDATE_RETRY_SECS)
+        return max(1.0, last + SL_UPDATE_RETRY_SECS - now)
+    busy = update_busy_reason()
+    if busy or not update_idle_settled(now):
+        why = busy or "just finished work — waiting a few idle minutes"
+        if s.get("waitingFor") != why:
+            log(f"streamlink setup: streamlink not found — will set up streamlink {target} when idle ({why})")
+        _sl_set(state="private-waiting", waitingFor=why, lastResult="streamlink not found",
+                nextCheckAt=now + AUTO_UPDATE_BUSY_SECS)
+        STATUS_FILE_WAKE.set()
+        return AUTO_UPDATE_BUSY_SECS
+    _sl_set(state="private-building", waitingFor=None)
+    STATUS_FILE_WAKE.set()
+    log(f"streamlink setup: streamlink not found — setting up the helper's own streamlink {target}")
+    SL_UPGRADING.set()
+    try:
+        ok, msg = sl_private_build(s.get("latestRequiresPython") or ">=3.10", target, find_python=_sl_find_python_any)
+    except Exception as e:
+        ok, msg = False, f"{type(e).__name__}: {e}"
+    finally:
+        SL_UPGRADING.clear()
+    if ok:
+        log(f"streamlink setup: now using the helper's own {msg} (verified: Twitch plugin + recorder options)")
+        info = streamlink_inspect()
+        _sl_set(state="up-to-date", installed=info.get("installed") or target, kind=info.get("kind"),
+                python=info.get("python"), pythonVersion=info.get("pythonVersion"), hint=info.get("hint"),
+                latestCompatible=target, lastResult=f"set up {msg}", lastError=None,
+                lastUpgradeAt=time.time(), lastUpgradeFrom="none", lastUpgradeTo=target,
+                installedReleasedAt=None, nextCheckAt=now + SL_UPDATE_EVERY_SECS, lastCheckAt=now)
+        STATUS_FILE_WAKE.set()
+        return SL_UPDATE_EVERY_SECS
+    with SL_UPDATE_LOCK:
+        SL_UPDATE.setdefault("fails", {})[key] = fails + 1
+    log(f"streamlink setup: couldn't set up streamlink {target} — {msg}; retry in {int(SL_UPDATE_RETRY_SECS // 60)} min")
+    _sl_set(state="missing", lastResult="streamlink not found", waitingFor=None,
+            lastError=f"couldn't set up streamlink {target} by itself: {msg}", nextCheckAt=now + SL_UPDATE_RETRY_SECS)
+    STATUS_FILE_WAKE.set()
+    return SL_UPDATE_RETRY_SECS
+
+
+def sl_install_hint():
+    """v6.66: what to tell the page / status file while streamlink is missing."""
+    with SL_UPDATE_LOCK:
+        st, err, why = SL_UPDATE.get("state"), SL_UPDATE.get("lastError"), SL_UPDATE.get("waitingFor")
+    if st == "private-building":
+        return "the helper is setting up its own streamlink now…"
+    if st == "private-waiting":
+        return f"the helper sets up its own streamlink when idle ({why})"
+    if err and "by itself" in str(err):
+        return "pip install streamlink (" + _short(str(err), 200) + ")"
+    if sl_provision_allowed():
+        return "pip install streamlink — or wait: the helper sets up its own copy a few minutes after it starts"
+    return "pip install streamlink"
 
 
 def _self_test_streamlink_update():
@@ -4433,6 +4952,7 @@ def self_test():
     _self_test_v663()  # v6.63
     _self_test_v664()  # v6.64
     _self_test_v665()  # v6.65
+    _self_test_v666()  # v6.66
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -4583,7 +5103,8 @@ def health_payload():
         "active": active,
         "lastErrors": last_errors,
         "retrying": retrying,
-        "installHint": None if sl else "pip install streamlink",
+        "installHint": None if sl else sl_install_hint(),  # v6.66: says when the helper sets it up itself
+        "ffmpegSetup": ffmpeg_setup_snapshot(),  # v6.66
         "diskFree": disk["diskFree"],
         "diskTotal": disk["diskTotal"],
         "diskWarn": disk["diskWarn"],
@@ -11246,6 +11767,7 @@ def build_status_doc(now=None):
                                       "outdated", "hint", "waitingFor", "lastResult", "lastError",
                                       "lastUpgradeFrom", "lastUpgradeTo", "private")},
         "streamlinkLine": streamlink_status_line(streamlink_update_snapshot()),
+        "ffmpegLine": ffmpeg_status_line(ffmpeg_setup_snapshot()),  # v6.66
         "recentRecordings": recent,
         # v6.49: helper watching armed streamers while the recorder page is closed
         "soloWatch": solo_watch_snapshot(),
@@ -11285,6 +11807,8 @@ def render_status_text(doc):
     L.append("Tools: " + ", ".join(f"{n} {'ok' if ok else 'MISSING'}" for n, ok in tools))
     if doc.get("streamlinkLine"):  # v6.55
         L.append(doc["streamlinkLine"])
+    if doc.get("ffmpegLine"):  # v6.66
+        L.append(doc["ffmpegLine"])
     disk = f"Disk free: {_fmt_mb(doc.get('diskFreeBytes'))}"
     if doc.get("diskBlock"):
         disk += " — ALMOST FULL, new recordings blocked"
@@ -12505,6 +13029,259 @@ def _self_test_v665():
         os.path = saved_path
 
 
+def _self_test_v666():
+    """v6.66: missing streamlink / ffmpeg are set up by the helper itself — asset pick, archive unpack,
+    checksum-checked download, pointer + PATH, tick decisions (idle wait, build, failure cap, opt-out).
+    Never touches the network, never runs a downloaded binary, never builds anything for real."""
+    import tempfile as _tmp66
+    import io as _io66
+    import zipfile as _zip66
+    import tarfile as _tar66
+    import hashlib as _hl66
+    assert ff_platform("Windows", "AMD64") == "win64" and ff_platform("Windows", "ARM64") == "winarm64"
+    assert ff_platform("Linux", "x86_64") == "linux64" and ff_platform("Linux", "aarch64") == "linuxarm64"
+    assert ff_platform("Darwin", "arm64") is None and ff_platform("Darwin", "x86_64") is None
+    a1, a2, a3, a4 = ("1" * 64, "2" * 64, "3" * 64, "4" * 64)
+    sums = "\n".join([f"{a1}  ffmpeg-master-latest-win64-gpl.zip", f"{a2}  ffmpeg-n8.1-latest-win64-gpl-8.1.zip",
+                      f"{a3}  ffmpeg-n9.0-latest-win64-gpl-9.0.zip", f"{a4}  ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip",
+                      f"{a4}  ffmpeg-n9.0-latest-linux64-gpl-9.0.tar.xz", "junk line"])
+    assert ff_pick_asset(sums, "win64") == ("ffmpeg-n9.0-latest-win64-gpl-9.0.zip", a3, "9.0")
+    assert ff_pick_asset(sums, "linux64") == ("ffmpeg-n9.0-latest-linux64-gpl-9.0.tar.xz", a4, "9.0")
+    assert ff_pick_asset(f"{a1}  ffmpeg-master-latest-winarm64-gpl.zip", "winarm64")[2] == "master"
+    assert ff_pick_asset(sums, "winarm64") == (None, None, None)
+    assert _ff_exe_names(True) == ("ffmpeg.exe", "ffprobe.exe") and _ff_exe_names(False) == ("ffmpeg", "ffprobe")
+    # PATH helpers under Windows path rules (ntpath), whatever OS this runs on
+    saved_path_mod, saved_sep = os.path, os.pathsep
+    try:
+        os.path = ntpath
+        os.pathsep = ";"
+        p = r"C:\Windows;C:\Users\eric1\AppData\Local\TwitchRecorder\ffmpeg\build-1\;C:\Tools"
+        assert _ff_path_without(p, r"c:\users\eric1\appdata\local\twitchrecorder\ffmpeg\build-1") == \
+            r"C:\Windows;C:\Tools"
+    finally:
+        os.path, os.pathsep = saved_path_mod, saved_sep
+    g = globals()
+    names = ("which_ffmpeg_system", "ff_platform", "update_busy_reason", "update_idle_settled", "ff_private_build",
+             "_ff_verify", "streamlink_inspect", "streamlink_latest", "sl_private_build", "which_streamlink",
+             "TOOLS_PROVISION_ENV_OFF", "FF_PRIVATE_ENV_OFF")
+    saved = {k: g[k] for k in names}
+    with FF_SETUP_LOCK:
+        saved_ff = dict(FF_SETUP)
+        saved_ff["fails"] = dict(FF_SETUP.get("fails") or {})
+    with SL_UPDATE_LOCK:
+        saved_sl = dict(SL_UPDATE)
+        saved_sl["fails"] = dict(SL_UPDATE.get("fails") or {})
+    prev_dir = os.environ.get("TWITCH_RECORDER_PRIVATE_FFMPEG_DIR")
+    prev_PATH = os.environ.get("PATH")
+    prev_added = _FF_PATH_ADDED[0]
+    try:
+        with _tmp66.TemporaryDirectory(prefix="tar-ffpriv-") as td:
+            os.environ["TWITCH_RECORDER_PRIVATE_FFMPEG_DIR"] = os.path.join(td, "ff")
+            g["FF_PRIVATE_ENV_OFF"] = False
+            _FF_PRIV_CACHE.update(mtime=None, bin=None)
+            assert ff_private_bin() is None
+            # archives as BtbN lays them out: <top>/bin/ffmpeg(.exe), ffprobe(.exe), plus docs
+            zbuf = _io66.BytesIO()
+            with _zip66.ZipFile(zbuf, "w") as z:
+                z.writestr("ffmpeg-n9.0-latest-win64-gpl-9.0/bin/ffmpeg.exe", b"MZ-ffmpeg")
+                z.writestr("ffmpeg-n9.0-latest-win64-gpl-9.0/bin/ffprobe.exe", b"MZ-ffprobe")
+                z.writestr("ffmpeg-n9.0-latest-win64-gpl-9.0/doc/ffmpeg.exe.html", b"no")
+            zpath = Path(td) / "w.zip"
+            zpath.write_bytes(zbuf.getvalue())
+            out = _ff_extract(zpath, "ffmpeg-n9.0-latest-win64-gpl-9.0.zip", Path(td) / "zx")
+            assert Path(out).name == "ffmpeg.exe" and Path(out).read_bytes() == b"MZ-ffmpeg"
+            assert (Path(td) / "zx" / "ffprobe.exe").read_bytes() == b"MZ-ffprobe"
+            tpath = Path(td) / "l.tar.xz"  # gz inside: some Pythons (e.g. macOS CLT) may lack lzma; "r:*" reads both
+            with _tar66.open(str(tpath), "w:gz") as t:
+                for nm, data in (("x/bin/ffmpeg", b"ELF-ffmpeg"), ("x/bin/ffprobe", b"ELF-ffprobe"),
+                                 ("x/man/ffmpeg", b"no")):
+                    ti = _tar66.TarInfo(nm)
+                    ti.size = len(data)
+                    t.addfile(ti, _io66.BytesIO(data))
+            out = _ff_extract(tpath, "ffmpeg-n9.0-latest-linux64-gpl-9.0.tar.xz", Path(td) / "tx")
+            assert Path(out).read_bytes() == b"ELF-ffmpeg" and (Path(td) / "tx" / "ffprobe").is_file()
+            bad = Path(td) / "bad.zip"
+            with _zip66.ZipFile(str(bad), "w") as z:
+                z.writestr("x/README.txt", b"no")
+            try:
+                _ff_extract(bad, "x.zip", Path(td) / "bx")
+                raise AssertionError("archive without ffmpeg accepted")
+            except RuntimeError:
+                pass
+            # checksum-checked streaming download (file:// URL, no network)
+            plat = "win64" if os.name == "nt" else "linux64"
+            arc = zpath if os.name == "nt" else tpath
+            asset = "ffmpeg-n9.0-latest-win64-gpl-9.0.zip" if os.name == "nt" else \
+                "ffmpeg-n9.0-latest-linux64-gpl-9.0.tar.xz"
+            sha = _hl66.sha256(arc.read_bytes()).hexdigest()
+            url = arc.resolve().as_uri()
+            _ff_download(url, Path(td) / "dl.bin", sha)
+            assert (Path(td) / "dl.bin").read_bytes() == arc.read_bytes()
+            try:
+                _ff_download(url, Path(td) / "dl2.bin", "0" * 64)
+                raise AssertionError("checksum mismatch accepted")
+            except RuntimeError as e:
+                assert "checksum mismatch" in str(e)
+            assert not (Path(td) / "dl2.bin").exists() and not (Path(td) / "dl2.bin.partial").exists()
+            # full build with fakes: pick → download (real, file://) → unpack → verify → pointer + PATH
+            fetched = []
+
+            def _fake_text(u):
+                fetched.append(u)
+                return f"{sha}  {asset}\n"
+
+            def _fake_dl(u, dest, want):
+                assert u.endswith(asset) and want == sha
+                return _ff_download(url, dest, want)
+            ok, msg = ff_private_build(plat, fetch_text=_fake_text, download=_fake_dl,
+                                       verify=lambda ff: ("9.0-test", None))
+            assert ok and "sha256 ok" in msg and fetched[0].endswith("checksums.sha256"), msg
+            pb = ff_private_bin()
+            assert pb and os.path.isfile(pb) and ff_private_info()["version"] == "9.0-test"
+            assert _FF_PATH_ADDED[0] == os.path.dirname(pb)
+            assert os.path.dirname(pb) in (os.environ.get("PATH") or "").split(os.pathsep)
+            assert not list(Path(os.environ["TWITCH_RECORDER_PRIVATE_FFMPEG_DIR"]).glob("download-*"))
+            g["which_ffmpeg_system"] = lambda: None
+            assert which_ffmpeg() == pb
+            g["which_ffmpeg_system"] = lambda: "/usr/bin/ffmpeg"
+            assert which_ffmpeg() == "/usr/bin/ffmpeg"  # a system ffmpeg always wins
+            first = ff_private_info()["dir"]
+            time.sleep(1.1)
+            ok, msg = ff_private_build(plat, fetch_text=_fake_text, download=_fake_dl,
+                                       verify=lambda ff: (None, "ffmpeg can't write OGG audio: test"))
+            assert not ok and "OGG" in msg and ff_private_info()["dir"] == first
+            assert len(list(Path(os.environ["TWITCH_RECORDER_PRIVATE_FFMPEG_DIR"]).glob("build-*"))) == 1
+            ok, msg = ff_private_build("x", fetch_text=lambda u: "", download=_fake_dl,
+                                       verify=lambda ff: ("x", None))
+            assert not ok and "no x ffmpeg build" in msg
+            ff_private_disable("self-test")
+            assert ff_private_bin() is None
+            g["_ff_verify"] = lambda ff: (_ for _ in ()).throw(AssertionError("self-test ran an ffmpeg"))
+            # tick decisions: system → nothing; missing + busy → wait; idle → build; failures capped; mac → hint
+            g["which_ffmpeg_system"] = lambda: "/usr/bin/ffmpeg"
+            g["ff_private_build"] = lambda *a, **k: (_ for _ in ()).throw(AssertionError("built with system ffmpeg"))
+            assert ffmpeg_setup_tick() == FF_SETUP_CHECK_SECS and FF_SETUP["state"] == "system"
+            g["which_ffmpeg_system"] = lambda: None
+            g["ff_platform"] = lambda *a: "win64"
+            env = {"busy": "recording lilypita", "res": (True, "ffmpeg 9.0 (test)")}
+            builds = []
+            g["update_busy_reason"] = lambda: env["busy"]
+            g["update_idle_settled"] = lambda now=None: True
+
+            def _fake_build(plat=None, **kw):
+                builds.append(plat)
+                _ff_set(asset="ffmpeg-n9.0-latest-win64-gpl-9.0.zip")
+                return env["res"]
+            g["ff_private_build"] = _fake_build
+            with FF_SETUP_LOCK:
+                FF_SETUP.update(state="starting", fails={}, asset=None, lastError=None, waitingFor=None)
+            assert ffmpeg_setup_tick() == AUTO_UPDATE_BUSY_SECS and not builds
+            assert FF_SETUP["state"] == "waiting-idle"
+            assert "when idle (recording lilypita)" in ffmpeg_status_line(ffmpeg_setup_snapshot())
+            env["busy"] = None
+            env["res"] = (False, "no network")
+            for _i in range(FF_SETUP_MAX_FAILS + 2):
+                ffmpeg_setup_tick()
+            assert len(builds) == FF_SETUP_MAX_FAILS and FF_SETUP["state"] == "error", (builds, FF_SETUP)
+            assert "couldn't set up ffmpeg: no network" in ffmpeg_status_line(ffmpeg_setup_snapshot())
+            with FF_SETUP_LOCK:
+                FF_SETUP.update(fails={})
+            env["res"] = (True, "ffmpeg 9.0 (test)")
+            assert ffmpeg_setup_tick() == FF_SETUP_CHECK_SECS and FF_SETUP["state"] == "private"
+            g["FF_PRIVATE_ENV_OFF"] = True
+            builds.clear()
+            ffmpeg_setup_tick()
+            assert not builds and FF_SETUP["state"] == "off"
+            g["FF_PRIVATE_ENV_OFF"] = False
+            g["ff_platform"] = lambda *a: None
+            ffmpeg_setup_tick()
+            assert not builds and FF_SETUP["state"] == "unsupported"
+            json.dumps(ffmpeg_setup_snapshot())
+            # streamlink not installed at all → helper's own copy when idle (v6.59 build, own Python first)
+            doc = {"releases": {"8.6.2": [{"requires_python": ">=3.10", "upload_time": "2026-10-07T00:00:00"}]}}
+            lat_real = saved["streamlink_latest"]
+            g["streamlink_latest"] = lambda pyver=None, doc=None, _d=doc: lat_real(pyver, doc=_d)
+            sl_env = {"have": None, "busy": "sending to Google Drive", "res": (True, "streamlink 8.6.2 on test")}
+            slb = []
+            g["which_streamlink"] = lambda: sl_env["have"]
+            g["streamlink_inspect"] = lambda sl=None: (
+                {"installed": None, "kind": "missing", "python": None, "pythonVersion": None,
+                 "hint": "streamlink not found — pip install streamlink"} if not sl_env["have"] else
+                {"installed": "8.6.2", "kind": "pip", "python": "/v/python", "pythonVersion": "3.12.4", "hint": None})
+            g["update_busy_reason"] = lambda: sl_env["busy"]
+
+            def _fake_slb(spec, version, find_python=None, **kw):
+                slb.append((spec, version, find_python))
+                if sl_env["res"][0]:
+                    sl_env["have"] = "/v/streamlink"
+                return sl_env["res"]
+            g["sl_private_build"] = _fake_slb
+            g["TOOLS_PROVISION_ENV_OFF"] = False
+
+            def _reset_sl():
+                with SL_UPDATE_LOCK:
+                    SL_UPDATE.update(state="starting", lastCheckAt=0.0, lastError=None, lastResult=None, fails={},
+                                     waitingFor=None, lastUpgradeTo=None, checkNow=False, installed=None,
+                                     kind=None)
+            if sl_provision_allowed():
+                _reset_sl()
+                assert streamlink_update_tick() == AUTO_UPDATE_BUSY_SECS and not slb
+                assert SL_UPDATE["state"] == "private-waiting", SL_UPDATE
+                assert "sets up its own streamlink 8.6.2 when idle" in streamlink_status_line(streamlink_update_snapshot())
+                assert "sets up its own streamlink when idle" in sl_install_hint()
+                sl_env["busy"] = None
+                sl_env["res"] = (False, "no Python 3.10+ and uv download failed")
+                streamlink_update_tick()
+                assert len(slb) == 1 and slb[0][2] is _sl_find_python_any, slb
+                assert SL_UPDATE["state"] == "missing" and "by itself" in str(SL_UPDATE["lastError"])
+                assert "by itself" in streamlink_status_line(streamlink_update_snapshot())
+                assert "pip install streamlink (" in sl_install_hint()
+                now0 = time.time()
+                for k in range(1, SL_UPDATE_MAX_FAILS + 2):  # re-checked hourly, at most 3 tries per version
+                    streamlink_update_tick(now=now0 + k * (SL_UPDATE_RETRY_SECS + 1))
+                assert len(slb) == SL_UPDATE_MAX_FAILS, slb
+                assert SL_UPDATE["state"] == "missing"
+                _reset_sl()
+                slb.clear()
+                sl_env["res"] = (True, "streamlink 8.6.2 on test")
+                streamlink_update_tick()
+                assert len(slb) == 1 and SL_UPDATE["state"] == "up-to-date" and SL_UPDATE["installed"] == "8.6.2"
+                assert SL_UPDATE["lastUpgradeTo"] == "8.6.2", SL_UPDATE
+            # opt-out: TWITCH_RECORDER_PROVISION_TOOLS=0 → old behaviour (state missing, nothing built)
+            g["TOOLS_PROVISION_ENV_OFF"] = True
+            sl_env["have"] = None
+            slb.clear()
+            _reset_sl()
+            streamlink_update_tick()
+            assert not slb and SL_UPDATE["state"] == "missing"
+            assert sl_install_hint() == "pip install streamlink"
+            # the helper's own Python is tried first when streamlink is missing
+            g["TOOLS_PROVISION_ENV_OFF"] = saved["TOOLS_PROVISION_ENV_OFF"]
+            spec_any = ">=%d.%d" % sys.version_info[:2]
+            exe, v = _sl_find_python_any(spec_any) if "/windowsapps/" not in (sys.executable or "").replace(
+                "\\", "/").lower() else (None, None)
+            if exe:
+                assert _py_satisfies(spec_any, v)
+    finally:
+        g.update(saved)
+        if prev_dir is None:
+            os.environ.pop("TWITCH_RECORDER_PRIVATE_FFMPEG_DIR", None)
+        else:
+            os.environ["TWITCH_RECORDER_PRIVATE_FFMPEG_DIR"] = prev_dir
+        if prev_PATH is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = prev_PATH
+        _FF_PATH_ADDED[0] = prev_added
+        _FF_PRIV_CACHE.update(mtime=None, bin=None)
+        with FF_SETUP_LOCK:
+            FF_SETUP.clear()
+            FF_SETUP.update(saved_ff)
+        with SL_UPDATE_LOCK:
+            SL_UPDATE.clear()
+            SL_UPDATE.update(saved_sl)
+
+
 def drive_stuck_counts():
     with PIPELINE_LOCK:
         origs = list((PIPELINE.get("originals") or {}).values())
@@ -13162,6 +13939,8 @@ def main():
     threading.Thread(target=auto_update_loop, daemon=True, name="auto-update").start()
     # v6.55: keep streamlink current (PyPI check a few min after start, then every ~12 h; upgrades when idle)
     threading.Thread(target=streamlink_update_loop, daemon=True, name="streamlink-update").start()
+    # v6.66: no ffmpeg → set up a checksum-verified portable copy when idle (Windows / Linux)
+    threading.Thread(target=ffmpeg_setup_loop, daemon=True, name="ffmpeg-setup").start()
     # v6.56: re-check a blocked Drive every minute and send the backlog once access works
     threading.Thread(target=drive_access_loop, daemon=True, name="drive-access").start()
     launcher_startup_repair()  # v6.60: LaunchAgent → real python, not the /usr/bin/python3 shim
@@ -13175,8 +13954,11 @@ def main():
     html_path = HERE / HTML_NAME
     log(f"helper v{HELPER_VERSION} listening on http://{HOST}:{PORT}/  (localhost only)")
     log(f"recordings dir: {REC_DIR}")
-    log(f"streamlink: {sl or 'NOT FOUND — pip install streamlink'}")
-    log(f"ffmpeg: {ff or 'not found (will write .ts; seamless join needs ffmpeg)'}")
+    log(f"streamlink: {sl or 'NOT FOUND — ' + sl_install_hint()}")
+    log(f"ffmpeg: {ff or 'not found (will write .ts; seamless join needs ffmpeg)'}"
+        + (" [helper's own copy]" if ff and ff != which_ffmpeg_system() else "")
+        + ("" if ff or FF_PRIVATE_ENV_OFF or not ff_platform() else
+           f" — the helper sets up its own portable ffmpeg when idle (~{int(FF_SETUP_FIRST_SECS)}s)"))
     log(f"seamless: {'ready' if ff else 'unavailable (install ffmpeg)'}")
     dm = which_demucs()
     log(f"demucs: {dm or 'NOT FOUND — pip install demucs (Music only)'}")

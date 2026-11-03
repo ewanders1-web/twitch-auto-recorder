@@ -220,7 +220,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.65</span>
+    <span class="badge">v6.66</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -574,7 +574,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.65'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.66'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -899,6 +899,7 @@ function markHelperDown(wasOk){
   helper.driveAccess=null; // v6.47
   helper.autoUpdate=null; // v6.43
   helper.streamlinkUpdate=null; // v6.55
+  helper.ffmpegSetup=null; // v6.66
   helper.graceOfflineSecs=null; // v6.48
   helper.soloWatch=null; // v6.49
   helperOkSince=0; // v6.43
@@ -1487,6 +1488,7 @@ function pingHelperAndStatus(){
       helper.driveAccess=(d.driveAccess && typeof d.driveAccess==='object')?d.driveAccess:null; // v6.47
       helper.autoUpdate=(d.autoUpdate && typeof d.autoUpdate==='object')?d.autoUpdate:null; // v6.43
       helper.streamlinkUpdate=(d.streamlinkUpdate && typeof d.streamlinkUpdate==='object')?d.streamlinkUpdate:null; // v6.55
+      helper.ffmpegSetup=(d.ffmpegSetup && typeof d.ffmpegSetup==='object')?d.ffmpegSetup:null; // v6.66
       helper.graceOfflineSecs=(typeof d.graceOfflineSecs==='number' && isFinite(d.graceOfflineSecs))?d.graceOfflineSecs:null; // v6.48
       helper.soloWatch=(d.soloWatch && typeof d.soloWatch==='object')?d.soloWatch:null; // v6.49
       { const sf=helper.statusFile; const da=helper.driveAccess;
@@ -2346,7 +2348,7 @@ function updateHelperBar(){
   const dot=document.getElementById('helperDot');
   const txt=document.getElementById('helperTxt');
   if(!dot||!txt) return;
-  const pendingBit=(helper.pendingRestart?(' · restart pending (disk v'+(helper.diskVersion||'?')+')'):'')+keepAwakeBit()+autoUpdateBit()+streamlinkBit()+twitchWatchBit(); // v6.64 twitch-watch bit · v6.40 keep-awake bit · v6.43 auto-update bit · v6.55 streamlink bit
+  const pendingBit=(helper.pendingRestart?(' · restart pending (disk v'+(helper.diskVersion||'?')+')'):'')+keepAwakeBit()+autoUpdateBit()+streamlinkBit()+ffmpegSetupBit()+twitchWatchBit(); // v6.66 ffmpeg setup bit · v6.64 twitch-watch bit · v6.40 keep-awake bit · v6.43 auto-update bit · v6.55 streamlink bit
   if(helper.ok && helper.streamlink){
     const diskBit=(helper.diskFree!=null)?(' · '+fmtDiskBytes(helper.diskFree)+' free'):'';
     const demucsBit=helper.demucs?'':(voiceReady()?' · voice removal: Fast (no demucs)':' · demucs missing');
@@ -5913,7 +5915,9 @@ function streamlinkUpdateText(){
   if(!helper.ok || !s) return '';
   if(!s.lastCheckAt) return 'streamlink: version check a few minutes after the helper starts';
   const inst=s.installed;
-  if(s.state==='missing' || !inst) return 'streamlink: ⚠ not working — '+(s.hint||s.lastResult||'streamlink --version failed');
+  if(!inst && s.state==='private-waiting') return 'streamlink: not installed — the helper sets up its own streamlink '+(s.latest||'')+' when idle'+(s.waitingFor?' (waiting: '+s.waitingFor+')':''); // v6.66
+  if(!inst && s.state==='private-building') return 'streamlink: not installed — the helper is setting up its own streamlink '+(s.latest||'')+' now…'; // v6.66
+  if(s.state==='missing' || !inst) return 'streamlink: ⚠ not working — '+(s.hint||s.lastResult||'streamlink --version failed')+((s.lastError && /by itself/.test(s.lastError))?' — '+s.lastError:'');
   let t='streamlink '+inst+(s.installedReleasedAt?' ('+s.installedReleasedAt+')':'');
   if(s.state==='up-to-date') t+=' — up to date';
   else if(s.state==='python-too-old'){
@@ -5928,14 +5932,26 @@ function streamlinkUpdateText(){
   else if(s.state==='off') t+=' — ⚠ outdated ('+s.latestCompatible+' available; automatic streamlink updates off)';
   else if(s.state==='error') t+=' — ⚠ '+(s.lastError||s.lastResult||'check failed');
   if(s.private && s.private.active) t+=' (helper\'s own copy, Python '+(s.private.pythonVersion||'?')+')'; // v6.59
-  if(s.lastUpgradeTo) t+=' · last auto-upgrade '+(s.lastUpgradeFrom||'?')+' → '+s.lastUpgradeTo+(s.lastUpgradeAt?' at '+auClock(s.lastUpgradeAt):'');
+  if(s.lastUpgradeTo && s.lastUpgradeFrom==='none') t+=' · set up by the helper'+(s.lastUpgradeAt?' at '+auClock(s.lastUpgradeAt):''); // v6.66
+  else if(s.lastUpgradeTo) t+=' · last auto-upgrade '+(s.lastUpgradeFrom||'?')+' → '+s.lastUpgradeTo+(s.lastUpgradeAt?' at '+auClock(s.lastUpgradeAt):'');
   return t;
+}
+// v6.66: the helper sets up a missing ffmpeg itself (portable, checksum-checked) — say what it is doing
+function ffmpegSetupBit(){
+  const f=helper.ffmpegSetup;
+  if(!helper.ok || !f || helper.ffmpeg) return '';
+  if(f.state==='downloading' || f.busy) return ' · ⬇ setting up ffmpeg';
+  if(f.state==='waiting-idle') return ' · ffmpeg missing — set up when idle';
+  if(f.state==='error') return ' · ⚠ ffmpeg missing: '+String(f.lastError||'setup failed').slice(0,90);
+  if(f.state==='unsupported' || f.state==='off') return ' · ffmpeg missing ('+String(f.lastResult||'install ffmpeg').replace(/^ffmpeg not found — /,'')+')';
+  return ' · ffmpeg missing';
 }
 function streamlinkBit(){
   const s=helper.streamlinkUpdate;
   if(!helper.ok || !s) return '';
   if(s.state==='upgrading' || s.upgrading) return ' · ⬆ updating streamlink';
   if(s.state==='private-building') return ' · ⬆ setting up streamlink '+(s.latest||''); // v6.59
+  if(!s.installed && s.state==='private-waiting') return ' · streamlink set up when idle'; // v6.66
   if(s.state==='waiting-idle') return ' · ⬆ streamlink '+s.latestCompatible+' when idle';
   if(s.outdated && (s.state==='outdated-manual' || s.state==='off' || s.state==='error')) return ' · ⚠ streamlink '+s.installed+' outdated';
   return '';
