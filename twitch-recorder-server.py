@@ -22,7 +22,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.66"
+HELPER_VERSION = "6.67"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4953,6 +4953,7 @@ def self_test():
     _self_test_v664()  # v6.64
     _self_test_v665()  # v6.65
     _self_test_v666()  # v6.66
+    _self_test_v667()  # v6.67
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -8998,7 +8999,117 @@ def plan_split(size_bytes, duration):
 
 
 def _part_name(base, i, n):
+    """v6.67: Eric's part names — <streamer>-<YYYY-MM-DD>-<Day>-part <i> of <n>.ogg
+    (e.g. whistleface-2026-11-03-Tue-part 1 of 4.ogg). A base we can't read a streamer + date
+    from (a renamed file) keeps the old <base>-music-part<i>of<n>.ogg. When the same streamer has
+    another broadcast that day, the Drive send adds " (2)", " (3)"… — see drive_part_names()."""
+    pre = pretty_part_prefix(base)
+    if pre:
+        return f"{pre}-part {i} of {n}.ogg"
     return f"{base}-music-part{i}of{n}.ogg"
+
+
+# v6.67: short part names. Env TWITCH_RECORDER_PART_NAMES=classic keeps <base>-music-partNofM.ogg.
+PART_NAMES_CLASSIC = (os.environ.get("TWITCH_RECORDER_PART_NAMES") or "").strip().lower() == "classic"
+_WEEKDAYS_EN = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_PRETTY_PART_RE = _re_drive.compile(
+    r"^(?P<pre>.+?)(?: \((?P<k>\d+)\))?-part (?P<i>\d+) of (?P<n>\d+)(?P<ext>\.[A-Za-z0-9]+)$")
+# Drive-side recordings named like whistleface_20261009-234934
+_ALT_STAMP_RE = _re_drive.compile(r"^(?P<user>[a-z0-9_]+?)_(?P<d>\d{8})-(?P<t>\d{6})")
+
+
+def pretty_part_prefix(base):
+    """'whistleface-2026-11-03-Tue' from a recording base, or None (unknown name / classic mode)."""
+    if PART_NAMES_CLASSIC or not base:
+        return None
+    b = os.path.basename(str(base))
+    user, ymd = None, None
+    m = _REC_STAMP_RE.match(b)
+    if m:
+        user, ymd = m.group("user"), m.group("d")
+    else:
+        m = _ALT_STAMP_RE.match(b.lower())
+        if m:
+            d8 = m.group("d")
+            user, ymd = m.group("user"), f"{d8[:4]}-{d8[4:6]}-{d8[6:]}"
+    if not user or not ymd:
+        return None
+    try:
+        wd = _WEEKDAYS_EN[time.strptime(ymd, "%Y-%m-%d").tm_wday]
+    except ValueError:
+        return None
+    return f"{user}-{ymd}-{wd}"
+
+
+def _with_day_slot(name, k):
+    """'x-part 1 of 4.ogg' → 'x (k)-part 1 of 4.ogg' (k=1 → unchanged). Other names untouched."""
+    m = _PRETTY_PART_RE.match(name)
+    if not m or k <= 1:
+        return name
+    return f"{m.group('pre')} ({k})-part {m.group('i')} of {m.group('n')}{m.group('ext')}"
+
+
+def drive_part_names(target, base, names, user=None, start=None, duration=None, sizes=None):
+    """v6.67: Drive names for one stream's parts. Short names are per streamer+day, so a second
+    broadcast that day (a restart, an evening set) must not land on — or replace — the first one's
+    parts: if a name is already in Drive and the Sent-parts manifest that owns it is a different
+    broadcast (or no manifest owns it), try ' (2)', ' (3)'… Same broadcast (this base, or another
+    computer's copy of it) keeps the name so the existing same-size skip / -<Computer> rule applies."""
+    names = list(names or [])
+    if not names or not any(_PRETTY_PART_RE.match(n) for n in names):
+        return names
+    tgt = Path(target)
+    if user is None or start is None:
+        u2, s2 = parse_recording_stamp(base)
+        user = user or u2
+        start = start if start is not None else s2
+    try:
+        duration = float(duration or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    owners = {}
+    for doc in _read_sent_manifests(tgt):
+        for p in doc.get("parts") or []:
+            if isinstance(p, dict) and p.get("name"):
+                owners.setdefault(str(p["name"]).lower(), []).append(doc)
+
+    def same_broadcast(doc):
+        if doc.get("base") == base:
+            return True
+        if not user or not start or str(doc.get("username") or "").lower() != str(user).lower():
+            return False
+        try:
+            o_start, o_dur = float(doc.get("startEpoch")), float(doc.get("durationSecs") or 0)
+        except (TypeError, ValueError):
+            return False
+        a_end = start + max(duration, 60.0)
+        b_end = o_start + max(o_dur, 60.0)
+        overlap = min(a_end, b_end) - max(start, o_start)
+        return overlap >= 0.5 * min(a_end - start, b_end - o_start)
+
+    sizes = list(sizes or [])
+
+    def taken_by_other(nm, idx):
+        cands = [nm, _host_variant(nm)]
+        for c in cands:
+            try:
+                if not (tgt / c).is_file():
+                    continue
+                # our own part from an interrupted send (same size) — place_in_drive skips it
+                if idx < len(sizes) and sizes[idx] > 0 and (tgt / c).stat().st_size == sizes[idx]:
+                    continue
+            except OSError:
+                continue
+            docs = owners.get(c.lower()) or []
+            if not docs or not any(same_broadcast(d) for d in docs):
+                return True
+        return False
+
+    for k in range(1, 30):
+        cand = [_with_day_slot(n, k) for n in names]
+        if not any(taken_by_other(c, j) for j, c in enumerate(cand)):
+            return cand
+    return [f"{base}-{n}" for n in names]  # 29 broadcasts in one day: fall back to the unique base
 
 
 def split_music_for_drive(job_id, src, progress=None):
@@ -9360,13 +9471,27 @@ def deliver_one(base):
     placed = []
     try:
         try:
-            for nm in d.get("parts") or []:
+            local_names = list(d.get("parts") or [])
+            # v6.67: another broadcast the same day already owns these short names → " (2)"…
+            lsizes = []
+            for nm in local_names:
+                try:
+                    lsizes.append(int((Path(d["partsDir"]) / nm).stat().st_size))
+                except (OSError, TypeError, KeyError):
+                    lsizes.append(0)
+            dnames = drive_part_names(target, base, local_names, user=cov_user, start=cov_start,
+                                      duration=cov_dur, sizes=lsizes)
+            if dnames != local_names:
+                _delivery_update(base, driveNames=dnames)
+                log(f"drive delivery base={base}: another broadcast that day has {local_names[0]!r} — "
+                    f"sending as {dnames[0]!r}…")
+            for nm, dnm in zip(local_names, dnames):
                 src = Path(d["partsDir"]) / nm
                 if not src.is_file():
                     raise RuntimeError(f"local part missing ({nm}) — use Split for Drive again")
                 # v6.38: same name+size already in Drive → skip; different size → <name>-<Computer>
                 # (a manual Re-split from this computer may replace its own earlier parts)
-                dest, _act = place_in_drive(src, Path(target), nm, allow_replace=(d.get("source") == "manual"))
+                dest, _act = place_in_drive(src, Path(target), dnm, allow_replace=(d.get("source") == "manual"))
                 try:
                     placed.append({"name": Path(dest).name, "size": int(src.stat().st_size)})
                 except OSError:
@@ -9528,7 +9653,7 @@ def deliveries_snapshot(limit=60):
             out.append({k: d.get(k) for k in (
                 "base", "musicName", "parts", "sizes", "partSecs", "status", "target",
                 "sentAt", "error", "note", "source", "createdAt", "updatedAt",
-                "localPartsCleared", "coveredBy")})
+                "localPartsCleared", "coveredBy", "driveNames")})
     return out
 
 
@@ -13028,6 +13153,49 @@ def _self_test_v665():
     finally:
         os.path = saved_path
 
+
+
+def _self_test_v667():
+    """v6.67: short Drive part names + a second same-day broadcast gets ' (2)' instead of colliding."""
+    import tempfile as _tmp67
+    assert pretty_part_prefix("whistleface-Tue-2026-11-03T10-08-45") == "whistleface-2026-11-03-Tue"
+    assert pretty_part_prefix("whistleface-2026-11-06T19-02-13") == "whistleface-2026-11-06-Fri"
+    assert pretty_part_prefix("whistleface_20261009-234934") == "whistleface-2026-10-09-Fri"
+    assert pretty_part_prefix("my renamed set") is None
+    assert _part_name("whistleface-Tue-2026-11-03T10-08-45", 1, 4) == "whistleface-2026-11-03-Tue-part 1 of 4.ogg"
+    assert _part_name("my renamed set", 2, 3) == "my renamed set-music-part2of3.ogg"
+    assert _with_day_slot("whistleface-2026-11-03-Tue-part 1 of 4.ogg", 2) == \
+        "whistleface-2026-11-03-Tue (2)-part 1 of 4.ogg"
+    assert _with_day_slot("x-music-part1of2.ogg", 2) == "x-music-part1of2.ogg"
+    with _tmp67.TemporaryDirectory() as td:
+        tgt = Path(td)
+        b1, b2 = "whistleface-Sun-2026-10-11T23-49-35", "whistleface-Sun-2026-10-11T23-58-10"
+        n1 = [_part_name(b1, i, 2) for i in (1, 2)]
+        assert drive_part_names(tgt, b1, n1) == n1  # empty Drive
+        for nm in n1:
+            (tgt / nm).write_bytes(b"x" * 10)
+        u1, s1 = parse_recording_stamp(b1)
+        write_sent_manifest(tgt, b1, "sent", parts=[{"name": n, "size": 10} for n in n1],
+                            duration=300, user=u1, start=s1)
+        assert drive_part_names(tgt, b1, n1) == n1  # our own resend keeps the names
+        u2, s2 = parse_recording_stamp(b2)  # starts after b1's 5 min ended → different broadcast
+        n2 = [_part_name(b2, i, 2) for i in (1, 2)]
+        assert n2 == n1
+        got = drive_part_names(tgt, b2, n2, user=u2, start=s2, duration=3600)
+        assert got == [_with_day_slot(n, 2) for n in n2], got
+        # another computer's copy of the SAME broadcast keeps the name (normal -<Computer>/skip rule)
+        assert drive_part_names(tgt, "whistleface-Sun-2026-10-11T23-50-01", n1, duration=280) == n1
+        # a file nobody's manifest owns is never replaced — next slot
+        (tgt / "whistleface-2026-10-12-Mon-part 1 of 1.ogg").write_bytes(b"y")
+        assert drive_part_names(tgt, "whistleface-Mon-2026-10-12T10-00-00",
+                                ["whistleface-2026-10-12-Mon-part 1 of 1.ogg"]) == \
+            ["whistleface-2026-10-12-Mon (2)-part 1 of 1.ogg"]
+        # an interrupted send of ours (same size, no manifest yet) keeps the name — no duplicate set
+        assert drive_part_names(tgt, "whistleface-Mon-2026-10-12T10-00-00",
+                                ["whistleface-2026-10-12-Mon-part 1 of 1.ogg"], sizes=[1]) == \
+            ["whistleface-2026-10-12-Mon-part 1 of 1.ogg"]
+        # classic names pass straight through
+        assert drive_part_names(tgt, "x", ["x-music-part1of1.ogg"]) == ["x-music-part1of1.ogg"]
 
 def _self_test_v666():
     """v6.66: missing streamlink / ffmpeg are set up by the helper itself — asset pick, archive unpack,

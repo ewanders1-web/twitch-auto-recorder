@@ -220,7 +220,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.66</span>
+    <span class="badge">v6.67</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -574,7 +574,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.66'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.67'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -5460,7 +5460,7 @@ async function fetchDriveHistory(){
 // ─── v6.36: AFTER STREAM ENDS → REMOVE VOICE → SPLIT → SEND TO DRIVE ─────
 // The helper does the work (so it runs with this page closed): when a recording finalizes it
 // queues Music only for the whole session (1 demucs at a time), splits the -music file into
-// equal parts under 50 MB (<base>-music-partNofM.ogg in ~/TwitchRecordings/Drive parts/<base>/)
+// equal parts under 50 MB (v6.67: <streamer>-<date>-<Day>-part N of M.ogg in ~/TwitchRecordings/Drive parts/<base>/)
 // and copies them into Google Drive for Desktop — or waits until Drive appears.
 let pipelineDeliveries={};   // base -> delivery snapshot (from /api/health driveDeliveries)
 let pipelineStatus=null;     // /api/pipeline/status payload
@@ -5529,13 +5529,15 @@ function pipelineBadgeHtml(dv){
   if(st==='sent'){
     txt='☁ Sent to Drive ('+n+' part'+pl+')';
     tip='In '+(dv.target||'Google Drive')+(dv.sentAt?(' · '+driveDate(dv.sentAt)):'');
+    const dn=(Array.isArray(dv.driveNames)&&dv.driveNames.length)?dv.driveNames:(dv.parts||[]); // v6.67
+    if(dn.length) tip+=' · named '+dn[0]+(dn.length>1?(' … '+dn[dn.length-1]):'');
     if(dv.localPartsCleared){ txt+=' · local parts cleared'; tip+=' · local Drive parts cleared (Re-split for Drive can recreate)'; }
   }
   else if(st==='covered'){ // v6.50: another computer already sent this stream
     const cb=dv.coveredBy||{};
     const cn=Number(cb.parts||0);
     txt='☁ In Drive from '+(cb.computer||'another computer')+(cn?(' ('+cn+' part'+(cn===1?'':'s')+')'):'');
-    tip=(dv.note||'Another computer already sent this stream')+(cb.base?(' · their parts: '+cb.base+'-music-part…'):'')+' · Re-split for Drive sends this computer\'s copy anyway';
+    tip=(dv.note||'Another computer already sent this stream')+((cb.partNames&&cb.partNames.length)?(' · their parts: '+cb.partNames[0]+(cb.partNames.length>1?' …':'')):(cb.base?(' · their parts: '+cb.base+'-music-part…'):''))+' · Re-split for Drive sends this computer\'s copy anyway';
   }
   else if(st==='sending'){ txt='⇪ Sending to Drive…'; tip=dv.target||''; }
   else if(st==='error'){ txt='⚠ Drive send failed'; tip=dv.error||'error'; }
