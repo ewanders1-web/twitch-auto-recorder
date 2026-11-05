@@ -220,7 +220,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.68</span>
+    <span class="badge">v6.69</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -460,13 +460,14 @@
         <strong style="font-size:.88rem">🎚️ Voice removal quality</strong>
         <label style="font-size:.75rem;color:#9ca3af;display:flex;align-items:center;gap:.3rem;margin:0">Quality
           <select id="voiceQualitySel" onchange="saveVoiceQuality()" style="font-size:.75rem;padding:.2rem .4rem;width:auto;margin:0">
-            <option value="auto">Auto (Better if demucs is installed, else Fast)</option>
-            <option value="better">Better — Demucs (slow, best)</option>
+            <option value="auto">Auto (Talk only if demucs is installed, else Fast)</option>
+            <option value="talkonly">Talk only — keep song vocals (default)</option>
+            <option value="better">All voices — Demucs full wipe</option>
             <option value="fast">Fast — ffmpeg center-cancel (quick, no demucs)</option>
           </select></label>
       </div>
       <div id="voiceQualityStatus" class="hint" style="margin-top:.35rem"></div>
-      <div class="hint">Used by History <strong>Music only</strong>, Auto Music only, the upload below, <strong>Google Drive → remove voice</strong>, Drive links, and the after-stream remove voice → Drive step. <strong>Better</strong> runs Demucs (also writes <code>-vocals</code> from History/upload). <strong>Fast</strong> cancels centered voice with ffmpeg in seconds-to-minutes — good on stereo VODs, lower quality, needs no Demucs (mono files fall back to Demucs when installed). Either way: one job at a time, output <code>&lt;stem&gt;-music.ogg</code> (unique <code>-2</code>, <code>-3</code>… on collision), originals untouched, and <code>-music</code> / <code>-vocals</code> / <code>-novoice</code> files are skipped as sources.</div>
+      <div class="hint">Used by History <strong>Music only</strong>, Auto Music only, the upload below, <strong>Google Drive → remove voice</strong>, Drive links, and the after-stream remove voice → Drive step. <strong>Talk only</strong> (default) runs Demucs then removes just the DJ talking — song vocals stay. <strong>All voices</strong> is the old full Demucs wipe (also writes <code>-vocals</code> from History/upload). <strong>Fast</strong> cancels centered voice with ffmpeg — quick, no Demucs. One job at a time; output <code>&lt;stem&gt;-music.ogg</code>; originals untouched. Per-streamer override optional in <code>.drive-pipeline.json</code> (<code>userVoiceQuality</code>).</div>
     </div>
     <div class="upload-music-box">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap;">
@@ -574,7 +575,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.68'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.69'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -1942,7 +1943,7 @@ function noticeHelperDisk(){
 }
 // v6.24: one-shot demucs-missing status when Auto Music only is on (soft-skip auto-queue until demucs true).
 // ─── v6.45: VOICE-REMOVAL QUALITY (Fast = ffmpeg, Better = demucs) ─────
-function normVoiceQuality(q){ q=String(q||'').toLowerCase(); return (q==='fast'||q==='better')?q:'auto'; }
+function normVoiceQuality(q){ q=String(q||'').toLowerCase().replace(/_/g,'-'); if(q==='talkonly'||q==='talk-only'||q==='talk'||q==='hybrid') return 'talkonly'; return (q==='fast'||q==='better')?q:'auto'; }
 function helperVoiceQualityAware(){ return !!(helper.voiceQuality && typeof helper.voiceQuality==='object'); }
 // Effective quality a new job would use on this helper (null = cannot remove voice).
 function effectiveVoiceQuality(){
@@ -1950,12 +1951,13 @@ function effectiveVoiceQuality(){
   if(!helperVoiceQualityAware()) return helper.demucs?'better':null; // helper older than v6.45: demucs only
   const want=normVoiceQuality(cfg.voiceQuality);
   const vq=helper.voiceQuality;
-  if(want==='auto') return vq.demucs?'better':(vq.ffmpeg?'fast':null);
+  if(want==='auto') return vq.demucs?'talkonly':(vq.ffmpeg?'fast':null);
+  if(want==='talkonly') return vq.demucs?'talkonly':(vq.ffmpeg?'fast':null);
   if(want==='better') return vq.demucs?'better':(vq.ffmpeg?'fast':null);
   return vq.ffmpeg?'fast':null;
 }
 function voiceReady(){ return !!effectiveVoiceQuality(); }
-function voiceQualityLabel(q){ return q==='fast'?'Fast (ffmpeg)':(q==='better'?'Better (demucs)':'—'); }
+function voiceQualityLabel(q){ return q==='fast'?'Fast (ffmpeg)':(q==='talkonly'?'Talk only':(q==='better'?'All voices (Better)':'—')); }
 function voiceNotReadyMsg(){
   if(helper.ok && !helperVoiceQualityAware()) return 'demucs not installed — '+demucsInstallMsg()+' (or update the helper to v6.45+ for Fast mode)';
   return 'voice removal unavailable — install ffmpeg (Fast) or '+demucsInstallMsg()+' (Better)';
@@ -1974,8 +1976,9 @@ function renderVoiceQualityUi(){
     if(!eff){ txt='Unavailable — '+voiceNotReadyMsg(); color='#fca5a5'; }
     else{
       txt='Using '+voiceQualityLabel(eff)+'.';
-      if(want==='better' && eff==='fast'){ txt+=' Demucs isn\u2019t installed on this helper, so Better falls back to Fast — '+demucsInstallMsg()+', then restart the helper.'; color='#fbbf24'; }
-      else if(want==='auto' && eff==='fast'){ txt+=' Install Demucs for Better: '+demucsInstallMsg()+'.'; }
+      if((want==='better'||want==='talkonly') && eff==='fast'){ txt+=' Demucs isn\u2019t installed on this helper, so it falls back to Fast — '+demucsInstallMsg()+', then restart the helper.'; color='#fbbf24'; }
+      else if(want==='auto' && eff==='fast'){ txt+=' Install Demucs for Talk only: '+demucsInstallMsg()+'.'; }
+      else if(want==='auto' && eff==='talkonly'){ txt+=' Removes DJ talk; keeps song vocals. Pick All voices for a full wipe.'; }
       txt+=' Demucs: '+(helper.voiceQuality.demucs?'installed':'not installed')+' · ffmpeg: '+(helper.voiceQuality.ffmpeg?'ok':'missing')+'.';
     }
   }

@@ -23,7 +23,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.68"
+HELPER_VERSION = "6.69"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4956,6 +4956,7 @@ def self_test():
     _self_test_v666()  # v6.66
     _self_test_v667()  # v6.67
     _self_test_v668()  # v6.68
+    _self_test_v669()  # v6.69
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -5653,17 +5654,20 @@ def music_only_worker(job_id, src_path):
             else:
                 _set_music_job(job_id, progress=msg)
 
-        if quality == "fast":
-            # v6.45: Twitchy Too Fast path — ffmpeg center-cancel, no demucs, -music only.
+        if quality in ("fast", "talkonly"):
+            # v6.45 Fast / v6.69 Talk only — chunked path via voice_removed_parts; -music only.
             info = probe_media(src_path)
+            user = _streamer_from_name(src_path.name) or _job_get(job_id, "username")
             parts = voice_removed_parts(job_id, [src_path], work, info["duration"],
-                                        progress, "fast", pct_lo=5.0, pct_hi=88.0)
+                                        progress, quality, pct_lo=5.0, pct_hi=88.0,
+                                        streamer=user)
             tmp_out = encode_joined_ogg(job_id, parts, work / "out.ogg", info["duration"],
                                         progress, pct_lo=88.0, pct_hi=98.0)
             final = atomic_publish(tmp_out, _unique_music_dest(src_path.name))
             vocals_wav = None
             out_name = final.name
         else:
+            # better — full vocal wipe; also export -vocals sibling
             stem_wav = _run_demucs(src_path, work, progress)
             vocals_wav = _find_vocals(work)
             progress("Encoding instrumental…", pct=90)
@@ -5796,8 +5800,8 @@ def start_music_only(raw_name, redo=False, quality=None):
                     "redo": bool(job.get("redo")),
                 }, 200
 
-    # v6.45: Better (demucs) or Fast (ffmpeg) — only fail when neither can run.
-    eff_q, q_note = resolve_voice_quality(quality)
+    # v6.45/v6.69: Talk only / Better / Fast — only fail when none can run.
+    eff_q, q_note = resolve_voice_quality(quality, username=_streamer_from_name(target.name))
     if not eff_q:
         return {
             "ok": False,
@@ -7377,15 +7381,759 @@ def encode_joined_ogg(job_id, parts, out_path, duration, progress, pct_lo=90.0, 
     raise RuntimeError(f"ffmpeg encode failed: {last}")
 
 
-# ─── v6.45: VOICE-REMOVAL QUALITY — Fast (ffmpeg) vs Better (demucs) ─────
-# Merged from Twitchy Too. One setting (Convert tab, saved in .drive-pipeline.json) drives
-# History/Auto Music only, Convert upload, Drive → remove voice, Drive link, and the
-# after-stream remove-voice → split → Drive pipeline. Requests may override per job.
-#   better — demucs two-stems no_vocals (unchanged behavior; needs demucs)
-#   fast   — ffmpeg center-cancel vocal reduce (no demucs; stereo sources only)
-#   auto   — Better when demucs is installed, else Fast (default)
-# Both still take the one-at-a-time voice-removal slot so jobs queue politely.
-VOICE_QUALITIES = ("auto", "better", "fast")
+# ─── v6.69: TALK-ONLY HYBRID VOICE REMOVAL ───────────────────────────────────
+# After demucs two-stems, keep song vocals; remove only the DJ talking via ECAPA
+# speaker embeddings (speechbrain spkrec-ecapa-voxceleb) matched to a per-streamer
+# voiceprint. Proven on Skratch Bastid Clip C (cutoff 0.33) and Red Alert prototypes.
+# Default when demucs is available (auto → talkonly). Falls back to Better (full wipe)
+# then Fast. Voiceprints: ~/TwitchRecordings/.voiceprints/<streamer>.npz
+# Opt-out of speechbrain auto-install: TWITCH_RECORDER_TALKONLY_AUTOINSTALL=0
+# Cutoff: TWITCH_RECORDER_TALKONLY_CUTOFF (default 0.33)
+# Model cache: ~/.twitch-recorder/ecapa_model (Windows: %LOCALAPPDATA%\TwitchRecorder\ecapa_model)
+
+TALKONLY_WIN_SECS = 1.6
+TALKONLY_HOP_SECS = 0.4
+TALKONLY_SMOOTH_WINDOWS = 5  # ~2 s moving average
+TALKONLY_RMS_GATE = 3e-3
+TALKONLY_PAD_SECS = 0.3
+TALKONLY_MERGE_GAP_SECS = 1.0
+TALKONLY_MIN_SEG_SECS = 0.8
+TALKONLY_XFADE_SECS = 0.05
+TALKONLY_REFINE_COS = 0.55
+TALKONLY_ENROLL_MIN = 8  # minimum seed windows for a usable voiceprint
+try:
+    TALKONLY_CUTOFF = float(os.environ.get("TWITCH_RECORDER_TALKONLY_CUTOFF") or "0.33")
+except ValueError:
+    TALKONLY_CUTOFF = 0.33
+TALKONLY_AUTOINSTALL = os.environ.get("TWITCH_RECORDER_TALKONLY_AUTOINSTALL", "1") != "0"
+TALKONLY_STATE = {
+    "speechbrain": None,  # True/False after probe
+    "installTried": False,
+    "installError": None,
+    "modelDir": None,
+    "lastError": None,
+}
+
+
+class _TalkOnlyError(RuntimeError):
+    """Talk-only path cannot run — caller should fall back to Better."""
+
+
+def voiceprints_dir():
+    d = REC_DIR / ".voiceprints"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def ecapa_model_dir():
+    env = os.environ.get("TWITCH_RECORDER_ECAPA_DIR")
+    if env:
+        return Path(env).expanduser()
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+        return base / "TwitchRecorder" / "ecapa_model"
+    return Path.home() / ".twitch-recorder" / "ecapa_model"
+
+
+def talkonly_python():
+    """Interpreter that should import torch + speechbrain (demucs' Python preferred)."""
+    return demucs_python() or sys.executable
+
+
+def _probe_speechbrain(py=None):
+    py = py or talkonly_python()
+    if not py:
+        return False, "no Python for talk-only"
+    try:
+        r = subprocess.run(
+            [py, "-c",
+             "import torch,numpy; from speechbrain.inference.speaker import EncoderClassifier; print('ok')"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120, stdin=subprocess.DEVNULL, **_no_window_kw(),
+        )
+        if r.returncode == 0 and "ok" in (r.stdout or ""):
+            return True, None
+        err = ((r.stderr or r.stdout or "")[-300:]).strip() or f"exit {r.returncode}"
+        return False, err
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+
+
+def speechbrain_available(force=False):
+    if TALKONLY_STATE["speechbrain"] is not None and not force:
+        return bool(TALKONLY_STATE["speechbrain"])
+    ok, err = _probe_speechbrain()
+    TALKONLY_STATE["speechbrain"] = ok
+    if not ok:
+        TALKONLY_STATE["lastError"] = err
+    return ok
+
+
+def ensure_speechbrain(progress=None):
+    """Install speechbrain into demucs' Python when missing (idle / first talkonly job)."""
+    if speechbrain_available():
+        return True
+    if not TALKONLY_AUTOINSTALL:
+        TALKONLY_STATE["installError"] = "auto-install disabled (TWITCH_RECORDER_TALKONLY_AUTOINSTALL=0)"
+        return False
+    py = talkonly_python()
+    if not py:
+        TALKONLY_STATE["installError"] = "no Python that can run demucs"
+        return False
+    if TALKONLY_STATE["installTried"]:
+        return speechbrain_available(force=True)
+    TALKONLY_STATE["installTried"] = True
+    if progress:
+        progress("Installing speechbrain for Talk only (one-time)…", None)
+    log(f"talkonly: pip install speechbrain into {py}")
+    try:
+        r = subprocess.run(
+            [py, "-m", "pip", "install", "--upgrade", "speechbrain", "soundfile"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=900, stdin=subprocess.DEVNULL, **_no_window_kw(),
+        )
+        if r.returncode != 0:
+            TALKONLY_STATE["installError"] = ((r.stderr or r.stdout or "")[-400:]).strip()
+            log(f"talkonly: speechbrain install failed: {TALKONLY_STATE['installError']}")
+            return False
+    except (OSError, subprocess.TimeoutExpired) as e:
+        TALKONLY_STATE["installError"] = str(e)
+        log(f"talkonly: speechbrain install error: {e}")
+        return False
+    ok = speechbrain_available(force=True)
+    if ok:
+        log("talkonly: speechbrain ready")
+        TALKONLY_STATE["installError"] = None
+    return ok
+
+
+def talkonly_snapshot():
+    sb = speechbrain_available()
+    return {
+        "available": bool(sb and demucs_available()),
+        "speechbrain": sb,
+        "demucs": demucs_available(),
+        "autoInstall": TALKONLY_AUTOINSTALL,
+        "installError": TALKONLY_STATE.get("installError"),
+        "lastError": TALKONLY_STATE.get("lastError"),
+        "cutoff": TALKONLY_CUTOFF,
+        "voiceprintsDir": str(voiceprints_dir()),
+        "modelDir": str(ecapa_model_dir()),
+    }
+
+
+def _streamer_from_name(name):
+    u, _ = parse_recording_stamp(name)
+    return (u or "").lower() or None
+
+
+def user_voice_quality(username):
+    """Optional per-streamer override from .drive-pipeline.json userVoiceQuality."""
+    u = safe_username(username) if username else None
+    if not u:
+        return None
+    with PIPELINE_LOCK:
+        m = PIPELINE.get("userVoiceQuality") or {}
+        return _norm_voice_quality(m.get(u))
+
+
+def load_voiceprint(streamer):
+    if not streamer:
+        return None
+    p = voiceprints_dir() / f"{streamer.lower()}.npz"
+    if not p.is_file():
+        return None
+    try:
+        # npz via numpy if available; else skip (worker will rewrite)
+        import numpy as _np
+        d = _np.load(str(p), allow_pickle=True)
+        c = d["centroid"]
+        n = float(d["n"]) if "n" in d.files else 0.0
+        return {"centroid": c, "n": n, "path": str(p)}
+    except Exception as e:
+        log(f"talkonly: voiceprint load failed {p.name}: {e}")
+        return None
+
+
+def save_voiceprint(streamer, centroid, n=0, meta=None):
+    if not streamer or centroid is None:
+        return None
+    try:
+        import numpy as _np
+        p = voiceprints_dir() / f"{streamer.lower()}.npz"
+        payload = {"centroid": _np.asarray(centroid, dtype="float32"), "n": float(n),
+                   "updatedAt": time.time(), "helper": HELPER_VERSION}
+        if meta:
+            payload["meta"] = str(meta)[:200]
+        _np.savez(str(p), **payload)
+        return str(p)
+    except Exception as e:
+        log(f"talkonly: voiceprint save failed: {e}")
+        return None
+
+
+def talkonly_smooth(scores, k=TALKONLY_SMOOTH_WINDOWS):
+    """Moving average (uniform filter) without scipy."""
+    if not scores:
+        return []
+    if k <= 1:
+        return list(scores)
+    n = len(scores)
+    half = k // 2
+    out = [0.0] * n
+    # prefix sums for O(n)
+    pref = [0.0]
+    for x in scores:
+        pref.append(pref[-1] + float(x))
+    for i in range(n):
+        a = max(0, i - half)
+        b = min(n, i + half + 1)
+        out[i] = (pref[b] - pref[a]) / (b - a)
+    return out
+
+
+def talkonly_mask_segments(times, scores, rms, cutoff=None,
+                           pad=TALKONLY_PAD_SECS, merge_gap=TALKONLY_MERGE_GAP_SECS,
+                           min_seg=TALKONLY_MIN_SEG_SECS, win=TALKONLY_WIN_SECS,
+                           hop=TALKONLY_HOP_SECS, rms_gate=TALKONLY_RMS_GATE):
+    """Build talk mask segments (start, end) in absolute seconds from window scores.
+    Matches skratch render.py: smooth → gate → center 0.8s of each window → merge → pad."""
+    cutoff = TALKONLY_CUTOFF if cutoff is None else float(cutoff)
+    if not times:
+        return []
+    sm = talkonly_smooth(scores, TALKONLY_SMOOTH_WINDOWS)
+    on = [(sm[i] > cutoff) and (float(rms[i]) > rms_gate) for i in range(len(sm))]
+    # rasterize at 10 ms
+    fr = 0.01
+    last_t = float(times[-1]) + win
+    n = int(last_t / fr) + 2
+    m = [False] * n
+    for ti, o in zip(times, on):
+        if not o:
+            continue
+        # center 0.8 s of the 1.6 s window (ti+0.4 .. ti+1.2)
+        a = int((float(ti) + 0.4) / fr)
+        b = int((float(ti) + 1.2) / fr)
+        a = max(0, a)
+        b = min(n, b)
+        for j in range(a, b):
+            m[j] = True
+    segs = []
+    i = 0
+    while i < n:
+        if not m[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and m[j]:
+            j += 1
+        segs.append((i * fr, j * fr))
+        i = j
+    mg = []
+    for a, b in segs:
+        if mg and a - mg[-1][1] < merge_gap:
+            mg[-1] = (mg[-1][0], b)
+        else:
+            mg.append((a, b))
+    out = []
+    for a, b in mg:
+        if b - a < min_seg:
+            continue
+        out.append((max(0.0, a - pad), b + pad))
+    return out
+
+
+def talkonly_render_mix(orig, no_vocals, sr, segments, xfade=TALKONLY_XFADE_SECS):
+    """Crossfade orig→no_vocals on talk segments. orig/no_vocals are list-of-frames
+    (each frame = (L,R) floats) or nested lists. Returns same shape as orig."""
+    n = len(orig)
+    if n == 0:
+        return orig
+    # Build gate 0..1 per sample
+    g = [0.0] * n
+    for a, b in segments:
+        i0 = max(0, int(a * sr))
+        i1 = min(n, int(b * sr))
+        for i in range(i0, i1):
+            g[i] = 1.0
+    k = max(1, int(xfade * sr))
+    if k > 1:
+        # box smooth via prefix sums (O(n))
+        pref = [0.0]
+        for x in g:
+            pref.append(pref[-1] + x)
+        outg = [0.0] * n
+        for i in range(n):
+            a = max(0, i - k + 1)
+            outg[i] = (pref[i + 1] - pref[a]) / (i - a + 1)
+        g = outg
+    # Mix: (1-g)*orig + g*no_vocals
+    nv = no_vocals
+    if len(nv) < n:
+        nv = list(nv) + [orig[i] for i in range(len(nv), n)]
+    mixed = []
+    stereo = isinstance(orig[0], (list, tuple))
+    for i in range(n):
+        gi = g[i]
+        if stereo:
+            o = orig[i]
+            v = nv[i] if i < len(nv) else o
+            # pad nv channels
+            if not isinstance(v, (list, tuple)):
+                v = (v, v)
+            if not isinstance(o, (list, tuple)):
+                o = (o, o)
+            mixed.append(((1 - gi) * float(o[0]) + gi * float(v[0]),
+                          (1 - gi) * float(o[1]) + gi * float(v[1])))
+        else:
+            mixed.append((1 - gi) * float(orig[i]) + gi * float(nv[i] if i < len(nv) else orig[i]))
+    return mixed
+
+
+def _read_wav_f32_stereo(path):
+    """Read wav → (sr, frames as list of (L,R) float -1..1). Prefer soundfile/numpy, else wave."""
+    try:
+        import numpy as _np
+        import soundfile as _sf
+        x, sr = _sf.read(str(path), dtype="float32", always_2d=True)
+        if x.shape[1] == 1:
+            x = _np.repeat(x, 2, axis=1)
+        return int(sr), [(float(a), float(b)) for a, b in x[:, :2]]
+    except Exception:
+        pass
+    import wave
+    import struct
+    with wave.open(str(path), "rb") as w:
+        sr = w.getframerate()
+        ch = w.getnchannels()
+        sw = w.getsampwidth()
+        n = w.getnframes()
+        raw = w.readframes(n)
+    if sw == 2:
+        fmt = "<" + "h" * (len(raw) // 2)
+        samples = struct.unpack(fmt, raw)
+        scale = 32768.0
+    elif sw == 4:
+        fmt = "<" + "i" * (len(raw) // 4)
+        samples = struct.unpack(fmt, raw)
+        scale = 2147483648.0
+    else:
+        raise RuntimeError(f"unsupported wav sample width {sw}")
+    frames = []
+    if ch == 1:
+        for s in samples:
+            v = s / scale
+            frames.append((v, v))
+    else:
+        for i in range(0, len(samples) - 1, ch):
+            frames.append((samples[i] / scale, samples[i + 1] / scale))
+    return sr, frames
+
+
+def _write_wav_f32_stereo(path, sr, frames):
+    try:
+        import numpy as _np
+        import soundfile as _sf
+        arr = _np.asarray(frames, dtype="float32")
+        if arr.ndim == 1:
+            arr = _np.stack([arr, arr], axis=1)
+        _sf.write(str(path), arr, sr, subtype="PCM_16")
+        return
+    except Exception:
+        pass
+    import wave
+    import struct
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        buf = bytearray()
+        for fr in frames:
+            if isinstance(fr, (list, tuple)):
+                l, r = float(fr[0]), float(fr[1])
+            else:
+                l = r = float(fr)
+            for v in (l, r):
+                i = int(max(-1.0, min(1.0, v)) * 32767.0)
+                buf += struct.pack("<h", i)
+        w.writeframes(bytes(buf))
+
+
+# Embedded worker: runs under demucs' Python (torch + speechbrain + numpy).
+_TALKONLY_WORKER = r'''
+import json, sys, os, subprocess
+import numpy as np
+WIN, HOP = 1.6, 0.4
+RMS_GATE = 3e-3
+REFINE = 0.55
+ENROLL_MIN = 8
+
+def ffmpeg_mono16(path, ff):
+    r = subprocess.run([ff, "-nostdin", "-v", "error", "-i", path, "-ac", "1", "-ar", "16000",
+                        "-f", "f32le", "-"], capture_output=True, timeout=3600)
+    if r.returncode != 0:
+        raise RuntimeError("ffmpeg decode failed: " + (r.stderr[-200:].decode("utf-8", "replace")))
+    return np.frombuffer(r.stdout, dtype=np.float32)
+
+def windows(x, off=0.0):
+    ts, rms, B = [], [], []
+    t = 0.0
+    sr = 16000
+    need = int(WIN * sr)
+    while t + WIN <= len(x) / sr:
+        i = int(round(t * sr))
+        s = x[i:i + need]
+        if len(s) < need:
+            break
+        ts.append(off + t)
+        rms.append(float(np.sqrt((s ** 2).mean())))
+        B.append(s)
+        t += HOP
+    if not B:
+        return np.zeros(0), np.zeros(0), np.zeros((0, need))
+    return np.asarray(ts), np.asarray(rms), np.stack(B)
+
+def main():
+    job = json.load(open(sys.argv[1], encoding="utf-8"))
+    ff = job["ffmpeg"]
+    model_dir = job["modelDir"]
+    os.makedirs(model_dir, exist_ok=True)
+    import torch
+    from speechbrain.inference.speaker import EncoderClassifier
+    torch.set_num_threads(max(1, min(4, os.cpu_count() or 2)))
+    enc = EncoderClassifier.from_hparams(
+        "speechbrain/spkrec-ecapa-voxceleb", savedir=model_dir, run_opts={"device": "cpu"})
+    all_t, all_rms, all_E = [], [], []
+    for ch in job["chunks"]:
+        x = ffmpeg_mono16(ch["vocals"], ff)
+        ts, rms, B = windows(x, float(ch.get("offset") or 0))
+        if len(B) == 0:
+            continue
+        E = []
+        with torch.no_grad():
+            for i in range(0, len(B), 64):
+                batch = torch.from_numpy(B[i:i+64].copy())
+                e = enc.encode_batch(batch).squeeze(1).numpy()
+                E.append(e)
+        E = np.concatenate(E)
+        E /= (np.linalg.norm(E, axis=1, keepdims=True) + 1e-9)
+        all_t.append(ts); all_rms.append(rms); all_E.append(E)
+    if not all_E:
+        raise SystemExit("no embeddings")
+    t = np.concatenate(all_t); rms = np.concatenate(all_rms); E = np.concatenate(all_E)
+    centroid = None
+    vp = job.get("voiceprint")
+    if vp and os.path.isfile(vp):
+        try:
+            d = np.load(vp)
+            centroid = np.asarray(d["centroid"], dtype=np.float32)
+            centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
+        except Exception:
+            centroid = None
+    # Seed enrollment when no voiceprint: energy peaks (intro/outro bias) as speech proxy
+    if centroid is None:
+        dur = float(t[-1] + WIN) if len(t) else 0
+        energy = rms.copy()
+        # boost first/last 5 minutes (DJ talk common there)
+        for i, ti in enumerate(t):
+            if ti < 300 or ti > max(0, dur - 300):
+                energy[i] *= 1.5
+        order = np.argsort(-energy)
+        seed_idx = [i for i in order if rms[i] > RMS_GATE][:max(ENROLL_MIN * 3, 24)]
+        if len(seed_idx) < ENROLL_MIN:
+            raise SystemExit("enrollment failed: not enough speech-like windows")
+        C = E[seed_idx].mean(0)
+        C /= (np.linalg.norm(C) + 1e-9)
+        # refine once with high cosine matches
+        st = E @ C
+        conf = (st > REFINE) & (rms > RMS_GATE)
+        if conf.sum() >= ENROLL_MIN:
+            C = E[conf].mean(0)
+            C /= (np.linalg.norm(C) + 1e-9)
+        centroid = C
+        enrolled = "energy-vad"
+    else:
+        enrolled = "existing"
+        st0 = E @ centroid
+        conf = (st0 > REFINE) & (rms > RMS_GATE)
+        if conf.sum() >= ENROLL_MIN:
+            C = E[conf].mean(0)
+            C /= (np.linalg.norm(C) + 1e-9)
+            # blend with prior for stability
+            centroid = 0.7 * centroid + 0.3 * C
+            centroid /= (np.linalg.norm(centroid) + 1e-9)
+            enrolled = "refined"
+    st = E @ centroid
+    out_vp = job.get("voiceprintOut") or vp
+    if out_vp:
+        os.makedirs(os.path.dirname(out_vp) or ".", exist_ok=True)
+        np.savez(out_vp, centroid=centroid.astype(np.float32), n=float((st > REFINE).sum()),
+                 enrolled=enrolled)
+    # write scores for helper
+    np.savez(job["scoresOut"], t=t, st=st.astype(np.float32), rms=rms.astype(np.float32),
+             enrolled=enrolled)
+    print(json.dumps({"ok": True, "windows": int(len(t)), "enrolled": enrolled,
+                      "talkish": int((st > float(job.get("cutoff") or 0.33)).sum())}))
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _run_talkonly_embeddings(job_id, chunks_meta, streamer, progress):
+    """chunks_meta: [{vocals, offset, no_vocals, orig}]. Returns (scores dict, note)."""
+    if not ensure_speechbrain(progress):
+        raise _TalkOnlyError(
+            TALKONLY_STATE.get("installError")
+            or TALKONLY_STATE.get("lastError")
+            or "speechbrain not available"
+        )
+    py = talkonly_python()
+    ff = which_ffmpeg()
+    if not ff:
+        raise _TalkOnlyError("ffmpeg not found")
+    work = Path(chunks_meta[0]["vocals"]).parent.parent if chunks_meta else Path(".")
+    # put job files under stems parent
+    base = Path(chunks_meta[0].get("work") or work)
+    job_path = base / "talkonly-job.json"
+    scores_path = base / "talkonly-scores.npz"
+    vp_path = voiceprints_dir() / f"{(streamer or 'unknown').lower()}.npz"
+    model_dir = ecapa_model_dir()
+    TALKONLY_STATE["modelDir"] = str(model_dir)
+    job = {
+        "ffmpeg": ff,
+        "modelDir": str(model_dir),
+        "cutoff": TALKONLY_CUTOFF,
+        "voiceprint": str(vp_path) if vp_path.is_file() else None,
+        "voiceprintOut": str(vp_path),
+        "scoresOut": str(scores_path),
+        "chunks": [{"vocals": c["vocals"], "offset": c["offset"]} for c in chunks_meta],
+    }
+    job_path.write_text(json.dumps(job), encoding="utf-8")
+    script = base / "talkonly_worker.py"
+    script.write_text(_TALKONLY_WORKER, encoding="utf-8")
+    progress("Talk only: ECAPA voiceprint / scoring…", None)
+    rc, tail = _job_run_proc(
+        job_id, [py, str(script), str(job_path)], timeout=3 * 3600,
+    )
+    if rc != 0 or not scores_path.is_file():
+        raise _TalkOnlyError(f"ECAPA scoring failed: {(tail or '')[-300:]}")
+    try:
+        import numpy as _np
+        d = _np.load(str(scores_path), allow_pickle=True)
+        return {
+            "t": [float(x) for x in d["t"]],
+            "st": [float(x) for x in d["st"]],
+            "rms": [float(x) for x in d["rms"]],
+            "enrolled": str(d["enrolled"]) if "enrolled" in d.files else "",
+        }, None
+    except Exception as e:
+        raise _TalkOnlyError(f"scores load failed: {e}")
+
+
+def chunked_demucs_talkonly(job_id, src, work, duration, progress, streamer=None,
+                            pct_lo=20.0, pct_hi=90.0):
+    """Demucs two-stems per chunk, then mask only DJ talk; return ordered talk-only FLACs.
+    On talk-only failure after demucs, returns no_vocals stems (Better) and sets qualityNote."""
+    srcs = list(src) if isinstance(src, (list, tuple)) else [src]
+    ff = which_ffmpeg()
+    if not ff:
+        raise RuntimeError("ffmpeg not found")
+    if not demucs_available():
+        raise _TalkOnlyError("demucs not installed")
+    chunks_dir = Path(work) / "chunks"
+    stems_dir = Path(work) / "stems"
+    sep_dir = Path(work) / "sep"
+    out_dir = Path(work) / "talkonly"
+    for d in (chunks_dir, stems_dir, sep_dir, out_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    est = max(1, int((duration or 0) // DEMUCS_CHUNK_SECS) + (1 if (duration or 0) % DEMUCS_CHUNK_SECS else 0))
+    progress(f"Splitting into {DEMUCS_CHUNK_SECS // 60 or 1}-min chunks (~{est})…", pct_lo - 2)
+    for si, one in enumerate(srcs):
+        rc, tail = _job_run_proc(
+            job_id,
+            [ff, "-nostdin", "-v", "error", "-y", "-i", str(one), "-vn", "-map", "0:a:0",
+             "-ac", "2", "-ar", "44100", "-c:a", "flac", "-f", "segment",
+             "-segment_time", str(DEMUCS_CHUNK_SECS), "-reset_timestamps", "1",
+             str(chunks_dir / f"s{si:03d}c%04d.flac")],
+            timeout=3 * 3600,
+        )
+        if rc != 0:
+            raise RuntimeError(f"ffmpeg split failed: {tail[-400:]}")
+    chunks = sorted(chunks_dir.glob("s*c*.flac"))
+    if not chunks:
+        raise RuntimeError("ffmpeg split produced no chunks")
+    n = len(chunks)
+    base_cmd = demucs_cmd_base()
+    span = max(1.0, (pct_hi - pct_lo) * 0.85)  # leave room for talkonly scoring/render
+    demucs_hi = pct_lo + span
+    meta = []
+    nv_flacs = []
+    for i, chunk in enumerate(chunks):
+        _check_cancel(job_id)
+        _wait_disk_ok(job_id, progress)
+        label = f"Demucs chunk {i + 1}/{n}"
+        progress(f"{label}…", round(pct_lo + span * i / n, 1))
+        out_sep = sep_dir / chunk.stem
+        state = {"pct": 0.0}
+
+        def on_line(line, i=i, label=label, state=state):
+            _msg, p = _parse_demucs_progress_line(line)
+            if p is not None and p >= state["pct"]:
+                state["pct"] = p
+                progress(f"{label} · {p:.0f}%", round(pct_lo + span * (i + p / 100.0) / n, 1))
+
+        last_err = ""
+        stem_nv = stem_v = None
+        for dev in _demucs_devices():
+            shutil.rmtree(out_sep, ignore_errors=True)
+            env = dict(os.environ)
+            env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+            cmd = base_cmd + [
+                "-n", "htdemucs", "--two-stems=vocals", "--segment", DEMUCS_SEGMENT,
+                "-j", "1", "-d", dev, "--clip-mode", "clamp",
+                "--filename", "{stem}.{ext}", "-o", str(out_sep), str(chunk),
+            ]
+            state["pct"] = 0.0
+            rc, tail = _job_run_proc(job_id, cmd, line_cb=on_line, env=env)
+            cand_nv = out_sep / "htdemucs" / "no_vocals.wav"
+            cand_v = out_sep / "htdemucs" / "vocals.wav"
+            if rc == 0 and cand_nv.is_file() and cand_v.is_file():
+                stem_nv, stem_v = cand_nv, cand_v
+                break
+            last_err = tail[-500:]
+            if dev == "cuda":
+                _DEMUCS_DEVICE_STATE["cuda_failed"] = True
+                progress(f"{label}: CUDA failed, retrying on CPU…", None)
+            if dev == "mps":
+                _DEMUCS_DEVICE_STATE["mps_failed"] = True
+                progress(f"{label}: MPS failed, retrying on CPU…", None)
+        tries = 0
+        while stem_nv is None and tries < DEMUCS_CHUNK_RETRIES and not _pipeline_error_is_permanent(last_err):
+            tries += 1
+            progress(f"{label} failed — trying that chunk again…", None)
+            _CHUNK_RETRY_STATS["retries"] += 1
+            t_end = time.time() + DEMUCS_CHUNK_RETRY_PAUSE_SECS
+            while time.time() < t_end:
+                _check_cancel(job_id)
+                time.sleep(0.5)
+            shutil.rmtree(out_sep, ignore_errors=True)
+            env = dict(os.environ)
+            env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+            cmd = base_cmd + [
+                "-n", "htdemucs", "--two-stems=vocals", "--segment", DEMUCS_SEGMENT,
+                "-j", "1", "-d", "cpu", "--clip-mode", "clamp",
+                "--filename", "{stem}.{ext}", "-o", str(out_sep), str(chunk),
+            ]
+            state["pct"] = 0.0
+            rc, tail = _job_run_proc(job_id, cmd, line_cb=on_line, env=env)
+            cand_nv = out_sep / "htdemucs" / "no_vocals.wav"
+            cand_v = out_sep / "htdemucs" / "vocals.wav"
+            if rc == 0 and cand_nv.is_file() and cand_v.is_file():
+                stem_nv, stem_v = cand_nv, cand_v
+                _CHUNK_RETRY_STATS["saved"] += 1
+            else:
+                last_err = tail[-500:]
+        if stem_nv is None or stem_v is None:
+            raise RuntimeError(friendly_demucs_error(last_err, f"demucs (chunk {i + 1}/{n})"))
+        # Keep both stems as FLAC; keep original chunk for remix
+        nv_flac = stems_dir / f"{chunk.stem}-nv.flac"
+        v_flac = stems_dir / f"{chunk.stem}-v.flac"
+        for src_wav, dest in ((stem_nv, nv_flac), (stem_v, v_flac)):
+            rc, tail = _job_run_proc(
+                job_id, [ff, "-nostdin", "-v", "error", "-y", "-i", str(src_wav),
+                         "-c:a", "flac", str(dest)], timeout=1800,
+            )
+            if rc != 0 or not dest.is_file():
+                raise RuntimeError(f"ffmpeg stem convert failed: {tail[-300:]}")
+        shutil.rmtree(out_sep, ignore_errors=True)
+        # offset: chunk index * DEMUCS_CHUNK_SECS (within concatenated timeline)
+        # Approximate from sorted order; multi-source uses sXXXcYYYY naming
+        offset = float(i * DEMUCS_CHUNK_SECS)
+        meta.append({
+            "orig": str(chunk),
+            "no_vocals": str(nv_flac),
+            "vocals": str(v_flac),
+            "offset": offset,
+            "work": str(work),
+            "index": i,
+        })
+        nv_flacs.append(nv_flac)
+    # Talk-only mask + render; on failure keep Better (no_vocals) stems
+    try:
+        scores, _ = _run_talkonly_embeddings(job_id, meta, streamer, progress)
+        segs = talkonly_mask_segments(scores["t"], scores["st"], scores["rms"])
+        progress(f"Talk only: rendering ({len(segs)} talk regions)…", demucs_hi)
+        outs = []
+        nmeta = len(meta)
+        for j, ch in enumerate(meta):
+            _check_cancel(job_id)
+            sr_o, orig = _read_wav_f32_stereo(ch["orig"])
+            sr_n, nv = _read_wav_f32_stereo(ch["no_vocals"])
+            sr = sr_o or sr_n
+            # segments relative to this chunk
+            off = float(ch["offset"])
+            dur_c = len(orig) / float(sr) if sr else 0
+            local = []
+            for a, b in segs:
+                if b <= off or a >= off + dur_c:
+                    continue
+                local.append((max(0.0, a - off), min(dur_c, b - off)))
+            mixed = talkonly_render_mix(orig, nv, sr, local)
+            out_wav = out_dir / f"c{j:04d}.wav"
+            _write_wav_f32_stereo(out_wav, sr, mixed)
+            out_flac = out_dir / f"c{j:04d}.flac"
+            rc, tail = _job_run_proc(
+                job_id, [ff, "-nostdin", "-v", "error", "-y", "-i", str(out_wav),
+                         "-c:a", "flac", str(out_flac)], timeout=1800,
+            )
+            if rc != 0 or not out_flac.is_file():
+                raise _TalkOnlyError(f"talkonly encode failed: {tail[-200:]}")
+            try:
+                out_wav.unlink()
+            except OSError:
+                pass
+            try:
+                Path(ch["orig"]).unlink()
+            except OSError:
+                pass
+            outs.append(out_flac)
+            progress(f"Talk only render {j + 1}/{nmeta}",
+                     round(demucs_hi + (pct_hi - demucs_hi) * (j + 1) / nmeta, 1))
+        enrolled = scores.get("enrolled") or ""
+        note = f"Talk only (cutoff {TALKONLY_CUTOFF}; voiceprint {enrolled or 'ok'})"
+        _set_music_job(job_id, quality="talkonly", qualityNote=note)
+        log(f"talkonly job={job_id} streamer={streamer} segs={len(segs)} enrolled={enrolled}")
+        return outs
+    except _TalkOnlyError as e:
+        log(f"talkonly job={job_id}: falling back to Better — {e}")
+        _set_music_job(job_id, quality="better",
+                       qualityNote=f"Talk only failed ({e}) — used All voices (Better)")
+        progress("Talk only unavailable — using All voices (Better)…", None)
+        TALKONLY_STATE["lastError"] = str(e)
+        return nv_flacs
+    except Exception as e:
+        log(f"talkonly job={job_id}: unexpected error, Better fallback — {e}")
+        _set_music_job(job_id, quality="better",
+                       qualityNote=f"Talk only failed ({e}) — used All voices (Better)")
+        progress("Talk only error — using All voices (Better)…", None)
+        TALKONLY_STATE["lastError"] = str(e)
+        return nv_flacs
+
+
+# ─── v6.45/v6.69: VOICE-REMOVAL QUALITY ─────
+# One setting (Convert tab, saved in .drive-pipeline.json) drives History/Auto Music only,
+# Convert upload, Drive → remove voice, Drive link, and the after-stream pipeline.
+#   talkonly — demucs two-stems + ECAPA: remove DJ talk, keep song vocals (v6.69 default via auto)
+#   better   — demucs two-stems no_vocals (all voices wiped; old "Better")
+#   fast     — ffmpeg center-cancel (no demucs; stereo only)
+#   auto     — Talk only when demucs installed, else Fast
+# Optional per-streamer override: userVoiceQuality in .drive-pipeline.json.
+# Jobs share the one-at-a-time voice-removal slot.
+# v6.69: talkonly (default via auto) / better (all voices) / fast
+VOICE_QUALITIES = ("auto", "talkonly", "better", "fast")
 FAST_VOICE_AF = "pan=stereo|c0=0.5*c0+-0.5*c1|c1=0.5*c0+-0.5*c1,afftdn=nf=-25"
 
 
@@ -7395,7 +8143,9 @@ class _MonoAudioError(RuntimeError):
 
 def _norm_voice_quality(q):
     q = str(q or "").strip().lower()
-    if q in ("better", "demucs", "high", "best"):
+    if q in ("talkonly", "talk-only", "talk_only", "talk", "hybrid", "talk only"):
+        return "talkonly"
+    if q in ("better", "demucs", "high", "best", "all", "allvoices", "all-voices"):
         return "better"
     if q in ("fast", "ffmpeg", "quick"):
         return "fast"
@@ -7409,20 +8159,31 @@ def voice_quality_pref():
         return _norm_voice_quality(PIPELINE.get("voiceQuality")) or "auto"
 
 
-def resolve_voice_quality(requested=None):
-    """→ (effective 'better' | 'fast' | None, note). Better needs demucs; Fast needs ffmpeg."""
+def resolve_voice_quality(requested=None, username=None):
+    """→ (effective 'talkonly' | 'better' | 'fast' | None, note).
+    Auto prefers Talk only when demucs is installed (speechbrain installed at job time),
+    else Better, else Fast. Per-streamer override: userVoiceQuality in .drive-pipeline.json."""
     q = _norm_voice_quality(requested)
+    if q is None and username:
+        q = user_voice_quality(username)
     if q is None:
         q = voice_quality_pref()
     has_d = demucs_available()
     has_ff = bool(which_ffmpeg())
     if q == "auto":
-        q = "better" if has_d else "fast"
+        # v6.69: Talk only is the default whenever demucs can run; speechbrain is ensured at job time.
+        q = "talkonly" if has_d else "fast"
+    if q == "talkonly":
+        if has_d:
+            return "talkonly", None
+        if has_ff:
+            return "fast", "Talk only needs demucs (not installed) — using Fast (ffmpeg)"
+        return None, "demucs not installed and ffmpeg not found — install ffmpeg (Fast) or pip install demucs (Talk only / Better)"
     if q == "better":
         if has_d:
             return "better", None
         if has_ff:
-            return "fast", "Better needs demucs (not installed) — using Fast (ffmpeg)"
+            return "fast", "All voices (Better) needs demucs (not installed) — using Fast (ffmpeg)"
         return None, "demucs not installed and ffmpeg not found — install ffmpeg (Fast) or pip install demucs (Better)"
     if not has_ff:
         return None, "ffmpeg not found — install ffmpeg (needed for Fast voice removal)"
@@ -7431,13 +8192,18 @@ def resolve_voice_quality(requested=None):
 
 def voice_quality_snapshot():
     eff, note = resolve_voice_quality(None)
-    return {"pref": voice_quality_pref(), "effective": eff, "note": note,
-            "demucs": demucs_available(), "ffmpeg": bool(which_ffmpeg())}
+    snap = {"pref": voice_quality_pref(), "effective": eff, "note": note,
+            "demucs": demucs_available(), "ffmpeg": bool(which_ffmpeg()),
+            "talkonly": talkonly_snapshot()}  # v6.69
+    return snap
 
 
 def voice_wait_msg(quality):
-    return ("Waiting for demucs (1 at a time)…" if quality != "fast"
-            else "Waiting for voice removal (1 at a time)…")
+    if quality == "fast":
+        return "Waiting for voice removal (1 at a time)…"
+    if quality == "talkonly":
+        return "Waiting for Talk only (1 at a time)…"
+    return "Waiting for demucs (1 at a time)…"
 
 
 def is_voice_removed_name(name):
@@ -7518,8 +8284,10 @@ def fast_voice_reduce_parts(job_id, src, work, duration, progress, pct_lo=20.0, 
     return outs
 
 
-def voice_removed_parts(job_id, src, work, duration, progress, quality, pct_lo=20.0, pct_hi=90.0):
-    """Dispatch to Fast (ffmpeg) or Better (chunked demucs). Mono + Fast → demucs if installed."""
+def voice_removed_parts(job_id, src, work, duration, progress, quality, pct_lo=20.0, pct_hi=90.0,
+                        streamer=None):
+    """Dispatch to Fast / Talk only / Better. Mono + Fast → demucs if installed.
+    Talk only keeps song vocals; on failure falls back to Better (full wipe)."""
     if quality == "fast":
         try:
             return fast_voice_reduce_parts(job_id, src, work, duration, progress, pct_lo, pct_hi)
@@ -7529,6 +8297,24 @@ def voice_removed_parts(job_id, src, work, duration, progress, quality, pct_lo=2
             log(f"voice job={job_id}: {e} — switching to Better (demucs)")
             _set_music_job(job_id, quality="better", qualityNote="mono source — used Better (demucs)")
             progress("Mono audio — using Better (demucs) instead of Fast…", None)
+            quality = "better"
+    if quality == "talkonly":
+        # streamer from arg, job, or source filename
+        user = streamer or _job_get(job_id, "username") or _job_get(job_id, "streamer")
+        if not user:
+            srcs = list(src) if isinstance(src, (list, tuple)) else [src]
+            if srcs:
+                user = _streamer_from_name(Path(srcs[0]).name)
+        try:
+            return chunked_demucs_talkonly(
+                job_id, src, work, duration, progress, streamer=user,
+                pct_lo=pct_lo, pct_hi=pct_hi)
+        except _TalkOnlyError as e:
+            log(f"voice job={job_id}: talkonly unavailable — {e}; using Better")
+            _set_music_job(job_id, quality="better",
+                           qualityNote=f"Talk only unavailable ({e}) — used All voices (Better)")
+            progress("Talk only unavailable — using All voices (Better)…", None)
+            quality = "better"
     return chunked_demucs_no_vocals(job_id, src, work, duration, progress, pct_lo, pct_hi)
 
 
@@ -8087,7 +8873,8 @@ PIPELINE_LOCK = threading.RLock()
 PIPELINE = {"enabled": True, "users": {}, "target": "", "deliveries": {},
             "origEnabled": True, "origUsers": {}, "originals": {},  # v6.38 originals
             "keepAwake": True, "keepAwakeArmed": False,  # v6.40 keep computer awake
-            "keepAwakeSchedule": True, "goLiveHistory": {}}  # v6.52 stay awake before usual go-live
+            "keepAwakeSchedule": True, "goLiveHistory": {},  # v6.52
+            "userVoiceQuality": {}}  # v6.69 per-streamer talkonly|better|fast
 DELIVERY_WAKE = threading.Event()
 DELIVERY_STATE = {"busy": False, "force": set(), "base": None}  # v6.37: base while mid-copy
 # v6.39: stale Drive .{name}.partial-{hex} under Auto-send target (+ Originals/)
@@ -8144,8 +8931,15 @@ def _pipeline_load():
         PIPELINE["soloWatch"] = data.get("soloWatch") is not False
         # v6.50: only one computer sends each stream's parts to Drive (default on)
         PIPELINE["oneCopy"] = data.get("oneCopy") is not False
-        # v6.45: voice-removal quality (auto = Better when demucs installed, else Fast)
+        # v6.45/v6.69: voice-removal quality (auto = Talk only when demucs installed, else Fast)
         PIPELINE["voiceQuality"] = _norm_voice_quality(data.get("voiceQuality")) or "auto"
+        # v6.69: optional per-streamer override {streamer: talkonly|better|fast}
+        uvq = data.get("userVoiceQuality") if isinstance(data.get("userVoiceQuality"), dict) else {}
+        PIPELINE["userVoiceQuality"] = {
+            str(k).lower(): v for k, v in (
+                (safe_username(str(k)), _norm_voice_quality(v)) for k, v in uvq.items()
+            ) if k and v
+        }
         # v6.53: recording sessions in progress (a crash/reboot leaves them here → recovered)
         lsd = data.get("liveSessions") if isinstance(data.get("liveSessions"), dict) else {}
         PIPELINE["liveSessions"] = {str(k).lower(): v for k, v in lsd.items()
@@ -9878,7 +10672,8 @@ def pipeline_status_payload():
                  "origUsers": dict(PIPELINE.get("origUsers") or {}),
                  "statusToDrive": PIPELINE.get("statusToDrive", True) is not False,
                  "autoUpdate": PIPELINE.get("autoUpdate", True) is not False,  # v6.43
-                 "voiceQuality": _norm_voice_quality(PIPELINE.get("voiceQuality")) or "auto",  # v6.45
+                 "voiceQuality": _norm_voice_quality(PIPELINE.get("voiceQuality")) or "auto",  # v6.45/v6.69
+                 "userVoiceQuality": dict(PIPELINE.get("userVoiceQuality") or {}),  # v6.69
                  "oneCopy": PIPELINE.get("oneCopy", True) is not False}  # v6.50
     return {
         "ok": True, "driveFound": bool(roots), "prefs": prefs,
@@ -9928,13 +10723,29 @@ def api_pipeline_prefs(body):
             PIPELINE["statusToDrive"] = bool(body.get("statusToDrive"))
             changed = True
             STATUS_FILE_WAKE.set()
-        if "voiceQuality" in body:  # v6.45
+        if "voiceQuality" in body:  # v6.45 / v6.69 talkonly
             vq = _norm_voice_quality(body.get("voiceQuality"))
             if vq and PIPELINE.get("voiceQuality") != vq:
                 log(f"voice quality pref: {vq}")
             if vq:
                 PIPELINE["voiceQuality"] = vq
                 changed = True
+        uvq = body.get("userVoiceQuality")  # v6.69
+        if isinstance(uvq, dict):
+            cur = PIPELINE.setdefault("userVoiceQuality", {})
+            for k, v in uvq.items():
+                u = safe_username(k)
+                q = _norm_voice_quality(v) if v not in (None, "", False) else None
+                if not u:
+                    continue
+                if q is None:
+                    if u in cur:
+                        del cur[u]
+                        changed = True
+                elif cur.get(u) != q:
+                    cur[u] = q
+                    changed = True
+                    log(f"voice quality override {u}={q}")
         if "autoUpdate" in body:  # v6.43
             on = bool(body.get("autoUpdate"))
             if PIPELINE.get("autoUpdate", True) is not on:
@@ -10093,7 +10904,8 @@ def _pipeline_attempt(job_id):
             _set_music_job(job_id, status="running", phase="demucs" if quality != "fast" else "fast")
             work = Path(tempfile.mkdtemp(prefix="music-only-", dir=str(REC_DIR)))
             _register_work_path(work)
-            parts = voice_removed_parts(job_id, paths, work, total, progress, quality, pct_lo=5.0, pct_hi=85.0)
+            parts = voice_removed_parts(job_id, paths, work, total, progress, quality, pct_lo=5.0, pct_hi=85.0,
+                                        streamer=_job_get(job_id, "username"))
             _set_music_job(job_id, phase="encode")
             tmp_out = encode_joined_ogg(job_id, parts, work / "out.ogg", total, progress,
                                         pct_lo=85.0, pct_hi=94.0, codec_args=MUSIC_OGG_ARGS)
@@ -10405,7 +11217,7 @@ def start_stream_pipeline(username, segments, redo=False, reason="stream-end"):
                 return jid, "already running"
     if not which_ffmpeg():
         return None, "ffmpeg not installed"
-    eff_q, q_note = resolve_voice_quality(None)  # v6.45: Fast needs no demucs
+    eff_q, q_note = resolve_voice_quality(None, username=username)  # v6.69: Talk only default
     if not eff_q:
         return None, q_note or "voice removal unavailable"
     PIPELINE_SEEN.add(first)
@@ -13412,6 +14224,140 @@ def _self_test_v667():
             ["whistleface-2026-10-12-Mon-part 1 of 1.ogg"]
         # classic names pass straight through
         assert drive_part_names(tgt, "x", ["x-music-part1of1.ogg"]) == ["x-music-part1of1.ogg"]
+
+
+def _self_test_v669():
+    """v6.69: Talk only — quality resolution, mask/render attenuates talk vs keeps music vocals,
+    voiceprint path, Better fallback note. No demucs/speechbrain network calls."""
+    import tempfile as _tmp69
+    import wave as _wave69
+    import struct as _struct69
+    import math as _math69
+    # Quality aliases + auto prefers talkonly when demucs present
+    assert _norm_voice_quality("talkonly") == "talkonly"
+    assert _norm_voice_quality("talk-only") == "talkonly"
+    assert _norm_voice_quality("hybrid") == "talkonly"
+    assert _norm_voice_quality("all") == "better"
+    saved_demucs = demucs_available
+    saved_ff = which_ffmpeg
+    try:
+        globals()["demucs_available"] = lambda: True
+        globals()["which_ffmpeg"] = lambda: "/usr/bin/ffmpeg"
+        with PIPELINE_LOCK:
+            prev_q = PIPELINE.get("voiceQuality")
+            prev_uvq = dict(PIPELINE.get("userVoiceQuality") or {})
+            PIPELINE["voiceQuality"] = "auto"
+            PIPELINE["userVoiceQuality"] = {}
+        eff, note = resolve_voice_quality(None)
+        assert eff == "talkonly", (eff, note)
+        eff, note = resolve_voice_quality("better")
+        assert eff == "better"
+        eff, note = resolve_voice_quality("fast")
+        assert eff == "fast"
+        with PIPELINE_LOCK:
+            PIPELINE["userVoiceQuality"] = {"whistleface": "better"}
+        eff, note = resolve_voice_quality(None, username="whistleface")
+        assert eff == "better", (eff, note)
+        eff, note = resolve_voice_quality(None, username="skratchbastid")
+        assert eff == "talkonly", (eff, note)
+        with PIPELINE_LOCK:
+            PIPELINE["voiceQuality"] = prev_q or "auto"
+            PIPELINE["userVoiceQuality"] = prev_uvq
+        # No demucs → auto falls to fast
+        globals()["demucs_available"] = lambda: False
+        eff, note = resolve_voice_quality("auto")
+        assert eff == "fast", (eff, note)
+        eff, note = resolve_voice_quality("talkonly")
+        assert eff == "fast" and note and "demucs" in note.lower(), (eff, note)
+    finally:
+        globals()["demucs_available"] = saved_demucs
+        globals()["which_ffmpeg"] = saved_ff
+
+    # Mask builder: high scores in talk region only
+    times = [i * 0.4 for i in range(50)]  # 0..19.6 s
+    scores = [0.7 if 4.0 <= t <= 8.0 else 0.1 for t in times]
+    rms = [0.05] * len(times)
+    segs = talkonly_mask_segments(times, scores, rms, cutoff=0.33)
+    assert segs, segs
+    # talk region ~4-8 should be covered (with pad)
+    assert any(a <= 5.0 <= b for a, b in segs), segs
+    assert not any(a <= 12.0 <= b for a, b in segs), segs
+
+    # Synthetic stereo: talk half loud center-ish noise, music half sustained tone in both
+    # Render with mask on first half → first half closer to no_vocals, second closer to orig
+    sr = 8000
+    n = sr * 4  # 4 seconds
+    import random as _rnd69
+    _rnd69.seed(69)
+    orig, nv = [], []
+    for i in range(n):
+        t = i / sr
+        # original: talk (noise) 0-2s + music tone 2-4s
+        if t < 2.0:
+            talk = (_rnd69.random() * 0.6 - 0.3)
+            o = (talk, talk * 0.9)
+            # no_vocals for talk region is near silence
+            v = (talk * 0.05, talk * 0.05)
+        else:
+            tone = 0.3 * _math69.sin(2 * _math69.pi * 440 * t)
+            o = (tone, tone * 0.95)
+            v = (tone * 0.98, tone * 0.93)  # music kept almost same in no_vocals? actually no_vocals removes vocals
+            # For music-vocal test: no_vocals is quieter (vocals removed), orig has vocals.
+            # Talk-only should KEEP orig in music region → mixed ≈ orig
+            v = (tone * 0.2, tone * 0.2)
+        orig.append(o)
+        nv.append(v)
+    segs = [(0.0, 2.0)]  # remove talk half
+    mixed = talkonly_render_mix(orig, nv, sr, segs)
+
+    def rms_range(frames, a, b):
+        i0, i1 = int(a * sr), int(b * sr)
+        s = 0.0
+        for fr in frames[i0:i1]:
+            s += (float(fr[0]) ** 2 + float(fr[1]) ** 2) * 0.5
+        return (s / max(1, i1 - i0)) ** 0.5
+
+    # Talk region: mixed should be much quieter than orig (attenuated toward nv)
+    assert rms_range(mixed, 0.2, 1.8) < 0.45 * rms_range(orig, 0.2, 1.8), (
+        rms_range(mixed, 0.2, 1.8), rms_range(orig, 0.2, 1.8))
+    # Music region: mixed should stay close to orig (song vocals kept)
+    mo, mm = rms_range(orig, 2.2, 3.8), rms_range(mixed, 2.2, 3.8)
+    assert abs(mo - mm) / max(mo, 1e-6) < 0.15, (mo, mm)
+
+    # Round-trip wav write/read + voiceprint dir
+    with _tmp69.TemporaryDirectory() as td:
+        td = Path(td)
+        # point REC_DIR-relative voiceprints via save using a temp — save_voiceprint uses voiceprints_dir()
+        # Just exercise mask→render→wav
+        wav = td / "mix.wav"
+        _write_wav_f32_stereo(wav, sr, mixed)
+        sr2, frames2 = _read_wav_f32_stereo(wav)
+        assert sr2 == sr and len(frames2) == len(mixed)
+        # voiceprint save/load when numpy present
+        try:
+            import numpy as _np69
+            c = _np69.ones(16, dtype="float32")
+            c /= _np69.linalg.norm(c)
+            # temporarily use td as REC_DIR for voiceprints
+            global REC_DIR
+            prev_rec = REC_DIR
+            try:
+                # voiceprints_dir uses REC_DIR — monkeypatch
+                globals()["REC_DIR"] = td
+                p = save_voiceprint("whistleface", c, n=12, meta="self-test")
+                assert p and Path(p).is_file()
+                loaded = load_voiceprint("whistleface")
+                assert loaded and float(_np69.linalg.norm(loaded["centroid"])) > 0.9
+            finally:
+                globals()["REC_DIR"] = prev_rec
+        except ImportError:
+            pass
+
+    snap = talkonly_snapshot()
+    assert "available" in snap and "cutoff" in snap and snap["cutoff"] == TALKONLY_CUTOFF
+    assert voice_wait_msg("talkonly").startswith("Waiting for Talk only")
+    json.dumps(voice_quality_snapshot())
+
 
 def _self_test_v668():
     """v6.68: Mac Drive EDEADLK — policy call (fake libc), retry recovers, gives plain advice, real copy."""
