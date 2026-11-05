@@ -15,6 +15,7 @@ import posixpath  # v6.65: macOS plist / Full Disk Access paths are POSIX data o
 import ntpath  # v6.38: Windows Drive for Desktop detection (unit-testable on any OS)
 import time
 import datetime  # v6.41: local timestamps in the Drive status file
+import errno  # v6.68: EDEADLK from Google Drive on macOS
 import urllib.parse
 import urllib.request
 import uuid
@@ -22,7 +23,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.67"
+HELPER_VERSION = "6.68"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4954,6 +4955,7 @@ def self_test():
     _self_test_v665()  # v6.65
     _self_test_v666()  # v6.66
     _self_test_v667()  # v6.67
+    _self_test_v668()  # v6.68
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -5119,6 +5121,7 @@ def health_payload():
         "keepAwake": keep_awake_snapshot(),  # v6.40
         "statusFile": status_file_snapshot(),  # v6.41
         "driveAccess": drive_access_snapshot(),  # v6.47: sticky banner when FDA/Drive blocks
+        "driveMaterialize": drive_materialize_snapshot(),  # v6.68: Mac online-only Drive folders
         "autoUpdate": auto_update_snapshot(),  # v6.43
         "streamlinkUpdate": streamlink_update_snapshot(),  # v6.55
         "autostart": autostart_snapshot(),  # v6.56 (Windows only; null elsewhere)
@@ -7530,7 +7533,12 @@ def voice_removed_parts(job_id, src, work, duration, progress, quality, pct_lo=2
 
 
 def atomic_publish(tmp_file, dest):
-    """Write dest atomically (temp in dest folder, then rename) so Drive syncs one clean file."""
+    """Write dest atomically (temp in dest folder, then rename) so Drive syncs one clean file.
+    v6.68: a Mac "Resource deadlock avoided" from Google Drive is fixed + retried (drive_write_retry)."""
+    return drive_write_retry(lambda: _atomic_publish_once(tmp_file, dest), dest)
+
+
+def _atomic_publish_once(tmp_file, dest):
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.parent / f".{dest.name}.partial-{uuid.uuid4().hex[:6]}"
@@ -9175,7 +9183,12 @@ def split_music_for_drive(job_id, src, progress=None):
 
 
 def atomic_copy(src, dest):
-    """Copy src → dest via a temp file in dest's folder + rename (source is kept)."""
+    """Copy src → dest via a temp file in dest's folder + rename (source is kept).
+    v6.68: a Mac "Resource deadlock avoided" from Google Drive is fixed + retried (drive_write_retry)."""
+    return drive_write_retry(lambda: _atomic_copy_once(src, dest), dest)
+
+
+def _atomic_copy_once(src, dest):
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.parent / f".{dest.name}.partial-{uuid.uuid4().hex[:6]}"
@@ -9192,6 +9205,205 @@ def atomic_copy(src, dest):
         except OSError:
             pass
     return dest
+
+
+# ─── v6.68: MAC GOOGLE DRIVE "Resource deadlock avoided" (EDEADLK) ───────────────────────────────
+# On macOS, Google Drive for Desktop is a File Provider: a Drive folder this Mac has never opened can be
+# "online-only" (dataless). macOS's system default for a background process is NOT to download such
+# folders/files when the process touches them — it fails the open() with EDEADLK ("[Errno 11] Resource
+# deadlock avoided"). macbookpro hit exactly this: every original since 2026-11-03 failed with
+# "Resource deadlock avoided: …/My Drive/Twitch/Originals/.<name>.partial-xxxx", 24 in a row, retried
+# every 5 min forever, while small status files in another folder still went through.
+# Now: (1) at start the helper asks macOS to download online-only Drive items for it
+#     (setiopolicy_np IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES → ON, process-wide, inherited by ffmpeg /
+#     demucs children); (2) a Drive write that still gets EDEADLK re-applies that (process + this thread),
+#     lists the folder (and its parent) so macOS fetches the folder listing (only the listing — no big
+#     files are pulled down), waits a few seconds and tries again (2 more tries); (3) if it still fails, the error is
+#     plain English and says what to click (open the folder in Finder / Available offline), and
+#     /api/health.driveMaterialize + the status file count it. Windows/Linux: no-op.
+# Env TWITCH_RECORDER_MAC_MATERIALIZE=0 → don't change the macOS policy (retries still happen).
+MAC_MATERIALIZE_ENV_OFF = (os.environ.get("TWITCH_RECORDER_MAC_MATERIALIZE") or "").strip().lower() in (
+    "0", "off", "false", "no")
+DRIVE_DEADLOCK_RETRIES = max(0, int(os.environ.get("TWITCH_RECORDER_DRIVE_DEADLOCK_RETRIES") or 2))
+DRIVE_DEADLOCK_WAIT_SECS = max(0.0, float(os.environ.get("TWITCH_RECORDER_DRIVE_DEADLOCK_WAIT_SECS") or 4))
+_IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES = 3  # <sys/resource.h>
+_IOPOL_SCOPE_PROCESS = 0
+_IOPOL_SCOPE_THREAD = 1
+_IOPOL_MATERIALIZE_DATALESS_FILES_ON = 2
+DRIVE_MATERIALIZE_LOCK = threading.Lock()
+DRIVE_MATERIALIZE = {
+    "supported": None, "enabled": False, "before": None, "after": None, "error": None, "at": None,
+    "envDisabled": MAC_MATERIALIZE_ENV_OFF, "deadlocks": 0, "recovered": 0, "failed": 0,
+    "lastDeadlockAt": None, "lastDeadlockFolder": None, "lastFailedAt": None,
+}
+_MAC_LIBC = None
+
+
+class DriveDeadlockError(RuntimeError):
+    """v6.68: Drive write still blocked by macOS EDEADLK after the fix + retries (message is the advice)."""
+
+
+def _mac_libc():
+    global _MAC_LIBC
+    if _MAC_LIBC is None:
+        import ctypes
+        import ctypes.util
+        lib = ctypes.CDLL(ctypes.util.find_library("c") or "/usr/lib/libSystem.B.dylib", use_errno=True)
+        lib.getiopolicy_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        lib.getiopolicy_np.restype = ctypes.c_int
+        lib.setiopolicy_np.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        lib.setiopolicy_np.restype = ctypes.c_int
+        _MAC_LIBC = lib
+    return _MAC_LIBC
+
+
+def mac_enable_dataless_materialization(scope=_IOPOL_SCOPE_PROCESS, libc=None, platform=None):
+    """Ask macOS to download online-only (dataless) Drive items this process touches. True if ON."""
+    plat = platform or sys.platform
+    if plat != "darwin":
+        with DRIVE_MATERIALIZE_LOCK:
+            DRIVE_MATERIALIZE.update(supported=False, enabled=False)
+        return False
+    if MAC_MATERIALIZE_ENV_OFF:
+        with DRIVE_MATERIALIZE_LOCK:
+            DRIVE_MATERIALIZE.update(supported=True, enabled=False,
+                                     error="disabled by TWITCH_RECORDER_MAC_MATERIALIZE=0")
+        return False
+    try:
+        lib = libc if libc is not None else _mac_libc()
+        T = _IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
+        before = int(lib.getiopolicy_np(T, scope))
+        rc = int(lib.setiopolicy_np(T, scope, _IOPOL_MATERIALIZE_DATALESS_FILES_ON))
+        err = None
+        if rc != 0:
+            try:
+                import ctypes
+                en = ctypes.get_errno() if libc is None else 0
+            except Exception:
+                en = 0
+            err = f"setiopolicy_np failed (rc={rc}{', errno ' + str(en) if en else ''})"
+        after = int(lib.getiopolicy_np(T, scope))
+        ok = rc == 0 and after == _IOPOL_MATERIALIZE_DATALESS_FILES_ON
+        if not ok and not err:
+            err = f"policy still {after} after setting ON"
+    except Exception as e:
+        before = after = None
+        ok, err = False, f"{type(e).__name__}: {e}"
+    if scope == _IOPOL_SCOPE_PROCESS:
+        with DRIVE_MATERIALIZE_LOCK:
+            DRIVE_MATERIALIZE.update(supported=True, enabled=ok, before=before, after=after,
+                                     error=err, at=time.time())
+    return ok
+
+
+def is_drive_deadlock(e):
+    """EDEADLK ("Resource deadlock avoided"; errno 11 on macOS) from a File Provider (Drive) path."""
+    return isinstance(e, OSError) and getattr(e, "errno", None) == errno.EDEADLK
+
+
+def _short_drive_folder(folder):
+    """'Twitch/Originals' style name for messages (POSIX or Windows path, any OS)."""
+    parts = [x for x in re.split(r"[\\/]+", str(folder or "")) if x]
+    return "/".join(parts[-2:]) if parts else str(folder)
+
+
+def drive_deadlock_message(dest):
+    folder = os.path.dirname(str(dest))
+    short = _short_drive_folder(folder)
+    with DRIVE_MATERIALIZE_LOCK:
+        on = bool(DRIVE_MATERIALIZE.get("enabled"))
+    return (f"Google Drive on this Mac wouldn't let the helper write into “{short}” yet — macOS said "
+            "“Resource deadlock avoided”, which means that Drive folder is online-only on this Mac and "
+            "macOS didn't download it for a background app"
+            + (f" (the helper already asked macOS to allow that and tried {DRIVE_DEADLOCK_RETRIES + 1} times)"
+               if on else "")
+            + f". Fix: open the {short} folder in Finder once (or right-click it → Make available offline "
+            "in Google Drive). The helper tries again every 5 min and sends everything waiting.")
+
+
+def _drive_deadlock_nudge(folder):
+    """Re-apply the materialize policy and make macOS fetch the folder before the next try."""
+    if sys.platform == "darwin" and not MAC_MATERIALIZE_ENV_OFF:
+        try:
+            mac_enable_dataless_materialization(_IOPOL_SCOPE_PROCESS)
+            mac_enable_dataless_materialization(_IOPOL_SCOPE_THREAD)
+        except Exception:
+            pass
+    folder = Path(folder)
+    for d in (folder.parent, folder):
+        try:
+            os.listdir(d)
+        except OSError:
+            pass
+    # (no `fileproviderctl materialize` — on a folder it could pull every big recording down to this Mac)
+
+
+def drive_write_retry(fn, dest, sleep=None):
+    """Run one Drive write; on EDEADLK fix + retry DRIVE_DEADLOCK_RETRIES more times, then explain."""
+    sleep = time.sleep if sleep is None else sleep
+    attempt = 0
+    while True:
+        try:
+            out = fn()
+        except OSError as e:
+            if not is_drive_deadlock(e):
+                raise
+            now = time.time()
+            folder = os.path.dirname(str(dest))
+            with DRIVE_MATERIALIZE_LOCK:
+                DRIVE_MATERIALIZE["deadlocks"] = int(DRIVE_MATERIALIZE.get("deadlocks") or 0) + 1
+                DRIVE_MATERIALIZE["lastDeadlockAt"] = now
+                DRIVE_MATERIALIZE["lastDeadlockFolder"] = folder
+            if attempt >= DRIVE_DEADLOCK_RETRIES:
+                with DRIVE_MATERIALIZE_LOCK:
+                    DRIVE_MATERIALIZE["failed"] = int(DRIVE_MATERIALIZE.get("failed") or 0) + 1
+                    DRIVE_MATERIALIZE["lastFailedAt"] = now
+                log(f"drive write {os.path.basename(str(dest))}: still 'Resource deadlock avoided' after "
+                    f"{attempt + 1} tries — {folder} is online-only on this Mac")
+                raise DriveDeadlockError(drive_deadlock_message(dest)) from e
+            attempt += 1
+            log(f"drive write {os.path.basename(str(dest))}: 'Resource deadlock avoided' (online-only Drive "
+                f"folder) — asking macOS to download it, retry {attempt}/{DRIVE_DEADLOCK_RETRIES}")
+            try:
+                _drive_deadlock_nudge(folder)
+            except Exception:
+                pass
+            sleep(DRIVE_DEADLOCK_WAIT_SECS * attempt)
+            continue
+        if attempt:
+            with DRIVE_MATERIALIZE_LOCK:
+                DRIVE_MATERIALIZE["recovered"] = int(DRIVE_MATERIALIZE.get("recovered") or 0) + 1
+            log(f"drive write {os.path.basename(str(dest))}: worked after the online-only folder fix "
+                f"(try {attempt + 1})")
+        return out
+
+
+def drive_materialize_snapshot():
+    with DRIVE_MATERIALIZE_LOCK:
+        d = dict(DRIVE_MATERIALIZE)
+    for k in ("at", "lastDeadlockAt", "lastFailedAt"):
+        d[k] = _iso_local(d.get(k)) if d.get(k) else None
+    return d
+
+
+def drive_materialize_status_line(m):
+    """Status-file line (Mac only; None when nothing worth saying)."""
+    if not m:
+        return None
+    n = int(m.get("deadlocks") or 0)
+    if m.get("supported") is not True:
+        if not n:
+            return None  # Windows / Linux (or not set yet): nothing to say
+        line = "Drive writes"
+    elif m.get("enabled"):
+        line = "Mac online-only Drive folders: helper allowed to download them (v6.68)"
+    else:
+        line = "Mac online-only Drive folders: NOT allowed — " + (m.get("error") or "unknown")
+    if n:
+        line += (f"; 'Resource deadlock avoided' {n}× ({int(m.get('recovered') or 0)} fixed by retry, "
+                 f"{int(m.get('failed') or 0)} still failed), last {m.get('lastDeadlockAt')} in "
+                 f"{_short_drive_folder(m.get('lastDeadlockFolder'))}")
+    return line
 
 
 def drive_permission_message():
@@ -11893,6 +12105,8 @@ def build_status_doc(now=None):
                                       "lastUpgradeFrom", "lastUpgradeTo", "private")},
         "streamlinkLine": streamlink_status_line(streamlink_update_snapshot()),
         "ffmpegLine": ffmpeg_status_line(ffmpeg_setup_snapshot()),  # v6.66
+        "driveMaterialize": drive_materialize_snapshot(),  # v6.68
+        "driveMaterializeLine": drive_materialize_status_line(drive_materialize_snapshot()),  # v6.68
         "recentRecordings": recent,
         # v6.49: helper watching armed streamers while the recorder page is closed
         "soloWatch": solo_watch_snapshot(),
@@ -12007,6 +12221,8 @@ def render_status_text(doc):
         elif local_p:
             line += " (also posted to Drive when reachable)"
         L.append(line)
+    if doc.get("driveMaterializeLine"):  # v6.68
+        L.append(doc["driveMaterializeLine"])
     L.append(f"Drive sends: {d.get('partsWaiting', 0)} part sets waiting, {d.get('partsErrors', 0)} failed;"
              f" {d.get('originalsWaiting', 0)} originals waiting, {d.get('originalsErrors', 0)} failed")
     if "oneCopyPerStream" in d:  # v6.50
@@ -13197,6 +13413,111 @@ def _self_test_v667():
         # classic names pass straight through
         assert drive_part_names(tgt, "x", ["x-music-part1of1.ogg"]) == ["x-music-part1of1.ogg"]
 
+def _self_test_v668():
+    """v6.68: Mac Drive EDEADLK — policy call (fake libc), retry recovers, gives plain advice, real copy."""
+    import tempfile as _tmp68
+    saved = dict(DRIVE_MATERIALIZE)
+    try:
+        class _FakeLibc:
+            def __init__(self, rc=0, stick=True):
+                self.pol = {0: 0, 1: 0}
+                self.rc, self.stick, self.calls = rc, stick, []
+
+            def getiopolicy_np(self, t, scope):
+                assert t == 3
+                return self.pol[scope]
+
+            def setiopolicy_np(self, t, scope, pol):
+                self.calls.append((t, scope, pol))
+                if self.rc == 0 and self.stick:
+                    self.pol[scope] = pol
+                return self.rc
+        assert mac_enable_dataless_materialization(platform="linux") is False
+        assert DRIVE_MATERIALIZE["supported"] is False
+        fl = _FakeLibc()
+        if not MAC_MATERIALIZE_ENV_OFF:
+            assert mac_enable_dataless_materialization(libc=fl, platform="darwin") is True
+            assert fl.calls == [(3, 0, 2)], fl.calls
+            assert DRIVE_MATERIALIZE["enabled"] is True and DRIVE_MATERIALIZE["before"] == 0
+            assert DRIVE_MATERIALIZE["after"] == 2
+            assert mac_enable_dataless_materialization(libc=_FakeLibc(rc=-1), platform="darwin") is False
+            assert "setiopolicy_np failed" in (DRIVE_MATERIALIZE["error"] or "")
+            assert mac_enable_dataless_materialization(libc=_FakeLibc(stick=False), platform="darwin") is False
+
+            class _Broken:
+                def getiopolicy_np(self, *a):
+                    raise AttributeError("no such symbol")
+            assert mac_enable_dataless_materialization(libc=_Broken(), platform="darwin") is False
+            DRIVE_MATERIALIZE.update(enabled=True, error=None)
+        assert is_drive_deadlock(OSError(errno.EDEADLK, "Resource deadlock avoided"))
+        assert not is_drive_deadlock(OSError(errno.EACCES, "nope"))
+        assert not is_drive_deadlock(PermissionError(errno.EPERM, "Operation not permitted"))
+        assert _short_drive_folder("/Users/EA/Library/CloudStorage/GoogleDrive-x/My Drive/Twitch/Originals") == \
+            "Twitch/Originals"
+        assert _short_drive_folder(r"H:\My Drive\Twitch\Originals") == "Twitch/Originals"
+        with _tmp68.TemporaryDirectory() as td:
+            td = Path(td)
+            src = td / "whistleface-Tue-2026-11-03T10-04-17.ogg"
+            src.write_bytes(b"OggS" + b"x" * 5000)
+            orig_dir = td / "Drive" / "Twitch" / "Originals"
+            DRIVE_MATERIALIZE.update(deadlocks=0, recovered=0, failed=0)
+            # 1) Drive refuses twice with EDEADLK, then works → copied, counted as recovered
+            fails = {"n": 2}
+            real_once = _atomic_copy_once
+            slept = []
+
+            def flaky():
+                if fails["n"]:
+                    fails["n"] -= 1
+                    raise OSError(errno.EDEADLK, "Resource deadlock avoided",
+                                  str(orig_dir / f".{src.name}.partial-abc123"))
+                return real_once(src, orig_dir / src.name)
+            out = drive_write_retry(flaky, orig_dir / src.name, sleep=slept.append)
+            assert Path(out).read_bytes() == src.read_bytes()
+            assert len(slept) == 2 and slept[1] >= slept[0], slept
+            assert DRIVE_MATERIALIZE["deadlocks"] == 2 and DRIVE_MATERIALIZE["recovered"] == 1
+            assert not list(orig_dir.glob(".*.partial-*"))
+            # 2) never works → DriveDeadlockError with plain advice (not a raw "[Errno 11]")
+            calls = {"n": 0}
+
+            def always():
+                calls["n"] += 1
+                raise OSError(errno.EDEADLK, "Resource deadlock avoided")
+            try:
+                drive_write_retry(always, orig_dir / "x.ogg", sleep=lambda s: None)
+                raise AssertionError("expected DriveDeadlockError")
+            except DriveDeadlockError as e:
+                msg = str(e)
+            assert calls["n"] == DRIVE_DEADLOCK_RETRIES + 1
+            assert "Twitch/Originals" in msg and "Finder" in msg and "[Errno" not in msg, msg
+            assert DRIVE_MATERIALIZE["failed"] == 1
+            # 3) other errors pass straight through, no retries
+            try:
+                drive_write_retry(lambda: (_ for _ in ()).throw(PermissionError(errno.EPERM, "x")),
+                                  orig_dir / "y.ogg", sleep=lambda s: (_ for _ in ()).throw(AssertionError))
+                raise AssertionError("expected PermissionError")
+            except PermissionError:
+                pass
+            # 4) the real atomic_copy + place_in_drive path still works (and atomic_publish)
+            d2, act = place_in_drive(src, td / "Drive" / "Twitch" / "Originals2", src.name)
+            assert act == "copied" and Path(d2).stat().st_size == src.stat().st_size
+            tmpf = td / "tmp.ogg"
+            tmpf.write_bytes(b"abc")
+            assert Path(atomic_publish(tmpf, td / "Drive" / "pub" / "m.ogg")).read_bytes() == b"abc"
+            # 5) status line + health json
+            DRIVE_MATERIALIZE.update(supported=True)
+            line = drive_materialize_status_line(drive_materialize_snapshot())
+            assert line and "5×" in line and "1 fixed by retry" in line and "1 still failed" in line, line
+            assert drive_materialize_status_line({"supported": False}) is None
+            json.dumps(drive_materialize_snapshot())
+            txt = render_status_text(build_status_doc())
+            assert ("Mac online-only Drive folders" in txt), txt[:400]
+    finally:
+        with DRIVE_MATERIALIZE_LOCK:
+            DRIVE_MATERIALIZE.clear()
+            DRIVE_MATERIALIZE.update(saved)
+
+
 def _self_test_v666():
     """v6.66: missing streamlink / ffmpeg are set up by the helper itself — asset pick, archive unpack,
     checksum-checked download, pointer + PATH, tick decisions (idle wait, build, failure cap, opt-out).
@@ -14056,6 +14377,15 @@ def _self_test_v656():
 
 def main():
     REC_DIR.mkdir(parents=True, exist_ok=True)
+    # v6.68: let macOS download online-only Google Drive folders this helper writes into (no EDEADLK)
+    if sys.platform == "darwin":
+        try:
+            ok = mac_enable_dataless_materialization()
+            m = drive_materialize_snapshot()
+            log("mac online-only Drive folders: " + ("helper may download them (policy ON, was "
+                f"{m.get('before')})" if ok else f"not changed — {m.get('error')}"))
+        except Exception as e:
+            log(f"mac online-only Drive policy failed: {e}")
     # v6.29: clear orphan music-only-* temp dirs left by mid-demucs crashes
     try:
         cleanup_orphan_temps(reason="startup")
