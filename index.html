@@ -220,7 +220,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.69</span>
+    <span class="badge">v6.70</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -273,6 +273,8 @@
     <div id="helperDownBanner" class="alert alert-err hidden" role="status"></div>
     <!-- v6.63: this open page is an older build than the helper (tab left open across an auto-update) -->
     <div id="pageStaleBanner" class="alert alert-info hidden" role="status"></div>
+    <!-- v6.70: helper auto-update is off but a newer version is on GitHub -->
+    <div id="manualUpdateBanner" class="alert alert-info hidden" role="status"></div>
 
     <!-- live now banners -->
     <div id="liveNowBox"></div>
@@ -575,7 +577,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.69'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.70'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -1529,6 +1531,7 @@ function pingHelperAndStatus(){
       applyPipelineFromHealth(d); // v6.36
       if(!helperOkSince) helperOkSince=Date.now(); // v6.43
       renderAutoUpdateLine(); // v6.43
+      try{ renderManualUpdateBanner(); }catch(_e){} // v6.70
       helperDownSince=0; try{ updateHelperDownBanner(); }catch(_e){} // v6.56
       try{ noticeStreamlinkUpdate(); }catch(_e){} // v6.55
     }else{
@@ -1552,6 +1555,7 @@ function pingHelperAndStatus(){
   renderStreamers();
   maybePageAutoUpdate(); // v6.43: one-time nudge for helpers that can't update themselves
   try{ checkPageStale(); }catch(e){ console.warn('[page-stale]', e); } // v6.63
+  try{ renderManualUpdateBanner(); }catch(e){} // v6.70
   // Fresh connect / reconnect: merge disk files and immediately kick live Auto-Rec
   if(helper.ok && !wasOk){
     driveRefresh().catch(function(){}); // v6.35
@@ -5887,8 +5891,16 @@ function autoUpdateText(){
     return 'Auto-update: this helper (v'+(helper.version||'?')+') can\u2019t update itself yet — Check for updates → Install update once (v6.43+ then updates itself when idle).'
       +(cfg.autoUpdate!==false?' This page will do it automatically once while the helper is idle.':'');
   }
-  if(!a.enabled) return 'Auto-update: off'+(a.envDisabled?' (TWITCH_RECORDER_AUTO_UPDATE=0)':'')+' — updates only via Check for updates → Install update.'
-    +(a.lastCheckAt?' Last checked '+auClock(a.lastCheckAt)+(a.lastResult?' ('+a.lastResult+')':'')+'.':'');
+  if(!a.enabled){
+    // v6.70: helper still checks GitHub while off — surface when a newer version is waiting
+    if(a.updateAvailable || a.state==='outdated-manual'){
+      return 'Auto-update: off'+(a.envDisabled?' (TWITCH_RECORDER_AUTO_UPDATE=0)':'')
+        +' — ⚠ v'+(a.remoteVersion||'?')+' available. Click Install update (will not install by itself).'
+        +(a.lastCheckAt?' Last checked '+auClock(a.lastCheckAt)+'.':'');
+    }
+    return 'Auto-update: off'+(a.envDisabled?' (TWITCH_RECORDER_AUTO_UPDATE=0)':'')+' — updates only via Check for updates → Install update.'
+      +(a.lastCheckAt?' Last checked '+auClock(a.lastCheckAt)+(a.lastResult?' ('+a.lastResult+')':'')+'.':'');
+  }
   let t='Auto-update: on';
   if(a.state==='waiting-idle') t+=' — v'+(a.remoteVersion||'?')+' available, installs when idle'+(a.waitingFor?' (waiting: '+a.waitingFor+')':'');
   else if(a.state==='restart-pending' || a.pendingRestart) t+=' — v'+(a.diskVersion||a.lastAppliedVersion||'?')+' installed, restarts when idle'+(a.waitingFor?' (waiting: '+a.waitingFor+')':'');
@@ -5993,7 +6005,13 @@ function renderAutoUpdateLine(){
 }
 function autoUpdateBit(){
   const a=helper.autoUpdate;
-  if(!helper.ok || !a || !a.enabled) return '';
+  if(!helper.ok || !a) return '';
+  // v6.70: when auto-update is off but a newer version is waiting, show it in the helper bar
+  if(!a.enabled){
+    if(a.updateAvailable || a.state==='outdated-manual')
+      return ' · ⚠ v'+(a.remoteVersion||'?')+' available (auto-update off)';
+    return '';
+  }
   if(a.state==='waiting-idle') return ' · ⬆ v'+(a.remoteVersion||'?')+' installs when idle';
   if(a.state==='installing') return ' · ⬆ installing v'+(a.remoteVersion||'?');
   if(a.state==='error' && a.lastError) return ' · ⚠ auto-update: '+String(a.lastError).slice(0,80);
@@ -6040,6 +6058,54 @@ async function maybePageAutoUpdate(){
   }finally{
     pageAutoUpdate.checking=false;
   }
+}
+// ─── v6.70: AUTO-UPDATE OFF BUT A NEWER VERSION IS ON GITHUB ───
+// Helpers with "Install helper updates automatically" off (or TWITCH_RECORDER_AUTO_UPDATE=0) still
+// check GitHub on the normal cadence from v6.70. Show a sticky banner + Install update so machines
+// like macbookpro / Silver Bullet / Quiques-Mach-1 that turned auto-update off don't stay silent.
+const MANUAL_UPDATE_DISMISS_KEY='tar-manual-update-dismiss-v1'; // {remote, at}
+function manualUpdateDismissedRemote(){
+  try{ const g=JSON.parse(localStorage.getItem(MANUAL_UPDATE_DISMISS_KEY)||'null'); return (g && g.remote)?String(g.remote):''; }catch(e){ return ''; }
+}
+function dismissManualUpdateBanner(){
+  const remote=manualUpdateRemote()||'';
+  try{ localStorage.setItem(MANUAL_UPDATE_DISMISS_KEY, JSON.stringify({remote:remote, at:Date.now()})); }catch(e){}
+  renderManualUpdateBanner();
+}
+function autoUpdateEffectivelyOff(){
+  const a=helper.autoUpdate||{};
+  if(cfg.autoUpdate===false) return true;
+  if(a.enabled===false) return true;
+  if(a.state==='outdated-manual') return true;
+  if(a.state==='off' && a.updateAvailable) return true;
+  return false;
+}
+function manualUpdateRemote(){
+  if(!helper.ok) return '';
+  const a=helper.autoUpdate||{};
+  const local=helper.version||UI_VERSION||'';
+  if((a.updateAvailable || a.state==='outdated-manual') && a.remoteVersion && _versionIsNewer(a.remoteVersion, local))
+    return String(a.remoteVersion);
+  if(updateCheck.updateAvailable && updateCheck.remoteVersion && _versionIsNewer(updateCheck.remoteVersion, local))
+    return String(updateCheck.remoteVersion);
+  return '';
+}
+function renderManualUpdateBanner(){
+  const ban=document.getElementById('manualUpdateBanner');
+  if(!ban) return;
+  if(!helper.ok || !autoUpdateEffectivelyOff()){ ban.classList.add('hidden'); ban.innerHTML=''; return; }
+  const remote=manualUpdateRemote();
+  if(!remote){ ban.classList.add('hidden'); ban.innerHTML=''; return; }
+  if(manualUpdateDismissedRemote()===remote){ ban.classList.add('hidden'); ban.innerHTML=''; return; }
+  const local=helper.version||UI_VERSION||'?';
+  // Seed updateCheck so Install update() works without a prior Check for updates click
+  updateCheck.localVersion=local;
+  updateCheck.remoteVersion=remote;
+  updateCheck.updateAvailable=true;
+  ban.innerHTML='⬆ <strong>Helper is v'+driveEsc(local)+'</strong> · <strong>v'+driveEsc(remote)+'</strong> is available. Auto-update is off — Install update to get it. '
+    +'<button type="button" class="btn btn-purple btn-sm" onclick="installUpdate()">Install update</button> '
+    +'<button type="button" class="btn btn-gray btn-sm" onclick="dismissManualUpdateBanner()">Dismiss</button>';
+  ban.classList.remove('hidden');
 }
 // ─── v6.63: AN OLD OPEN PAGE RELOADS ITSELF WHEN IDLE ──────────
 // The helper updates itself when idle (v6.43), but a recorder tab left open for days keeps running

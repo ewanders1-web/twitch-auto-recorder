@@ -23,7 +23,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.69"
+HELPER_VERSION = "6.70"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -2813,6 +2813,7 @@ AUTO_UPDATE = {
     "lastError": None, "remoteVersion": None, "updateAvailable": False, "waitingFor": None,
     "nextCheckAt": 0.0, "lastAppliedAt": 0.0, "lastAppliedVersion": None, "lastAppliedSource": None,
     "backupDir": None, "lastBusyAt": 0.0, "checkNow": False,
+    "noticedOutdatedVersion": None,  # v6.70: last remote logged while auto-update off
 }
 UPLOADS_INFLIGHT = [0]  # v6.43: POST /api/music-only-upload bodies being received
 
@@ -2884,7 +2885,12 @@ def note_update_check(res, source):
 
 
 def auto_update_tick(now=None):
-    """One step of the unattended updater. Returns seconds until the next step."""
+    """One step of the unattended updater. Returns seconds until the next step.
+
+    v6.70: when auto-update is OFF (pref or TWITCH_RECORDER_AUTO_UPDATE=0), still run the periodic
+    GitHub version check on the same cadence and set state to "outdated-manual" when a newer
+    version is available — never call apply_update from that path (Install update on the page).
+    """
     now = time.time() if now is None else now
     # 1) files already on disk (manual install while busy, or our own apply) → restart when idle.
     #    Runs even with the pref off: same as the v6.32 health-path auto-restart, but works with
@@ -2893,9 +2899,7 @@ def auto_update_tick(now=None):
         _auto_update_set(state="restart-pending")
         maybe_auto_restart_idle()
         return AUTO_UPDATE_BUSY_SECS
-    if not auto_update_enabled():
-        _auto_update_set(state="off", waitingFor=None, nextCheckAt=0.0)
-        return AUTO_UPDATE_EVERY_SECS
+    enabled = auto_update_enabled()
     with AUTO_UPDATE_LOCK:
         last = float(AUTO_UPDATE.get("lastCheckAt") or 0.0)
         had_err = bool(AUTO_UPDATE.get("lastError")) and AUTO_UPDATE.get("lastResult") == "check failed"
@@ -2916,8 +2920,22 @@ def auto_update_tick(now=None):
         available = bool(res.get("updateAvailable"))
         remote = res.get("remoteVersion")
         last = now
-        if not available:
+        if not available and enabled:
             log(f"auto-update: up to date (v{local_helper_version()}, GitHub v{remote})")
+    # v6.70: off still checks; surface outdated-manual; NEVER install
+    if not enabled:
+        next_at = (last or now) + AUTO_UPDATE_EVERY_SECS
+        if available:
+            with AUTO_UPDATE_LOCK:
+                noticed = AUTO_UPDATE.get("noticedOutdatedVersion")
+            if noticed != remote:
+                log(f"auto-update: off — v{remote} available (install from the page)")
+                _auto_update_set(noticedOutdatedVersion=remote)
+            _auto_update_set(state="outdated-manual", waitingFor=None, nextCheckAt=next_at)
+            STATUS_FILE_WAKE.set()
+        else:
+            _auto_update_set(state="off", waitingFor=None, noticedOutdatedVersion=None, nextCheckAt=next_at)
+        return max(1.0, next_at - now)
     if not available:
         _auto_update_set(state="up-to-date", waitingFor=None, nextCheckAt=last + AUTO_UPDATE_EVERY_SECS)
         return max(1.0, last + AUTO_UPDATE_EVERY_SECS - now)
@@ -4957,6 +4975,7 @@ def self_test():
     _self_test_v667()  # v6.67
     _self_test_v668()  # v6.68
     _self_test_v669()  # v6.69
+    _self_test_v670()  # v6.70
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -12906,7 +12925,9 @@ def build_status_doc(now=None):
         "autoUpdate": {"enabled": au.get("enabled"), "state": au.get("state"),
                        "lastCheckAt": _iso_local(au.get("lastCheckAt")), "lastResult": au.get("lastResult"),
                        "lastError": _short(au.get("lastError"), 300) or None,
-                       "remoteVersion": au.get("remoteVersion"), "waitingFor": au.get("waitingFor"),
+                       "remoteVersion": au.get("remoteVersion"),
+                       "updateAvailable": bool(au.get("updateAvailable")),  # v6.70
+                       "waitingFor": au.get("waitingFor"),
                        "lastAppliedVersion": au.get("lastAppliedVersion"),
                        "lastAppliedAt": _iso_local(au.get("lastAppliedAt"))},
         # v6.55: installed vs newest streamlink (outdated streamlink = Twitch recordings fail)
@@ -13062,7 +13083,12 @@ def render_status_text(doc):
     au = doc.get("autoUpdate") or {}  # v6.43
     if au:
         if not au.get("enabled"):
-            line = "Helper auto-update: OFF (updates only via Check for updates → Install update)"
+            # v6.70: when a newer version was found, say so clearly (Install update on the page)
+            if au.get("updateAvailable") and au.get("remoteVersion"):
+                line = (f"Helper auto-update: OFF — v{au.get('remoteVersion')} available; "
+                        "Install update in the recorder page")
+            else:
+                line = "Helper auto-update: OFF (updates only via Check for updates → Install update)"
         else:
             line = "Helper auto-update: on"
             st = au.get("state")
@@ -14224,6 +14250,81 @@ def _self_test_v667():
             ["whistleface-2026-10-12-Mon-part 1 of 1.ogg"]
         # classic names pass straight through
         assert drive_part_names(tgt, "x", ["x-music-part1of1.ogg"]) == ["x-music-part1of1.ogg"]
+
+
+def _self_test_v670():
+    """v6.70: auto-update OFF still checks GitHub; sets outdated-manual; never installs."""
+    saved = dict(AUTO_UPDATE)
+    prev_check = check_update
+    prev_apply = apply_update
+    apply_calls = []
+    with PIPELINE_LOCK:
+        prev_au = PIPELINE.get("autoUpdate", True)
+        PIPELINE["autoUpdate"] = False
+    try:
+        def fake_check_newer():
+            return {
+                "ok": True,
+                "localVersion": HELPER_VERSION,
+                "remoteVersion": "99.0",
+                "updateAvailable": True,
+                "repo": UPDATE_REPO,
+                "rawBase": UPDATE_RAW_BASE,
+            }
+
+        def fake_check_same():
+            return {
+                "ok": True,
+                "localVersion": HELPER_VERSION,
+                "remoteVersion": HELPER_VERSION,
+                "updateAvailable": False,
+                "repo": UPDATE_REPO,
+                "rawBase": UPDATE_RAW_BASE,
+            }
+
+        def fake_apply(source="manual"):
+            apply_calls.append(source)
+            return {"ok": True, "version": "99.0"}
+
+        globals()["check_update"] = fake_check_newer
+        globals()["apply_update"] = fake_apply
+        _auto_update_set(
+            lastCheckAt=0.0, checkNow=True, updateAvailable=False, remoteVersion=None,
+            state="off", lastError=None, lastResult=None, noticedOutdatedVersion=None,
+            waitingFor=None, nextCheckAt=0.0)
+        auto_update_tick()
+        assert AUTO_UPDATE.get("updateAvailable") is True, AUTO_UPDATE
+        assert AUTO_UPDATE.get("remoteVersion") == "99.0", AUTO_UPDATE
+        assert AUTO_UPDATE.get("state") == "outdated-manual", AUTO_UPDATE
+        assert AUTO_UPDATE.get("lastCheckAt"), AUTO_UPDATE
+        assert not apply_calls, apply_calls
+        # second tick (not due) must not install either
+        auto_update_tick()
+        assert AUTO_UPDATE.get("state") == "outdated-manual"
+        assert not apply_calls, apply_calls
+        snap = auto_update_snapshot()
+        assert snap["enabled"] is False and snap["updateAvailable"] and snap["state"] == "outdated-manual", snap
+        assert snap["remoteVersion"] == "99.0"
+        doc = build_status_doc()
+        au = doc.get("autoUpdate") or {}
+        assert au.get("updateAvailable") and au.get("remoteVersion") == "99.0" and au.get("state") == "outdated-manual", au
+        text = render_status_text(doc)
+        assert "OFF — v99.0 available" in text and "Install update" in text, text
+        # up to date while off → state off, still no install
+        globals()["check_update"] = fake_check_same
+        _auto_update_set(checkNow=True, lastCheckAt=0.0, noticedOutdatedVersion="99.0")
+        auto_update_tick()
+        assert AUTO_UPDATE.get("state") == "off", AUTO_UPDATE
+        assert AUTO_UPDATE.get("updateAvailable") is False
+        assert not apply_calls, apply_calls
+    finally:
+        globals()["check_update"] = prev_check
+        globals()["apply_update"] = prev_apply
+        with PIPELINE_LOCK:
+            PIPELINE["autoUpdate"] = prev_au
+        with AUTO_UPDATE_LOCK:
+            AUTO_UPDATE.clear()
+            AUTO_UPDATE.update(saved)
 
 
 def _self_test_v669():
@@ -15417,8 +15518,8 @@ def main():
     if AUTO_UPDATE_ENV_OFF:
         log("auto-update: disabled by TWITCH_RECORDER_AUTO_UPDATE=0")
     else:
-        log(f"auto-update: {'on' if auto_update_enabled() else 'OFF (Settings)'} — first GitHub check in "
-            f"{int(AUTO_UPDATE_FIRST_SECS)}s, then every {AUTO_UPDATE_EVERY_SECS / 3600:g} h; installs only when idle")
+        log(f"auto-update: {'on' if auto_update_enabled() else 'OFF (Settings; still checks GitHub, Install update on the page)'} — first GitHub check in "
+            f"{int(AUTO_UPDATE_FIRST_SECS)}s, then every {AUTO_UPDATE_EVERY_SECS / 3600:g} h; installs only when idle and auto-update is on")
     if SL_UPDATE_ENV_OFF:
         log("streamlink update: disabled by TWITCH_RECORDER_STREAMLINK_UPDATE=0 (version still reported)")
     else:
