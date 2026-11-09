@@ -220,7 +220,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.70</span>
+    <span class="badge">v6.71</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -577,7 +577,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.70'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.71'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -5626,7 +5626,7 @@ function renderPipelineBox(){
     ol.forEach(function(ov){
       const nEsc=driveEsc(ov.name).replace(/&#39;/g,"\\'");
       html+='<div class="dp-row"><span>'+driveEsc(ov.name)+'</span>'+originalBadgeHtml(ov)
-        +(ov.status==='waiting'||ov.status==='error'?'<button class="btn btn-gray btn-sm" onclick="pipelineSendOriginal(\''+nEsc+'\')">Send original now</button>':'')
+        +(ov.status==='waiting'||ov.status==='error'||ov.status==='held'||ov.status==='covered'?'<button class="btn btn-gray btn-sm" onclick="pipelineSendOriginal(\''+nEsc+'\')">Send original now</button>':'')
         +'</div>'+(ov.status==='error'&&ov.error?'<div class="hint" style="color:#fca5a5;margin:.1rem 0 .3rem">'+driveEsc(ov.error)+'</div>':'');
     });
   }
@@ -6247,8 +6247,17 @@ function originalBadgeHtml(ov){
   }else if(st==='sending'){ txt='⇪ Sending original…'; tip=ov.target||''; }
   else if(st==='queued'){ txt='⇪ Original queued for Drive'; tip='Sent before voice removal starts'; }
   else if(st==='error'){ txt='⚠ Original send failed'; tip=ov.error||'error'; }
+  else if(st==='covered'){ // v6.71: another computer already put this stream's original in Drive
+    const cb=ov.coveredBy||{};
+    txt='☁ Original in Drive from '+(cb.computer||'another computer');
+    tip=(ov.note||'Already in Drive from another computer — skipped the duplicate')+' · Send original now copies this computer\'s file anyway';
+  }
+  else if(st==='held'){ // v6.71: taking turns with the other recording computers
+    txt='⏳ Original: letting another computer send first';
+    tip=(ov.note||'Another computer may send this original first')+(ov.holdUntil?(' · checks again '+driveDate(ov.holdUntil)):'')+' — the local original stays in ~/TwitchRecordings';
+  }
   else { txt='⏳ Original waiting for Drive'; tip=(ov.note||'Waiting for Google Drive for Desktop')+' — the local original stays in ~/TwitchRecordings'; }
-  const cls=(st==='queued')?'sending':st;
+  const cls=(st==='queued'||st==='held')?'sending':st;
   return ' <span class="dp-badge '+driveEsc(cls)+'" title="'+driveEsc(tip)+'">'+driveEsc(txt)+'</span>';
 }
 function applyOriginalsFromHealth(d){
@@ -6264,6 +6273,9 @@ function applyOriginalsFromHealth(d){
     if(ov.status==='sent' && (!prev || prev.status!=='sent')){
       flashOk('☁ Original '+(ov.action==='skipped'?'already in':'sent to')+' Drive: '+driveEsc(ov.name));
       fireNotify('tar-do-'+ov.name, 'Original sent to Drive', ov.name+(ov.dest?(' → '+ov.dest):''));
+    }else if(ov.status==='covered' && (!prev || prev.status!=='covered')){ // v6.71
+      const cb=ov.coveredBy||{};
+      flashOk('☁ Original already in Drive from '+driveEsc(cb.computer||'another computer')+' — skipped the duplicate copy of '+driveEsc(ov.name)+' (kept here locally)');
     }else if(ov.status==='error' && (!prev || prev.status!=='error')){
       flashErr('Original → Drive failed ('+driveEsc(ov.name)+'): '+driveEsc(ov.error||'unknown'));
       fireNotify('tar-do-'+ov.name, 'Original → Drive failed', ov.error||'');

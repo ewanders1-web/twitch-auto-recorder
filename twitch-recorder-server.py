@@ -23,7 +23,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.70"
+HELPER_VERSION = "6.71"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4976,6 +4976,7 @@ def self_test():
     _self_test_v668()  # v6.68
     _self_test_v669()  # v6.69
     _self_test_v670()  # v6.70
+    _self_test_v671()  # v6.71
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -11963,6 +11964,343 @@ def one_copy_precheck(username, first_name, duration):
     return None
 
 
+# ─── v6.71: ONE COPY PER STREAM FOR ORIGINALS ────────────────────────────────
+# v6.50 stopped duplicate voice-removed PARTS, but every recording computer still copied its own
+# ~0.4–0.9 GB original into Drive/Originals (Nov 7 whistleface: three 660 MB copies from three
+# computers, a fourth one failing on macbookpro). All copies finish within seconds of each other, so
+# besides the v6.50-style manifest check (<target>/Recorder status/Sent originals/<name>__<computer>.json)
+# the computers now take turns: each live helper (status file < 20 min old, v6.71+, watching or
+# recording this streamer) gets a slot by sorted computer name; slot 0 sends right away, slot N
+# waits N × ~2.5 min ("held" — voice removal does NOT wait for it) and then skips when an
+# earlier computer's original that covers the whole of ours (within max(3 min, 2 %)) is in Drive
+# with the listed size. A shorter or missing copy never blocks ours, a fresh "sending" claim makes us
+# wait (stale after 20 min), and "Send original now" / manual sends always copy. The local original
+# is never touched. Same Settings toggle as parts (oneCopy); env TWITCH_RECORDER_ONE_COPY_ORIGINALS=0
+# turns only this part off; TWITCH_RECORDER_ORIGINAL_STAGGER_SECS (default 150) sets the slot length.
+SENT_ORIG_MANIFEST_SUBDIR = "Sent originals"
+ORIG_ONE_COPY_ENV_OFF = (os.environ.get("TWITCH_RECORDER_ONE_COPY_ORIGINALS") or "").strip() == "0"
+ORIGINAL_STAGGER_SECS = float(os.environ.get("TWITCH_RECORDER_ORIGINAL_STAGGER_SECS") or 150)
+ORIGINAL_CLAIM_STALE_SECS = float(os.environ.get("TWITCH_RECORDER_ORIGINAL_CLAIM_SECS") or 1200)
+ORIGINAL_PEER_FRESH_SECS = 20 * 60
+ORIGINAL_ONE_COPY_MIN_VERSION = (6, 71)
+ORIG_ONE_COPY_STATS = {"covered": 0, "held": 0, "sentAfterHold": 0}
+
+
+def originals_one_copy_enabled():
+    return (not ORIG_ONE_COPY_ENV_OFF) and one_copy_enabled()
+
+
+def _sent_orig_manifest_dir(target):
+    return Path(target) / STATUS_SUBDIR / SENT_ORIG_MANIFEST_SUBDIR
+
+
+def write_original_manifest(target, name, state, drive_name, size, info):
+    """<target>/Recorder status/Sent originals/<stem>__<computer>.json. Soft: never raises."""
+    try:
+        doc = {"kind": "twitch-recorder-sent-original", "v": 1, "helperVersion": HELPER_VERSION,
+               "computer": computer_name(), "name": name, "username": info.get("user"),
+               "startEpoch": info.get("start"), "startedAt": _iso_local(info.get("start")),
+               "durationSecs": round(float(info.get("duration") or 0), 1), "state": state,
+               "driveName": drive_name, "size": size, "updatedAt": time.time()}
+        d = _sent_orig_manifest_dir(target)
+        d.mkdir(parents=True, exist_ok=True)
+        _status_atomic_write(d / f"{Path(name).stem}__{computer_name()}.json",
+                             json.dumps(doc, indent=1).encode("utf-8"))
+        return True
+    except Exception as e:
+        log(f"one-copy originals: manifest write failed {name}: {e}")
+        return False
+
+
+def _read_original_manifests(target):
+    out = []
+    d = _sent_orig_manifest_dir(target)
+    try:
+        if not d.is_dir():
+            return out
+        for p in d.glob("*.json"):
+            if p.name.startswith("."):
+                continue
+            try:
+                doc = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(doc, dict) and doc.get("kind") == "twitch-recorder-sent-original":
+                out.append(doc)
+    except OSError as e:
+        log(f"one-copy originals: cannot read {d}: {e}")
+    return out
+
+
+def _orig_manifest_present(target, doc):
+    nm = os.path.basename(str(doc.get("driveName") or ""))
+    if not nm or nm in (".", ".."):
+        return False
+    try:
+        return (Path(target) / ORIGINALS_SUBDIR / nm).stat().st_size == int(doc.get("size"))
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def find_other_original(target, user, start, duration, now=None):
+    """('sent', doc) when another computer's original covering ALL of ours is in Drive,
+    ('sending', doc) when one is being copied right now, else (None, None)."""
+    try:
+        duration = float(duration or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if not target or not user or not start or duration <= 0:
+        return None, None
+    now = time.time() if now is None else now
+    me = computer_name().lower()
+    tol = max(ONE_COPY_TOL_SECS, 0.02 * duration)
+    end = start + duration
+    sending = (None, None)
+    for doc in _read_original_manifests(target):
+        if str(doc.get("computer") or "").lower() == me:
+            continue
+        if str(doc.get("username") or "").lower() != str(user).lower():
+            continue
+        try:
+            o_start = float(doc.get("startEpoch"))
+            o_end = o_start + float(doc.get("durationSecs"))
+        except (TypeError, ValueError):
+            continue
+        if o_start > start + tol or o_end < end - tol:
+            continue  # theirs misses part of what we have — ours is worth sending
+        st = doc.get("state")
+        if st == "sent" and _orig_manifest_present(target, doc):
+            return "sent", doc
+        if st == "sending" and now - float(doc.get("updatedAt") or 0) < ORIGINAL_CLAIM_STALE_SECS:
+            sending = ("sending", doc)
+    return sending
+
+
+def _peer_watches_user(doc, user):
+    u = str(user or "").lower()
+    if not u:
+        return False
+    for r in doc.get("recording") or []:
+        if isinstance(r, dict) and str(r.get("username") or "").lower() == u:
+            return True
+    if u in [str(x).lower() for x in (doc.get("autoRecArmed") or [])]:
+        return True
+    sw = doc.get("soloWatch") or {}
+    if isinstance(sw, dict) and u in [str(x).lower() for x in (sw.get("users") or [])]:
+        return True
+    for o in ((doc.get("drive") or {}).get("recentOriginals") or []):
+        if isinstance(o, dict) and str(o.get("name") or "").lower().startswith(u + "-"):
+            return True
+    return False
+
+
+def original_send_slot(target, user, now=None):
+    """(slot, first_computer): my place among live v6.71+ helpers that watch this streamer."""
+    now = time.time() if now is None else now
+    me = computer_name()
+    names = {me.lower(): me}
+    try:
+        folder = Path(target) / STATUS_SUBDIR
+        for p in folder.glob("*.json"):
+            if p.name.startswith("."):
+                continue
+            try:
+                doc = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(doc, dict):
+                continue
+            comp = str(doc.get("computer") or "")
+            if not comp or comp.lower() == me.lower():
+                continue
+            try:
+                fresh = now - float(doc.get("updatedAtEpoch") or 0) < ORIGINAL_PEER_FRESH_SECS
+            except (TypeError, ValueError):
+                fresh = False
+            if not fresh:
+                continue
+            if _parse_version_tuple(str(doc.get("helperVersion") or "0")) < ORIGINAL_ONE_COPY_MIN_VERSION:
+                continue  # older helpers always send — waiting on them saves nothing
+            if not _peer_watches_user(doc, user):
+                continue
+            names[comp.lower()] = comp
+    except OSError:
+        pass
+    order = sorted(names)
+    return order.index(me.lower()), names[order[0]]
+
+
+def _orig_duration(name, d, src):
+    dur = d.get("durationSecs")
+    if dur:
+        return float(dur)
+    try:
+        dur = float(probe_media(src).get("duration") or 0)
+    except Exception:
+        dur = 0.0
+    if dur > 0:
+        _orig_update(name, durationSecs=round(dur, 1))
+    return dur
+
+
+def original_one_copy_gate(name, d, target, src, now=None):
+    """None = send without manifests; {'skip': True, 'snap': …} = not now / not needed;
+    otherwise a dict (user/start/duration) — send and write the manifest."""
+    if not originals_one_copy_enabled() or d.get("source") != "stream":
+        return None
+    user, start = parse_recording_stamp(name)
+    user = (d.get("username") or user or "").lower()
+    if not user or not start:
+        return None
+    dur = _orig_duration(name, d, src)
+    if dur <= 0:
+        return None
+    now = time.time() if now is None else now
+    info = {"user": user, "start": start, "duration": dur}
+    kind, doc = find_other_original(target, user, start, dur, now=now)
+    if kind == "sent":
+        comp = doc.get("computer") or "another computer"
+        note = (f"Already in Drive from {comp} ({float(doc.get('durationSecs') or 0) / 60:.0f} min, "
+                f"{doc.get('driveName')}) — skipped the duplicate; the local original is kept")
+        ORIG_ONE_COPY_STATS["covered"] += 1
+        log(f"one-copy originals: {name} already in Drive from {comp} ({doc.get('driveName')}) — not copying")
+        snap = _orig_update(name, status="covered", note=note, error=None, holdUntil=None,
+                            coveredBy={"computer": comp, "name": doc.get("driveName"),
+                                       "durationSecs": doc.get("durationSecs")},
+                            lastAttempt=now)
+        STATUS_FILE_WAKE.set()
+        return {"skip": True, "snap": snap}
+    if kind == "sending":
+        comp = doc.get("computer") or "another computer"
+        snap = _orig_update(name, status="held", holdUntil=now + 60, lastAttempt=now, error=None,
+                            note=f"{comp} is copying this stream's original to Drive right now — "
+                                 "checking again in a minute (sends ours if theirs doesn't finish)")
+        return {"skip": True, "snap": snap}
+    if d.get("status") != "held":  # first look: take a turn if earlier computers might send it
+        slot, first = original_send_slot(target, user, now=now)
+        if slot > 0 and ORIGINAL_STAGGER_SECS > 0:
+            wait = slot * ORIGINAL_STAGGER_SECS
+            ORIG_ONE_COPY_STATS["held"] += 1
+            log(f"one-copy originals: {name} slot {slot} — letting {first} send first ({wait:.0f}s)")
+            snap = _orig_update(name, status="held", holdUntil=now + wait, lastAttempt=now, error=None,
+                                note=f"Letting {first} send this original first — this computer sends "
+                                     f"in about {max(1, round(wait / 60))} min if it's not in Drive by then")
+            STATUS_FILE_WAKE.set()
+            return {"skip": True, "snap": snap}
+    else:
+        ORIG_ONE_COPY_STATS["sentAfterHold"] += 1
+    write_original_manifest(target, name, "sending", None, None, info)
+    return info
+
+
+def _self_test_v671():
+    """v6.71: originals one copy per stream — covered / held / slot / shorter never blocks."""
+    import tempfile as _tmp71
+    global REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE
+    prev_g = (REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE)
+    with PIPELINE_LOCK:
+        prev_p = {k: (json.loads(json.dumps(PIPELINE.get(k))) if k in PIPELINE else None)
+                  for k in ("originals", "oneCopy")}
+    prev_probe = globals()["probe_media"]
+    try:
+        with _tmp71.TemporaryDirectory(prefix="tar-671-") as td:
+            td = Path(td)
+            REC_DIR = td / "rec"
+            DRIVE_PARTS_DIR = REC_DIR / "Drive parts"
+            PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
+            REC_DIR.mkdir(parents=True)
+            tgt = td / "Twitch"
+            (tgt / ORIGINALS_SUBDIR).mkdir(parents=True)
+            (tgt / STATUS_SUBDIR).mkdir(parents=True)
+            globals()["probe_media"] = lambda _p: {"duration": 3600.0}
+            with PIPELINE_LOCK:
+                PIPELINE["oneCopy"] = True
+                PIPELINE["originals"] = {}
+            if not originals_one_copy_enabled():
+                return
+            name = "selftest671-Sat-2026-11-07T21-02-46.ogg"
+            (REC_DIR / name).write_bytes(b"r" * 5000)
+            _u, st = parse_recording_stamp(name)
+            now = time.time()
+
+            def reg():
+                with PIPELINE_LOCK:
+                    PIPELINE["originals"] = {}
+                register_original(name, "selftest671", "stream")
+                with PIPELINE_LOCK:
+                    return dict(PIPELINE["originals"][name])
+
+            # alone → send (writes "sending" manifest)
+            d = reg()
+            info = original_one_copy_gate(name, d, str(tgt), REC_DIR / name, now=now)
+            assert isinstance(info, dict) and not info.get("skip"), info
+            mine = _sent_orig_manifest_dir(tgt) / f"{Path(name).stem}__{computer_name()}.json"
+            assert json.loads(mine.read_text())["state"] == "sending"
+            mine.unlink()
+            # live v6.71 peer "AAA-Peer" sorts first and watches the streamer → held
+            peer = {"computer": "AAA-Peer", "updatedAtEpoch": now, "helperVersion": "6.71",
+                    "autoRecArmed": ["selftest671"], "recording": []}
+            (tgt / STATUS_SUBDIR / "AAA-Peer.json").write_text(json.dumps(peer))
+            if computer_name().lower() > "aaa-peer":
+                d = reg()
+                r = original_one_copy_gate(name, d, str(tgt), REC_DIR / name, now=now)
+                assert r and r.get("skip") and r["snap"]["status"] == "held", r
+                assert originals_due(set(), now) == []
+                assert originals_due(set(), now + ORIGINAL_STAGGER_SECS + 1) == [name]
+                # old peer doesn't count
+                peer["helperVersion"] = "6.70"
+                (tgt / STATUS_SUBDIR / "AAA-Peer.json").write_text(json.dumps(peer))
+                assert original_send_slot(str(tgt), "selftest671", now=now)[0] == 0
+                # stale peer doesn't count
+                peer.update(helperVersion="6.71", updatedAtEpoch=now - 3600)
+                (tgt / STATUS_SUBDIR / "AAA-Peer.json").write_text(json.dumps(peer))
+                assert original_send_slot(str(tgt), "selftest671", now=now)[0] == 0
+            # peer's covering original in Drive → covered (local kept)
+            other = "selftest671-Sat-2026-11-07T21-02-32.ogg"
+            (tgt / ORIGINALS_SUBDIR / other).write_bytes(b"o" * 7000)
+            md = _sent_orig_manifest_dir(tgt)
+            md.mkdir(parents=True, exist_ok=True)
+            man = {"kind": "twitch-recorder-sent-original", "computer": "AAA-Peer", "username": "selftest671",
+                   "startEpoch": st - 14, "durationSecs": 3610.0, "state": "sent", "driveName": other,
+                   "size": 7000, "updatedAt": now}
+            (md / "x__AAA-Peer.json").write_text(json.dumps(man))
+            d = reg()
+            r = original_one_copy_gate(name, d, str(tgt), REC_DIR / name, now=now)
+            assert r and r.get("skip") and r["snap"]["status"] == "covered", r
+            assert (REC_DIR / name).is_file()
+            # manual send always copies
+            d = dict(d, source="manual")
+            assert original_one_copy_gate(name, d, str(tgt), REC_DIR / name, now=now) is None
+            # their copy changed size → not covered
+            (tgt / ORIGINALS_SUBDIR / other).write_bytes(b"o" * 10)
+            assert find_other_original(str(tgt), "selftest671", st, 3600.0, now=now)[0] is None
+            (tgt / ORIGINALS_SUBDIR / other).write_bytes(b"o" * 7000)
+            # theirs is shorter (missed the last 20 min) → ours still sends
+            man["durationSecs"] = 2400.0
+            (md / "x__AAA-Peer.json").write_text(json.dumps(man))
+            assert find_other_original(str(tgt), "selftest671", st, 3600.0, now=now)[0] is None
+            # fresh "sending" claim → wait; stale claim → ignored
+            man.update(durationSecs=3610.0, state="sending", updatedAt=now)
+            (md / "x__AAA-Peer.json").write_text(json.dumps(man))
+            assert find_other_original(str(tgt), "selftest671", st, 3600.0, now=now)[0] == "sending"
+            assert find_other_original(str(tgt), "selftest671", st, 3600.0,
+                                       now=now + ORIGINAL_CLAIM_STALE_SECS + 5)[0] is None
+            # a covered original is never re-queued by the delivery loop
+            with PIPELINE_LOCK:
+                PIPELINE["originals"][name]["status"] = "covered"
+            assert name not in originals_due(set(), now + 99999)
+            assert drive_stuck_counts()["originals"] == 0
+    finally:
+        globals()["probe_media"] = prev_probe
+        REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE = prev_g
+        with PIPELINE_LOCK:
+            for k, v in prev_p.items():
+                if v is None:
+                    PIPELINE.pop(k, None)
+                else:
+                    PIPELINE[k] = v
+
+
 def original_enabled_for(username):
     u = (username or "").lower()
     with PIPELINE_LOCK:
@@ -12020,7 +12358,7 @@ def register_original(name, username=None, source="stream", force=False):
     with PIPELINE_LOCK:
         origs = PIPELINE.setdefault("originals", {})
         d = origs.get(name)
-        if d and not force and d.get("status") in ("queued", "sending", "sent", "waiting"):
+        if d and not force and d.get("status") in ("queued", "sending", "sent", "waiting", "held", "covered"):
             return dict(d)
         if d and d.get("status") == "sent" and force and d.get("size") == size:
             return dict(d)  # already in Drive, unchanged
@@ -12069,8 +12407,16 @@ def deliver_original(name):
     if err or not target:
         return _orig_update(name, status="error", error=err or "no target", lastAttempt=time.time())
     dest_dir = Path(target) / ORIGINALS_SUBDIR
+    # v6.71: one copy per stream for originals too (another computer may already have sent it)
+    oc = None
+    try:
+        oc = original_one_copy_gate(name, d, target, src)
+    except Exception as e:
+        log(f"one-copy originals: check skipped for {name}: {e}")
+    if isinstance(oc, dict) and oc.get("skip"):
+        return oc.get("snap")
     _orig_update(name, status="sending", error=None, target=str(dest_dir), lastAttempt=time.time(),
-                 note=None)
+                 note=None, holdUntil=None)
     DELIVERY_STATE["busy"] = True
     DELIVERY_STATE["base"] = Path(name).stem
     try:
@@ -12080,10 +12426,14 @@ def deliver_original(name):
         except Exception as e:
             log(f"drive original error {name}: {e}")
             msg = drive_permission_message() if isinstance(e, PermissionError) else (str(e) or type(e).__name__)
+            if oc:
+                write_original_manifest(target, name, "error", None, None, oc)
             return _orig_update(name, status="error", error=msg)
         # v6.51: the copy is in Drive — a failing log line can no longer mark it "error"
         snap = _orig_update(name, status="sent", sentAt=time.time(), dest=str(dest), action=action,
                             size=size, error=None)
+        if oc:
+            write_original_manifest(target, name, "sent", Path(dest).name, size, oc)
         log(f"drive original {action}: {name} → {dest}")
         return snap
     finally:
@@ -12096,9 +12446,11 @@ def originals_due(forced, now):
         todo = []
         for name, d in (PIPELINE.get("originals") or {}).items():
             st = d.get("status")
-            if st in ("queued", "waiting") or name in forced or ("*" in forced and st == "error"):
+            if st in ("queued", "waiting") or name in forced or ("*" in forced and st in ("error", "held")):
                 todo.append(name)
             elif st == "error" and now - float(d.get("lastAttempt") or 0) > DELIVERY_ERROR_RETRY_SECS:
+                todo.append(name)
+            elif st == "held" and now >= float(d.get("holdUntil") or 0):  # v6.71
                 todo.append(name)
     return todo
 
@@ -12109,7 +12461,8 @@ def originals_snapshot(limit=60):
                        key=lambda d: d.get("updatedAt") or 0, reverse=True)
         return [{k: d.get(k) for k in (
             "name", "base", "username", "size", "status", "target", "dest", "action", "sentAt",
-            "error", "note", "source", "computer", "createdAt", "updatedAt")} for d in items[:limit]]
+            "error", "note", "source", "computer", "createdAt", "updatedAt",
+            "holdUntil", "coveredBy", "durationSecs")} for d in items[:limit]]
 
 
 def forget_original_if_unsent(name):
@@ -12900,6 +13253,9 @@ def build_status_doc(now=None):
             "partsErrors": sum(1 for d in all_dels if d.get("status") == "error"),
             "originalsWaiting": sum(1 for d in all_origs if d.get("status") in ("waiting", "queued")),
             "originalsErrors": sum(1 for d in all_origs if d.get("status") == "error"),
+            "originalsOneCopy": originals_one_copy_enabled(),  # v6.71
+            "originalsSkippedAsDuplicate": sum(1 for d in all_origs if d.get("status") == "covered"),
+            "originalsHeld": sum(1 for d in all_origs if d.get("status") == "held"),
             "recentDeliveries": [{
                 "base": d.get("base"), "status": d.get("status"), "parts": len(d.get("parts") or []),
                 "sentAt": _iso_local(d.get("sentAt")), "note": _short(d.get("note"), 200),
