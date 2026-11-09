@@ -220,7 +220,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.72</span>
+    <span class="badge">v6.73</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -469,7 +469,7 @@
           </select></label>
       </div>
       <div id="voiceQualityStatus" class="hint" style="margin-top:.35rem"></div>
-      <div class="hint">Used by History <strong>Music only</strong>, Auto Music only, the upload below, <strong>Google Drive → remove voice</strong>, Drive links, and the after-stream remove voice → Drive step. <strong>All voices</strong> (default, v6.72) is the full Demucs wipe — every voice removed, song vocals too (also writes <code>-vocals</code> from History/upload). <strong>Talk only</strong> (optional) runs Demucs then removes just the DJ talking so song vocals stay; it installs speechbrain the first time it’s used. <strong>Fast</strong> cancels centered voice with ffmpeg — quick, no Demucs. One job at a time; output <code>&lt;stem&gt;-music.ogg</code>; originals untouched. Per-streamer override optional in <code>.drive-pipeline.json</code> (<code>userVoiceQuality</code>).</div>
+      <div class="hint">Used by History <strong>Music only</strong>, Auto Music only, the upload below, <strong>Google Drive → remove voice</strong>, Drive links, and the after-stream remove voice → Drive step. <strong>All voices</strong> (default, v6.72) is the full Demucs wipe — every voice removed, song vocals too (also writes <code>-vocals</code> from History/upload). <strong>Talk only</strong> (optional) runs Demucs then removes just the DJ talking so song vocals stay; it installs speechbrain the first time it’s used. <strong>Fast</strong> cancels centered voice with ffmpeg — quick, no Demucs. One job at a time; output <code>&lt;stem&gt;-music.ogg</code>; originals untouched. Since v6.73 every music-only file is volume-leveled (louder, even: −14 LUFS, −1.5 dB peak) and saved as Opus 180 kb/s, 48 kHz, so a 4-hour set is about 7 parts of ~34 min. Per-streamer override optional in <code>.drive-pipeline.json</code> (<code>userVoiceQuality</code>).</div>
     </div>
     <div class="upload-music-box">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap;">
@@ -577,7 +577,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.72'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.73'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45

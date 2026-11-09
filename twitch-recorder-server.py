@@ -23,7 +23,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.72"
+HELPER_VERSION = "6.73"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4979,6 +4979,7 @@ def self_test():
     _self_test_v670()  # v6.70
     _self_test_v671()  # v6.71
     _self_test_v672()  # v6.72
+    _self_test_v673()  # v6.73
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -5324,8 +5325,9 @@ def _find_vocals(work_dir):
     return _find_demucs_stem(work_dir, ("vocals",))
 
 
-def _remux_instrumental(wav_path, dest_path):
-    """Prefer OGG (libvorbis, then libopus) via ffmpeg; else copy wav. Returns final Path."""
+def _remux_instrumental(wav_path, dest_path, normalize=False, job_id=None, progress=None):
+    """Stem wav → OGG (v6.73: Opus 180k CBR, Vorbis fallback; normalize=True → -14 LUFS loudnorm);
+    else copy wav. Returns final Path."""
     ff = which_ffmpeg()
     wav_path = Path(wav_path)
     dest_path = Path(dest_path)
@@ -5333,39 +5335,26 @@ def _remux_instrumental(wav_path, dest_path):
         final = dest_path.with_suffix(".wav")
         shutil.copy2(str(wav_path), str(final))
         return final
-    # Prefer ogg; fall back wav only if ogg encode fails (legacy mp3/m4a no longer preferred)
-    for ext, args in (
-        (".ogg", ["-codec:a", "libvorbis", "-q:a", "5"]),
-        (".ogg", ["-codec:a", "libopus", "-b:a", "128k"]),
-    ):
-        out = dest_path.with_suffix(ext)
-        cmd = [
-            ff,
-            "-y",
-            "-i",
-            str(wav_path),
-            "-vn",
-            *args,
-            str(out),
-        ]
+    out = dest_path.with_suffix(".ogg")
+    try:
+        dur = 0.0
         try:
-            r = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8", errors="replace",  # v6.51: not the Windows code page
-                timeout=600,
-            )
-            if r.returncode == 0 and out.is_file() and out.stat().st_size > 0:
-                return out
-            log(f"ffmpeg remux to {ext} ({args[1]}) failed: {(r.stderr or '')[-400:]}")
-            try:
-                if out.is_file() and out.stat().st_size == 0:
-                    out.unlink()
-            except OSError:
-                pass
-        except (OSError, subprocess.TimeoutExpired) as e:
-            log(f"ffmpeg remux {ext} error: {e}")
+            dur = float(probe_media(wav_path)["duration"] or 0)
+        except Exception:
+            pass
+        res = encode_music_ogg(job_id, ["-i", str(wav_path)], out, dur, progress or (lambda *a, **k: None),
+                               normalize=normalize)
+        if res and Path(res).is_file() and Path(res).stat().st_size > 0:
+            return Path(res)
+    except _JobCancelled:
+        raise
+    except Exception as e:
+        log(f"ffmpeg remux to .ogg failed: {str(e)[-400:]}")
+        try:
+            if out.is_file() and out.stat().st_size == 0:
+                out.unlink()
+        except OSError:
+            pass
     final = dest_path.with_suffix(".wav")
     shutil.copy2(str(wav_path), str(final))
     return final
@@ -5695,7 +5684,7 @@ def music_only_worker(job_id, src_path):
             progress("Encoding instrumental…", pct=90)
             # Native source is never overwritten — sibling -music / -vocals only.
             provisional = _unique_music_dest(src_path.name)
-            final = _remux_instrumental(stem_wav, provisional)
+            final = _remux_instrumental(stem_wav, provisional, normalize=True)  # v6.73 leveled
             out_name = final.name
         url = "/api/download/" + urllib.parse.quote(out_name)
         vocals_name = None
@@ -7369,38 +7358,186 @@ def chunked_demucs_no_vocals(job_id, src, work, duration, progress, pct_lo=20.0,
 
 
 def encode_joined_ogg(job_id, parts, out_path, duration, progress, pct_lo=90.0, pct_hi=99.0, codec_args=None):
-    """Concat no_vocals parts in order → OGG (libvorbis q5, fallback libopus)."""
-    ff = which_ffmpeg()
+    """Concat voice-removed (lossless FLAC) parts in order → OGG. v6.73: two-pass loudnorm to -14 LUFS /
+    -1.5 dBTP (TWITCH_RECORDER_LOUDNORM=0 to skip) and Opus 48 kHz 180 kb/s CBR (Vorbis fallback)."""
     lst = Path(out_path).with_suffix(".txt")
     with open(lst, "w", encoding="utf-8") as fh:
         for p in parts:
             fh.write("file '" + str(p).replace("'", "'\\''") + "'\n")
+    return encode_music_ogg(job_id, ["-f", "concat", "-safe", "0", "-i", str(lst)], out_path, duration,
+                            progress, pct_lo=pct_lo, pct_hi=pct_hi, codec_args=codec_args)
+
+
+# ─── v6.73: LOUDER, EVEN VOLUME + BETTER MUSIC ENCODE ───────────────────────────────────────────
+# Every music-only file (Fast / All voices / Talk only; History, Drive, after-stream pipeline) is
+# volume-leveled with ffmpeg's two-pass EBU R128 loudnorm: pass 1 measures the whole set, pass 2 applies
+# one gain (linear mode whenever the peak ceiling allows it, otherwise loudnorm's gentle dynamic mode) to
+# -14 LUFS integrated, -1.5 dBTP true peak (-1 overshot after lossy encoding in testing). After encoding,
+# the true peak is checked; if it's still above -1 dBTP the file is re-encoded once a little quieter.
+# If the measure pass fails (odd file, silence, old ffmpeg) the file is saved without leveling — logged.
+# Encode: Opus stereo 48 kHz 180 kb/s CBR in .ogg (falls back to Vorbis q6 when libopus is missing).
+# Env: TWITCH_RECORDER_LOUDNORM=0 → no volume leveling; TWITCH_RECORDER_MUSIC_CODEC=vorbis → old Vorbis q6.
+LOUDNORM_ON = (os.environ.get("TWITCH_RECORDER_LOUDNORM") or "").strip().lower() not in ("0", "off", "false", "no")
+LOUDNORM_I = -14.0
+LOUDNORM_TP = -1.5
+LOUDNORM_LRA = 11.0
+LOUDNORM_TP_CEIL = -1.0  # measured on the encoded file; above this → one quieter re-encode
+LOUDNORM_KEYS = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
+MUSIC_OPUS_ARGS = ["-c:a", "libopus", "-b:a", "180k", "-vbr", "off", "-application", "audio",
+                   "-ar", "48000", "-ac", "2"]
+MUSIC_VORBIS_ARGS = ["-c:a", "libvorbis", "-q:a", "6", "-ar", "44100", "-ac", "2"]  # ≤ v6.72 default
+MUSIC_CODEC_VORBIS = (os.environ.get("TWITCH_RECORDER_MUSIC_CODEC") or "").strip().lower() == "vorbis"
+
+
+def music_codec_choices(codec_args=None):
+    """Encoder arg lists to try in order (first that works wins)."""
+    first = [MUSIC_VORBIS_ARGS, MUSIC_OPUS_ARGS] if MUSIC_CODEC_VORBIS else [MUSIC_OPUS_ARGS, MUSIC_VORBIS_ARGS]
+    out = []
+    for a in ([list(codec_args)] if codec_args else []) + first + [
+            ["-c:a", "libvorbis", "-q:a", "5", "-ar", "48000"], ["-c:a", "libopus", "-b:a", "128k", "-ar", "48000"]]:
+        if a not in out:
+            out.append(a)
+    return out
+
+
+def parse_loudnorm_json(text):
+    """The loudnorm print_format=json block from ffmpeg output → dict of floats, or None."""
+    text = text or ""
+    j = text.rfind("}")
+    i = text.rfind("{", 0, j) if j >= 0 else -1
+    if i < 0:
+        return None
+    try:
+        raw = json.loads(text[i:j + 1])
+    except ValueError:
+        return None
+    out = {}
+    for k in LOUDNORM_KEYS:
+        try:
+            v = float(raw.get(k))
+        except (TypeError, ValueError):
+            return None
+        if v != v or v in (float("inf"), float("-inf")):
+            return None
+        out[k] = v
+    if out["input_i"] <= -70.0:  # silence / near-silence: nothing sensible to level
+        return None
+    return out
+
+
+def loudnorm_measure(job_id, in_args, tp=LOUDNORM_TP, timeout=3 * 3600):
+    """Pass 1: measure loudness of in_args (ffmpeg input args). Returns dict or None."""
+    ff = which_ffmpeg()
+    if not ff:
+        return None
+    cmd = [ff, "-nostdin", "-hide_banner", "-nostats", "-v", "info", *in_args, "-vn", "-map", "0:a:0",
+           "-af", f"loudnorm=I={LOUDNORM_I:g}:TP={tp:g}:LRA={LOUDNORM_LRA:g}:print_format=json",
+           "-f", "null", "-"]
+    if job_id:
+        rc, text = _job_run_proc(job_id, cmd, timeout=timeout)
+    else:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout)
+        rc, text = r.returncode, (r.stderr or "") + (r.stdout or "")
+    if rc != 0:
+        return None
+    return parse_loudnorm_json(text)
+
+
+def loudnorm_af(meas, tp=LOUDNORM_TP, extra_gain_db=0.0):
+    """Pass 2 filter from pass-1 numbers (linear when possible). extra_gain_db < 0 → a touch quieter."""
+    af = (f"loudnorm=I={LOUDNORM_I:g}:TP={tp:g}:LRA={LOUDNORM_LRA:g}"
+          f":measured_I={meas['input_i']:.2f}:measured_TP={meas['input_tp']:.2f}"
+          f":measured_LRA={meas['input_lra']:.2f}:measured_thresh={meas['input_thresh']:.2f}"
+          f":offset={meas['target_offset']:.2f}:linear=true:print_format=none")
+    if extra_gain_db:
+        af += f",volume={extra_gain_db:.2f}dB"
+    return af
+
+
+def encode_music_ogg(job_id, in_args, out_path, duration, progress, pct_lo=90.0, pct_hi=99.0,
+                     codec_args=None, normalize=True):
+    """v6.73: (optional two-pass loudnorm) + encode in_args → out_path (.ogg). Returns Path."""
+    ff = which_ffmpeg()
+    if not ff:
+        raise RuntimeError("ffmpeg not found")
+    out_path = Path(out_path)
     dur_us = max(1.0, float(duration or 0)) * 1_000_000
+    meas = None
+    if normalize and LOUDNORM_ON:
+        progress("Measuring loudness…", pct_lo)
+        try:
+            meas = loudnorm_measure(job_id, in_args)
+        except _JobCancelled:
+            raise
+        except Exception as e:  # never fail the job over leveling
+            log(f"loudnorm: measure failed ({e}) — saving without volume leveling")
+            meas = None
+        if meas is None:
+            log("loudnorm: could not measure loudness — saving without volume leveling")
+        else:
+            log(f"loudnorm: measured {meas['input_i']:.1f} LUFS / {meas['input_tp']:.1f} dBTP → "
+                f"{LOUDNORM_I:g} LUFS / {LOUDNORM_TP:g} dBTP")
+    enc_lo = pct_lo + (pct_hi - pct_lo) * (0.35 if meas else 0.0)
 
-    def on_line(line):
-        if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
-            try:
-                v = float(line.split("=", 1)[1])
-            except ValueError:
-                return
-            frac = max(0.0, min(1.0, v / dur_us))
-            progress(f"Encoding OGG · {frac * 100:.0f}%", round(pct_lo + (pct_hi - pct_lo) * frac, 1))
+    def run_encode(af):
+        def on_line(line):
+            if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                try:
+                    v = float(line.split("=", 1)[1])
+                except ValueError:
+                    return
+                frac = max(0.0, min(1.0, v / dur_us))
+                progress(f"Encoding OGG · {frac * 100:.0f}%", round(enc_lo + (pct_hi - enc_lo) * frac, 1))
 
-    last = ""
-    choices = [list(codec_args)] if codec_args else []
-    choices += [["-c:a", "libvorbis", "-q:a", "5"], ["-c:a", "libopus", "-b:a", "128k"]]
-    for args in choices:
-        progress("Encoding OGG…", pct_lo)
-        rc, tail = _job_run_proc(
-            job_id,
-            [ff, "-nostdin", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-             "-vn", *args, "-progress", "pipe:1", "-nostats", str(out_path)],
-            line_cb=on_line, timeout=3 * 3600,
-        )
-        if rc == 0 and Path(out_path).is_file() and Path(out_path).stat().st_size > 0:
-            return Path(out_path)
-        last = tail[-400:]
-    raise RuntimeError(f"ffmpeg encode failed: {last}")
+        last = ""
+        for args in music_codec_choices(codec_args):
+            args = list(args)
+            if af and "-ar" not in args:
+                args += ["-ar", "48000"]  # loudnorm works at 192 kHz internally — never write that out
+            progress("Encoding OGG…", enc_lo)
+            cmd = [ff, "-nostdin", "-v", "error", "-y", *in_args, "-vn", "-map", "0:a:0"]
+            if af:
+                cmd += ["-af", af]
+            cmd += [*args, "-f", "ogg", "-progress", "pipe:1", "-nostats", str(out_path)]
+            if job_id:
+                rc, tail = _job_run_proc(job_id, cmd, line_cb=on_line, timeout=3 * 3600)
+            else:
+                r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", timeout=3 * 3600)
+                rc, tail = r.returncode, (r.stderr or "")
+            if rc == 0 and out_path.is_file() and out_path.stat().st_size > 0:
+                return out_path
+            last = tail[-400:]
+        if af:
+            log(f"loudnorm: leveled encode failed ({last[-160:]}) — trying without volume leveling")
+            return None
+        raise RuntimeError(f"ffmpeg encode failed: {last}")
+
+    if meas is None:
+        return run_encode(None)
+    res = run_encode(loudnorm_af(meas))
+    if res is None:
+        return run_encode(None)
+    # The lossy encode can push true peak a little past the ceiling — check the real file once.
+    try:
+        progress("Checking volume…", pct_hi)
+        got = loudnorm_measure(job_id, ["-i", str(out_path)])
+    except _JobCancelled:
+        raise
+    except Exception as e:
+        got = None
+        log(f"loudnorm: post-check skipped ({e})")
+    if got and got["input_tp"] > LOUDNORM_TP_CEIL:
+        over = got["input_tp"] - LOUDNORM_TP
+        log(f"loudnorm: encoded peak {got['input_tp']:.2f} dBTP > {LOUDNORM_TP_CEIL:g} — re-encoding "
+            f"{over:.2f} dB quieter")
+        res2 = run_encode(loudnorm_af(meas, extra_gain_db=-over))
+        if res2 is not None:
+            res = res2
+    elif got:
+        log(f"loudnorm: encoded {got['input_i']:.1f} LUFS / {got['input_tp']:.2f} dBTP")
+    return res
 
 
 # ─── v6.69: TALK-ONLY HYBRID VOICE REMOVAL ───────────────────────────────────
@@ -8319,7 +8456,7 @@ def fast_voice_reduce_parts(job_id, src, work, duration, progress, pct_lo=20.0, 
         rc, tail = _job_run_proc(
             job_id,
             [ff, "-nostdin", "-v", "error", "-y", "-i", str(one), "-vn", "-map", "0:a:0",
-             "-af", FAST_VOICE_AF, "-ac", "2", "-ar", "44100", "-c:a", "flac",
+             "-af", FAST_VOICE_AF, "-ac", "2", "-ar", "48000", "-c:a", "flac",  # v6.73: no 44.1k downsample
              "-progress", "pipe:1", "-nostats", str(flac)],
             line_cb=on_line, timeout=3 * 3600,
         )
@@ -8907,7 +9044,8 @@ def cleanup_drive_temps(reason="startup"):
 # ─────────────────────────────────────────────────────────────────────────────
 import math as _math_pipe
 
-PART_TARGET_BYTES = int(os.environ.get("TWITCH_RECORDER_PART_TARGET_BYTES") or 45 * 1000 * 1000)
+# v6.73: 47.5 MB target → a 4 h Opus 180k set is 7 equal parts (~34 min, ~46.6 MB each), still < 50 MB
+PART_TARGET_BYTES = int(os.environ.get("TWITCH_RECORDER_PART_TARGET_BYTES") or 47_500_000)
 PART_MAX_BYTES = int(os.environ.get("TWITCH_RECORDER_PART_MAX_BYTES") or 50 * 1000 * 1000)
 PART_MIN_SECS = float(os.environ.get("TWITCH_RECORDER_PART_MIN_SECS") or 600)
 DELIVERY_POLL_SECS = max(2, int(os.environ.get("TWITCH_RECORDER_DELIVERY_SECS") or 60))
@@ -8928,7 +9066,7 @@ DELIVERY_STATE = {"busy": False, "force": set(), "base": None}  # v6.37: base wh
 DRIVE_PARTIAL_STALE_SECS = int(os.environ.get("TWITCH_RECORDER_DRIVE_PARTIAL_STALE_SECS") or 3600)
 DRIVE_PARTIAL_IDLE_SECS = int(os.environ.get("TWITCH_RECORDER_DRIVE_PARTIAL_IDLE_SECS") or 300)
 PIPELINE_SEEN = set()  # first-segment basenames already queued by this process
-MUSIC_OGG_ARGS = ["-c:a", "libvorbis", "-q:a", "6", "-ar", "44100", "-ac", "2"]
+MUSIC_OGG_ARGS = None  # v6.73: music_codec_choices() — Opus 180k CBR first, Vorbis q6 fallback
 AUTO_TARGET_NAMES = ("twitch", "twitchrecordings", "twitch recordings", "twitch-recordings")
 DEFAULT_TARGET_REL = ("Twitch Recordings", "Music only")
 
@@ -9837,7 +9975,7 @@ def set_pipeline_user_pref(username, on):
 
 
 def plan_split(size_bytes, duration):
-    """Equal parts: count = ceil(size / 45 MB), capped so parts stay >= PART_MIN_SECS
+    """Equal parts: count = ceil(size / 47.5 MB), capped so parts stay >= PART_MIN_SECS
     unless that would push a part over PART_MAX_BYTES (50 MB is the hard limit)."""
     try:
         size_bytes = float(size_bytes or 0)
@@ -9968,8 +10106,31 @@ def drive_part_names(target, base, names, user=None, start=None, duration=None, 
     return [f"{base}-{n}" for n in names]  # 29 broadcasts in one day: fall back to the unique base
 
 
+def split_bounds(duration, m):
+    """v6.73: exact equal source intervals [(start, length or None for 'to the end')]."""
+    duration = max(0.0, float(duration or 0))
+    m = max(1, int(m))
+    out = []
+    for i in range(m):
+        a = duration * i / m
+        out.append((a, None if i == m - 1 else duration * (i + 1) / m - a))
+    return out
+
+
+SPLIT_TAIL_MIN_SECS = 1.0  # a last part shorter than this is codec padding, not music — dropped
+
+
+def _probe_secs(path):
+    try:
+        return float(probe_media(path)["duration"] or 0)
+    except Exception:
+        return -1.0
+
+
 def split_music_for_drive(job_id, src, progress=None):
-    """Cut a -music file into equal-length parts (<50 MB). Returns (parts_dir, [names], part_secs)."""
+    """Cut a -music file into equal-length parts (<50 MB). Returns (parts_dir, [names], part_secs).
+    v6.73: each part is cut from exact equal source intervals (no segment muxer → no tiny padding-only
+    tail part); Opus and Vorbis sources are stream-copied (no second lossy encode)."""
     src = Path(src)
     ff = which_ffmpeg()
     if not ff:
@@ -9978,10 +10139,9 @@ def split_music_for_drive(job_id, src, progress=None):
     dur = float(info["duration"] or 0)
     size = os.stat(src).st_size
     base = music_base_stem(src.name)
-    copy_ok = info["audioCodec"] == "vorbis" and "ogg" in (info["container"] or "")
-    codec_args = ["-c", "copy"] if copy_ok else MUSIC_OGG_ARGS
+    copy_ok = info["audioCodec"] in ("vorbis", "opus") and "ogg" in (info["container"] or "")
     DRIVE_PARTS_DIR.mkdir(parents=True, exist_ok=True)
-    m = plan_split(size, dur)
+    m = plan_split(size, dur) if dur > 0 else 1
     for attempt in range(6):
         if progress:
             progress(f"Splitting into {m} part{'s' if m != 1 else ''} (~{dur / max(1, m) / 60:.0f} min each)…", None)
@@ -9989,24 +10149,40 @@ def split_music_for_drive(job_id, src, progress=None):
         tmp.mkdir(parents=True)
         _register_work_path(tmp)
         try:
-            cmd = [ff, "-nostdin", "-v", "error", "-y", "-i", str(src), "-map", "0:a:0", "-vn", *codec_args]
-            if m > 1:
-                times = ",".join(f"{dur * i / m:.3f}" for i in range(1, m))
-                cmd += ["-f", "segment", "-segment_format", "ogg", "-segment_times", times,
-                        "-reset_timestamps", "1", "-segment_start_number", "1", str(tmp / "p%03d.ogg")]
-            else:
-                cmd += ["-f", "ogg", str(tmp / "p001.ogg")]
-            if job_id:
-                rc, tail = _job_run_proc(job_id, cmd, timeout=3 * 3600)
-            else:
-                r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                                   errors="replace", timeout=3 * 3600)  # v6.51
-                rc, tail = r.returncode, (r.stderr or "")
-            if rc != 0:
-                raise RuntimeError(f"ffmpeg split failed: {tail[-400:]}")
+            for idx, (a, length) in enumerate(split_bounds(dur, m), 1):
+                out = tmp / f"p{idx:03d}.ogg"
+                last_tail = ""
+                choices = [["-c", "copy"]] if copy_ok else []
+                choices += music_codec_choices()
+                for codec_args in choices:
+                    cmd = [ff, "-nostdin", "-v", "error", "-y"]
+                    if a > 0:
+                        cmd += ["-ss", f"{a:.3f}"]
+                    cmd += ["-i", str(src)]
+                    if length is not None:
+                        cmd += ["-t", f"{length:.3f}"]
+                    cmd += ["-map", "0:a:0", "-vn", *codec_args, "-f", "ogg", str(out)]
+                    if job_id:
+                        rc, tail = _job_run_proc(job_id, cmd, timeout=3 * 3600)
+                    else:
+                        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                           errors="replace", timeout=3 * 3600)  # v6.51
+                        rc, tail = r.returncode, (r.stderr or "")
+                    if rc == 0 and out.is_file() and out.stat().st_size > 0:
+                        break
+                    last_tail = tail
+                else:
+                    raise RuntimeError(f"ffmpeg split failed: {last_tail[-400:]}")
+                if progress and m > 1:
+                    progress(f"Split part {idx} of {m}…", None)
             parts = sorted(p for p in tmp.glob("p*.ogg") if p.stat().st_size > 0)
             if not parts:
                 raise RuntimeError("ffmpeg split produced no parts")
+            # Never ship a padding-only sliver as its own "part M of M".
+            while len(parts) > 1 and 0 <= _probe_secs(parts[-1]) < SPLIT_TAIL_MIN_SECS:
+                log(f"split: dropped a near-empty last part ({parts[-1].stat().st_size} bytes) for {base}")
+                parts[-1].unlink()
+                parts.pop()
             biggest = max(p.stat().st_size for p in parts)
             if biggest >= PART_MAX_BYTES and attempt < 5:
                 m += 1
@@ -14715,6 +14891,35 @@ def _self_test_v670():
         with AUTO_UPDATE_LOCK:
             AUTO_UPDATE.clear()
             AUTO_UPDATE.update(saved)
+
+
+def _self_test_v673():
+    """v6.73: loudnorm numbers parse + pass-2 filter (linear, measured values, -14 LUFS / -1.5 dBTP);
+    Opus 180k CBR first with Vorbis fallback; a 4 h set plans 7 parts under 50 MB; split intervals are
+    exact and equal with no padding-only tail. Pure logic — no ffmpeg run, no files touched."""
+    sample = ('[Parsed_loudnorm_0 @ 0x1]\n{\n\t"input_i" : "-18.71",\n\t"input_tp" : "-4.36",\n'
+              '\t"input_lra" : "3.80",\n\t"input_thresh" : "-28.90",\n\t"output_i" : "-14.0",\n'
+              '\t"target_offset" : "0.12"\n}\n')
+    m = parse_loudnorm_json(sample)
+    assert m and m["input_i"] == -18.71 and m["input_tp"] == -4.36 and m["target_offset"] == 0.12, m
+    assert parse_loudnorm_json("no json here") is None
+    assert parse_loudnorm_json(sample.replace('"-18.71"', '"-inf"')) is None  # silence → skip leveling
+    af = loudnorm_af(m)
+    assert af.startswith("loudnorm=I=-14:TP=-1.5:LRA=11:") and "measured_I=-18.71" in af and "linear=true" in af, af
+    assert loudnorm_af(m, extra_gain_db=-0.5).endswith(",volume=-0.50dB")
+    assert LOUDNORM_TP == -1.5 and LOUDNORM_I == -14.0
+    ch = music_codec_choices()
+    assert ch[0][:2] == ["-c:a", "libopus"] and "180k" in ch[0] and ["-vbr", "off"] == ch[0][4:6] and "48000" in ch[0]
+    assert any(c[:2] == ["-c:a", "libvorbis"] for c in ch)  # no libopus → Vorbis still works
+    size4h = int(4 * 3600 * 181017 / 8)  # measured Opus 180k container rate
+    n = plan_split(size4h, 4 * 3600)
+    assert n == 7 and size4h / n < PART_MAX_BYTES, n
+    b = split_bounds(4 * 3600, 7)
+    assert len(b) == 7 and b[0][0] == 0 and b[-1][1] is None
+    assert all(abs(x[1] - 4 * 3600 / 7) < 1e-6 for x in b[:-1])
+    assert abs(b[-1][0] - 6 * 4 * 3600 / 7) < 1e-6
+    assert split_bounds(100, 1) == [(0.0, None)]
+    assert SPLIT_TAIL_MIN_SECS >= 0.5
 
 
 def _self_test_v672():
