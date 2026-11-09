@@ -220,7 +220,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.71</span>
+    <span class="badge">v6.72</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -462,14 +462,14 @@
         <strong style="font-size:.88rem">🎚️ Voice removal quality</strong>
         <label style="font-size:.75rem;color:#9ca3af;display:flex;align-items:center;gap:.3rem;margin:0">Quality
           <select id="voiceQualitySel" onchange="saveVoiceQuality()" style="font-size:.75rem;padding:.2rem .4rem;width:auto;margin:0">
-            <option value="auto">Auto (Talk only if demucs is installed, else Fast)</option>
-            <option value="talkonly">Talk only — keep song vocals (default)</option>
+            <option value="auto">Auto — All voices (default; Fast if demucs isn’t installed)</option>
             <option value="better">All voices — Demucs full wipe</option>
+            <option value="talkonly">Talk only — keep song vocals (DJ talk removed)</option>
             <option value="fast">Fast — ffmpeg center-cancel (quick, no demucs)</option>
           </select></label>
       </div>
       <div id="voiceQualityStatus" class="hint" style="margin-top:.35rem"></div>
-      <div class="hint">Used by History <strong>Music only</strong>, Auto Music only, the upload below, <strong>Google Drive → remove voice</strong>, Drive links, and the after-stream remove voice → Drive step. <strong>Talk only</strong> (default) runs Demucs then removes just the DJ talking — song vocals stay. <strong>All voices</strong> is the old full Demucs wipe (also writes <code>-vocals</code> from History/upload). <strong>Fast</strong> cancels centered voice with ffmpeg — quick, no Demucs. One job at a time; output <code>&lt;stem&gt;-music.ogg</code>; originals untouched. Per-streamer override optional in <code>.drive-pipeline.json</code> (<code>userVoiceQuality</code>).</div>
+      <div class="hint">Used by History <strong>Music only</strong>, Auto Music only, the upload below, <strong>Google Drive → remove voice</strong>, Drive links, and the after-stream remove voice → Drive step. <strong>All voices</strong> (default, v6.72) is the full Demucs wipe — every voice removed, song vocals too (also writes <code>-vocals</code> from History/upload). <strong>Talk only</strong> (optional) runs Demucs then removes just the DJ talking so song vocals stay; it installs speechbrain the first time it’s used. <strong>Fast</strong> cancels centered voice with ffmpeg — quick, no Demucs. One job at a time; output <code>&lt;stem&gt;-music.ogg</code>; originals untouched. Per-streamer override optional in <code>.drive-pipeline.json</code> (<code>userVoiceQuality</code>).</div>
     </div>
     <div class="upload-music-box">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap;">
@@ -577,7 +577,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.71'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.72'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -736,7 +736,8 @@ function persist(){
       driveLastPath: String(cfg.driveLastPath||''),
       driveOutMode: cfg.driveOutMode||'subfolder',
       driveKeepSource: !!cfg.driveKeepSource,
-      voiceQuality: normVoiceQuality(cfg.voiceQuality) // v6.45
+      voiceQuality: normVoiceQuality(cfg.voiceQuality), // v6.45
+      voiceQualityV672: true // v6.72 migration done
     }));
   }catch(e){ console.warn('persist failed', e); }
 }
@@ -797,6 +798,8 @@ function restoreSettings(){
     cfg.driveKeepSource=data.driveKeepSource===true;
     cfg.voiceQuality=normVoiceQuality(data.voiceQuality); // v6.45 Fast / Better / Auto
     voiceQualityFromStorage=(typeof data.voiceQuality==='string');
+    // v6.72: back to All voices for everyone — a saved Talk only (v6.69–6.71 default) resets to Auto once
+    if(data.voiceQualityV672!==true && cfg.voiceQuality==='talkonly') cfg.voiceQuality='auto';
     if(Array.isArray(data.streamers)){
       restoredStreamerList=true; // even an empty list is user data — don't overwrite
       streamers=data.streamers.filter(s=>s&&s.username).map((s,i)=>{
@@ -1438,7 +1441,7 @@ async function queueAutoMusicOnly(name, opts){
   }
   autoMusicQueued.add(name);
   try{
-    const d=await helperFetch('/api/music-only', {name:name, redo:false, quality:normVoiceQuality(cfg.voiceQuality)}, 8000);
+    const d=await helperFetch('/api/music-only', {name:name, redo:false, quality:voiceQualityReq()}, 8000);
     if(!d || !d.ok){
       autoMusicQueued.delete(name);
       // 409 still-recording is expected if we raced the active file — stay quiet unless unexpected
@@ -1503,7 +1506,7 @@ function pingHelperAndStatus(){
       helper.demucs=!!d.demucs;
       helper.voiceQuality=(d.voiceQuality && typeof d.voiceQuality==='object')?d.voiceQuality:null; // v6.45
       // v6.45: a browser that never chose a quality adopts the helper's saved setting
-      if(!voiceQualityFromStorage && helper.voiceQuality && helper.voiceQuality.pref){ cfg.voiceQuality=normVoiceQuality(helper.voiceQuality.pref); voiceQualityFromStorage=true; persist(); }
+      if(!voiceQualityFromStorage && helper.voiceQuality && helper.voiceQuality.pref){ cfg.voiceQuality=normVoiceQuality(helper.voiceQuality.pref); if(cfg.voiceQuality==='talkonly' && helperVerLt(helper.version||'0','6.72')) cfg.voiceQuality='auto'; /* v6.72 */ voiceQualityFromStorage=true; persist(); }
       helper.version=d.version?String(d.version):'';
       helper.diskVersion=(d.diskVersion!=null)?String(d.diskVersion):'';
       helper.pendingRestart=!!d.pendingRestart;
@@ -1955,10 +1958,17 @@ function effectiveVoiceQuality(){
   if(!helperVoiceQualityAware()) return helper.demucs?'better':null; // helper older than v6.45: demucs only
   const want=normVoiceQuality(cfg.voiceQuality);
   const vq=helper.voiceQuality;
-  if(want==='auto') return vq.demucs?'talkonly':(vq.ffmpeg?'fast':null);
+  if(want==='auto') return vq.demucs?'better':(vq.ffmpeg?'fast':null); // v6.72: Auto = All voices
   if(want==='talkonly') return vq.demucs?'talkonly':(vq.ffmpeg?'fast':null);
   if(want==='better') return vq.demucs?'better':(vq.ffmpeg?'fast':null);
   return vq.ffmpeg?'fast':null;
+}
+// v6.72: quality sent to the helper. Helpers 6.69–6.71 map Auto → Talk only, so send All voices
+// (better) explicitly to them; v6.72+ helpers get the saved choice as-is.
+function voiceQualityReq(){
+  const want=normVoiceQuality(cfg.voiceQuality);
+  if(want==='auto' && helper.ok && helper.version && helperVerLt(helper.version,'6.72') && !helperVerLt(helper.version,'6.69')) return 'better';
+  return want;
 }
 function voiceReady(){ return !!effectiveVoiceQuality(); }
 function voiceQualityLabel(q){ return q==='fast'?'Fast (ffmpeg)':(q==='talkonly'?'Talk only':(q==='better'?'All voices (Better)':'—')); }
@@ -1981,8 +1991,9 @@ function renderVoiceQualityUi(){
     else{
       txt='Using '+voiceQualityLabel(eff)+'.';
       if((want==='better'||want==='talkonly') && eff==='fast'){ txt+=' Demucs isn\u2019t installed on this helper, so it falls back to Fast — '+demucsInstallMsg()+', then restart the helper.'; color='#fbbf24'; }
-      else if(want==='auto' && eff==='fast'){ txt+=' Install Demucs for Talk only: '+demucsInstallMsg()+'.'; }
-      else if(want==='auto' && eff==='talkonly'){ txt+=' Removes DJ talk; keeps song vocals. Pick All voices for a full wipe.'; }
+      else if(want==='auto' && eff==='fast'){ txt+=' Install Demucs for All voices: '+demucsInstallMsg()+'.'; }
+      else if(want==='auto' && eff==='better'){ txt+=' Removes every voice (full Demucs wipe). Pick Talk only to keep song vocals.'; }
+      else if(want==='talkonly' && eff==='talkonly'){ txt+=' Removes DJ talk; keeps song vocals (installs speechbrain on first use).'; }
       txt+=' Demucs: '+(helper.voiceQuality.demucs?'installed':'not installed')+' · ffmpeg: '+(helper.voiceQuality.ffmpeg?'ok':'missing')+'.';
     }
   }
@@ -1996,7 +2007,7 @@ async function saveVoiceQuality(){
   try{ updateDemucsUi(); }catch(e){}
   if(helper.ok && helperVoiceQualityAware()){
     try{
-      const d=await helperFetch('/api/pipeline/prefs', {voiceQuality:cfg.voiceQuality}, 6000);
+      const d=await helperFetch('/api/pipeline/prefs', {voiceQuality:voiceQualityReq()}, 6000);
       if(d && d.voiceQuality) helper.voiceQuality=d.voiceQuality;
       renderVoiceQualityUi();
     }catch(e){}
@@ -4787,7 +4798,7 @@ async function startMusicOnly(i){
     return;
   }
   try{
-    const d=await helperFetch('/api/music-only', {name:r.name, redo:!!redo, quality:normVoiceQuality(cfg.voiceQuality)}, 8000);
+    const d=await helperFetch('/api/music-only', {name:r.name, redo:!!redo, quality:voiceQualityReq()}, 8000);
     if(!d || !d.ok){
       flashErr((d && d.error) || 'Music only failed to start');
       return;
@@ -4937,7 +4948,7 @@ async function uploadMusicOnly(){
   try{
     d=await new Promise(function(resolve, reject){
       const xhr=new XMLHttpRequest();
-      xhr.open('POST', HELPER_URL+'/api/music-only-upload?quality='+encodeURIComponent(normVoiceQuality(cfg.voiceQuality))); // v6.45
+      xhr.open('POST', HELPER_URL+'/api/music-only-upload?quality='+encodeURIComponent(voiceQualityReq())); // v6.45
       xhr.timeout=120000;
       xhr.upload.onprogress=function(ev){
         if(!ev.lengthComputable) return;
@@ -5322,7 +5333,7 @@ async function driveRemoveVoice(){
   if(!voiceReady()){ flashErr(voiceNotReadyMsg()); return; }
   const redo=driveRedoChecked();
   try{
-    const d=await helperFetch('/api/drive/music', {paths:paths, redo:redo, outMode:cfg.driveOutMode||'subfolder', quality:normVoiceQuality(cfg.voiceQuality)}, 15000);
+    const d=await helperFetch('/api/drive/music', {paths:paths, redo:redo, outMode:cfg.driveOutMode||'subfolder', quality:voiceQualityReq()}, 15000);
     if(!d || !d.ok){ flashErr('Remove voice: '+((d&&d.error)||'failed to start')); return; }
     const started=(d.started||[]).length;
     const skipped=d.skipped||[];
@@ -5346,7 +5357,7 @@ async function driveFetchLink(){
   const keep=!!(document.getElementById('driveKeepSource')||{}).checked;
   const redo=!!(document.getElementById('driveLinkRedo')||{}).checked;
   try{
-    const d=await helperFetch('/api/drive/fetch', {url:url, keepSource:keep, redo:redo, quality:normVoiceQuality(cfg.voiceQuality)}, 15000);
+    const d=await helperFetch('/api/drive/fetch', {url:url, keepSource:keep, redo:redo, quality:voiceQualityReq()}, 15000);
     if(!d || !d.ok){ flashErr('Drive link: '+driveEsc((d&&d.error)||'failed')); return; }
     driveJobs[d.jobId]=Object.assign(driveJobs[d.jobId]||{}, {jobId:d.jobId, source:'link', fileId:d.fileId, displayName:'Drive file '+String(d.fileId||'').slice(0,10)+'…', status:'running', progress:d.alreadyRunning?'Already running…':'Contacting Google Drive…', progressPct:0});
     flashOk(d.alreadyRunning?'That Drive file is already in the queue.':'Downloading from Drive, then removing voice → ~/TwitchRecordings');
@@ -5493,7 +5504,7 @@ function pipelinePrefsBody(){
     streamlinkUpdate:cfg.streamlinkUpdate!==false, // v6.55
     soloWatch:cfg.soloWatch!==false, // v6.49
     oneCopy:cfg.oneCopy!==false, // v6.50
-    voiceQuality:normVoiceQuality(cfg.voiceQuality)}; // v6.45
+    voiceQuality:voiceQualityReq()}; // v6.45 / v6.72
 }
 async function syncPipelinePrefs(force){
   if(!helper.ok || !helperHasPipeline()) return;

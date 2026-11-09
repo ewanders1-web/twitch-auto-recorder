@@ -23,7 +23,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.71"
+HELPER_VERSION = "6.72"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4700,8 +4700,9 @@ def _self_test_go_live_schedule():
 def self_test():
     """v6.43: `python twitch-recorder-server.py --self-test` — exercise the module without binding
     the port or starting threads (used by apply_update before swapping in a download)."""
-    global _auto_restart_scheduled
+    global _auto_restart_scheduled, SELF_TEST_MODE
     _auto_restart_scheduled = True  # a self-test must never restart anything
+    SELF_TEST_MODE = True  # v6.72: never rewrite the real prefs file from a self-test
     _pipeline_load()
     h = health_payload()
     status_payload()
@@ -4977,6 +4978,7 @@ def self_test():
     _self_test_v669()  # v6.69
     _self_test_v670()  # v6.70
     _self_test_v671()  # v6.71
+    _self_test_v672()  # v6.72
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
 
@@ -7405,7 +7407,8 @@ def encode_joined_ogg(job_id, parts, out_path, duration, progress, pct_lo=90.0, 
 # After demucs two-stems, keep song vocals; remove only the DJ talking via ECAPA
 # speaker embeddings (speechbrain spkrec-ecapa-voxceleb) matched to a per-streamer
 # voiceprint. Proven on Skratch Bastid Clip C (cutoff 0.33) and Red Alert prototypes.
-# Default when demucs is available (auto → talkonly). Falls back to Better (full wipe)
+# v6.72: opt-in only (pick Talk only on the page or userVoiceQuality). Auto = All voices again.
+# Was the v6.69 default when demucs is available (auto → talkonly). Falls back to Better (full wipe)
 # then Fast. Voiceprints: ~/TwitchRecordings/.voiceprints/<streamer>.npz
 # Opt-out of speechbrain auto-install: TWITCH_RECORDER_TALKONLY_AUTOINSTALL=0
 # Cutoff: TWITCH_RECORDER_TALKONLY_CUTOFF (default 0.33)
@@ -7493,7 +7496,9 @@ def speechbrain_available(force=False):
 
 
 def ensure_speechbrain(progress=None):
-    """Install speechbrain into demucs' Python when missing (idle / first talkonly job)."""
+    """Install speechbrain into demucs' Python when missing (first talkonly job only).
+    v6.72: only reached from a job that resolved to Talk only — Auto / All voices / Fast never
+    install speechbrain or download the ECAPA model."""
     if speechbrain_available():
         return True
     if not TALKONLY_AUTOINSTALL:
@@ -8146,13 +8151,13 @@ def chunked_demucs_talkonly(job_id, src, work, duration, progress, streamer=None
 # ─── v6.45/v6.69: VOICE-REMOVAL QUALITY ─────
 # One setting (Convert tab, saved in .drive-pipeline.json) drives History/Auto Music only,
 # Convert upload, Drive → remove voice, Drive link, and the after-stream pipeline.
-#   talkonly — demucs two-stems + ECAPA: remove DJ talk, keep song vocals (v6.69 default via auto)
-#   better   — demucs two-stems no_vocals (all voices wiped; old "Better")
+#   better   — demucs two-stems no_vocals (all voices wiped; "All voices") — v6.72 default via auto
+#   talkonly — demucs two-stems + ECAPA: remove DJ talk, keep song vocals (opt-in since v6.72)
 #   fast     — ffmpeg center-cancel (no demucs; stereo only)
-#   auto     — Talk only when demucs installed, else Fast
+#   auto     — All voices (Better) when demucs installed, else Fast
 # Optional per-streamer override: userVoiceQuality in .drive-pipeline.json.
 # Jobs share the one-at-a-time voice-removal slot.
-# v6.69: talkonly (default via auto) / better (all voices) / fast
+# v6.72: better / All voices (default via auto) / talkonly (opt-in) / fast
 VOICE_QUALITIES = ("auto", "talkonly", "better", "fast")
 FAST_VOICE_AF = "pan=stereo|c0=0.5*c0+-0.5*c1|c1=0.5*c0+-0.5*c1,afftdn=nf=-25"
 
@@ -8174,6 +8179,27 @@ def _norm_voice_quality(q):
     return None
 
 
+def _migrate_voice_quality_v672():
+    """v6.72: reset Talk only (v6.69 default) back to Auto = All voices, once. Caller holds/needs
+    PIPELINE_LOCK-safe context. Returns True when something changed."""
+    with PIPELINE_LOCK:
+        if PIPELINE.get("voiceQualityV672") is True:
+            return False
+        changed = False
+        if _norm_voice_quality(PIPELINE.get("voiceQuality")) == "talkonly":
+            PIPELINE["voiceQuality"] = "auto"
+            changed = True
+        uvq = PIPELINE.get("userVoiceQuality") or {}
+        for u in [k for k, v in uvq.items() if _norm_voice_quality(v) == "talkonly"]:
+            del uvq[u]
+            changed = True
+        PIPELINE["userVoiceQuality"] = uvq
+        PIPELINE["voiceQualityV672"] = True
+    if changed:
+        log("voice quality: v6.72 reset Talk only → Auto (All voices) for every streamer")
+    return changed
+
+
 def voice_quality_pref():
     with PIPELINE_LOCK:
         return _norm_voice_quality(PIPELINE.get("voiceQuality")) or "auto"
@@ -8181,8 +8207,8 @@ def voice_quality_pref():
 
 def resolve_voice_quality(requested=None, username=None):
     """→ (effective 'talkonly' | 'better' | 'fast' | None, note).
-    Auto prefers Talk only when demucs is installed (speechbrain installed at job time),
-    else Better, else Fast. Per-streamer override: userVoiceQuality in .drive-pipeline.json."""
+    v6.72: Auto = All voices (Better) when demucs is installed, else Fast. Talk only only when
+    explicitly chosen (page or per-streamer override). Per-streamer override: userVoiceQuality in .drive-pipeline.json."""
     q = _norm_voice_quality(requested)
     if q is None and username:
         q = user_voice_quality(username)
@@ -8191,8 +8217,8 @@ def resolve_voice_quality(requested=None, username=None):
     has_d = demucs_available()
     has_ff = bool(which_ffmpeg())
     if q == "auto":
-        # v6.69: Talk only is the default whenever demucs can run; speechbrain is ensured at job time.
-        q = "talkonly" if has_d else "fast"
+        # v6.72: back to All voices (full Demucs wipe) for every streamer; Fast without demucs.
+        q = "better" if has_d else "fast"
     if q == "talkonly":
         if has_d:
             return "talkonly", None
@@ -8889,6 +8915,7 @@ DELIVERY_ERROR_RETRY_SECS = 300
 PIPELINE_START_DELAY_SECS = float(os.environ.get("TWITCH_RECORDER_PIPELINE_DELAY") or 3)
 DRIVE_PARTS_DIR = REC_DIR / "Drive parts"
 PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
+SELF_TEST_MODE = False  # v6.72: set by --self-test (no prefs-file writes from migrations)
 PIPELINE_LOCK = threading.RLock()
 PIPELINE = {"enabled": True, "users": {}, "target": "", "deliveries": {},
             "origEnabled": True, "origUsers": {}, "originals": {},  # v6.38 originals
@@ -8951,7 +8978,7 @@ def _pipeline_load():
         PIPELINE["soloWatch"] = data.get("soloWatch") is not False
         # v6.50: only one computer sends each stream's parts to Drive (default on)
         PIPELINE["oneCopy"] = data.get("oneCopy") is not False
-        # v6.45/v6.69: voice-removal quality (auto = Talk only when demucs installed, else Fast)
+        # v6.45/v6.72: voice-removal quality (auto = All voices when demucs installed, else Fast)
         PIPELINE["voiceQuality"] = _norm_voice_quality(data.get("voiceQuality")) or "auto"
         # v6.69: optional per-streamer override {streamer: talkonly|better|fast}
         uvq = data.get("userVoiceQuality") if isinstance(data.get("userVoiceQuality"), dict) else {}
@@ -8960,6 +8987,11 @@ def _pipeline_load():
                 (safe_username(str(k)), _norm_voice_quality(v)) for k, v in uvq.items()
             ) if k and v
         }
+        # v6.72: one-time migration back to All voices for everyone — a saved Talk only
+        # (global pref or per-streamer) from the v6.69–6.71 default era is reset; Talk only
+        # chosen again after this sticks (voiceQualityV672 flag).
+        PIPELINE["voiceQualityV672"] = data.get("voiceQualityV672") is True
+        _migrated_vq = _migrate_voice_quality_v672()
         # v6.53: recording sessions in progress (a crash/reboot leaves them here → recovered)
         lsd = data.get("liveSessions") if isinstance(data.get("liveSessions"), dict) else {}
         PIPELINE["liveSessions"] = {str(k).lower(): v for k, v in lsd.items()
@@ -8968,6 +9000,8 @@ def _pipeline_load():
         pj = data.get("pendingJobs") if isinstance(data.get("pendingJobs"), dict) else {}
         PIPELINE["pendingJobs"] = {str(k): v for k, v in pj.items()
                                    if isinstance(v, dict) and isinstance(v.get("segments"), list)}
+    if _migrated_vq and not SELF_TEST_MODE:  # v6.72: persist the Talk only → All voices reset now
+        _pipeline_save()
 
 
 def _pipeline_save():
@@ -11237,7 +11271,7 @@ def start_stream_pipeline(username, segments, redo=False, reason="stream-end"):
                 return jid, "already running"
     if not which_ffmpeg():
         return None, "ffmpeg not installed"
-    eff_q, q_note = resolve_voice_quality(None, username=username)  # v6.69: Talk only default
+    eff_q, q_note = resolve_voice_quality(None, username=username)  # v6.72: All voices default
     if not eff_q:
         return None, q_note or "voice removal unavailable"
     PIPELINE_SEEN.add(first)
@@ -14683,6 +14717,77 @@ def _self_test_v670():
             AUTO_UPDATE.update(saved)
 
 
+def _self_test_v672():
+    """v6.72: All voices is the default again for every streamer (whistleface included); Talk only
+    stays selectable; Fast without demucs; saved Talk only (global / per-streamer) migrates once;
+    Auto / All voices never install speechbrain."""
+    import tempfile as _tmp72
+    global PIPELINE_FILE
+    saved_demucs = demucs_available
+    saved_ff = which_ffmpeg
+    saved_ensure = ensure_speechbrain
+    prev_pf = PIPELINE_FILE
+    with PIPELINE_LOCK:
+        prev = {k: (dict(PIPELINE[k]) if isinstance(PIPELINE.get(k), dict) else PIPELINE.get(k))
+                for k in ("voiceQuality", "userVoiceQuality", "voiceQualityV672")}
+    calls = []
+    try:
+        globals()["demucs_available"] = lambda: True
+        globals()["which_ffmpeg"] = lambda: "/usr/bin/ffmpeg"
+        globals()["ensure_speechbrain"] = lambda progress=None: calls.append(1) or False
+        with PIPELINE_LOCK:
+            PIPELINE["voiceQuality"] = "auto"
+            PIPELINE["userVoiceQuality"] = {}
+        for u in (None, "whistleface", "redalert", "lilypita"):
+            eff, note = resolve_voice_quality(None, username=u)
+            assert eff == "better", (u, eff, note)
+            eff, note = resolve_voice_quality("auto", username=u)
+            assert eff == "better", (u, eff, note)
+        assert voice_quality_snapshot()["effective"] == "better"
+        assert resolve_voice_quality("talkonly", username="whistleface")[0] == "talkonly"
+        assert resolve_voice_quality("hybrid")[0] == "talkonly"
+        globals()["demucs_available"] = lambda: False
+        assert resolve_voice_quality(None, username="whistleface")[0] == "fast"
+        eff, note = resolve_voice_quality("better")
+        assert eff == "fast" and note and "demucs" in note.lower(), (eff, note)
+        globals()["demucs_available"] = lambda: True
+        assert not calls, "speechbrain install must not run for Auto / All voices"
+        # Migration: saved Talk only (v6.69–6.71 default era) → Auto, once; later choice sticks
+        with _tmp72.TemporaryDirectory(prefix="tar-v672-") as td:
+            PIPELINE_FILE = Path(td) / ".drive-pipeline.json"
+            PIPELINE_FILE.write_text(json.dumps({
+                "voiceQuality": "talkonly",
+                "userVoiceQuality": {"whistleface": "talkonly", "skratchbastid": "fast"}}),
+                encoding="utf-8")
+            _pipeline_load()
+            with PIPELINE_LOCK:
+                assert PIPELINE["voiceQuality"] == "auto", PIPELINE["voiceQuality"]
+                assert PIPELINE["userVoiceQuality"] == {"skratchbastid": "fast"}, PIPELINE["userVoiceQuality"]
+                assert PIPELINE["voiceQualityV672"] is True
+            assert resolve_voice_quality(None, username="whistleface")[0] == "better"
+            PIPELINE_FILE.write_text(json.dumps({
+                "voiceQuality": "talkonly", "voiceQualityV672": True,
+                "userVoiceQuality": {"whistleface": "talkonly"}}), encoding="utf-8")
+            _pipeline_load()
+            with PIPELINE_LOCK:
+                assert PIPELINE["voiceQuality"] == "talkonly"
+                assert PIPELINE["userVoiceQuality"] == {"whistleface": "talkonly"}
+            assert resolve_voice_quality(None, username="whistleface")[0] == "talkonly"
+            # _migrate is a no-op once flagged
+            assert _migrate_voice_quality_v672() is False
+    finally:
+        globals()["demucs_available"] = saved_demucs
+        globals()["which_ffmpeg"] = saved_ff
+        globals()["ensure_speechbrain"] = saved_ensure
+        PIPELINE_FILE = prev_pf
+        with PIPELINE_LOCK:
+            for k, v in prev.items():
+                if v is None:
+                    PIPELINE.pop(k, None)
+                else:
+                    PIPELINE[k] = v
+
+
 def _self_test_v669():
     """v6.69: Talk only — quality resolution, mask/render attenuates talk vs keeps music vocals,
     voiceprint path, Better fallback note. No demucs/speechbrain network calls."""
@@ -14706,7 +14811,9 @@ def _self_test_v669():
             PIPELINE["voiceQuality"] = "auto"
             PIPELINE["userVoiceQuality"] = {}
         eff, note = resolve_voice_quality(None)
-        assert eff == "talkonly", (eff, note)
+        assert eff == "better", (eff, note)  # v6.72: auto = All voices again
+        eff, note = resolve_voice_quality("talkonly")
+        assert eff == "talkonly", (eff, note)  # still selectable
         eff, note = resolve_voice_quality("better")
         assert eff == "better"
         eff, note = resolve_voice_quality("fast")
@@ -14716,7 +14823,11 @@ def _self_test_v669():
         eff, note = resolve_voice_quality(None, username="whistleface")
         assert eff == "better", (eff, note)
         eff, note = resolve_voice_quality(None, username="skratchbastid")
-        assert eff == "talkonly", (eff, note)
+        assert eff == "better", (eff, note)  # v6.72
+        with PIPELINE_LOCK:
+            PIPELINE["userVoiceQuality"] = {"skratchbastid": "talkonly"}
+        eff, note = resolve_voice_quality(None, username="skratchbastid")
+        assert eff == "talkonly", (eff, note)  # explicit per-streamer opt-in still works
         with PIPELINE_LOCK:
             PIPELINE["voiceQuality"] = prev_q or "auto"
             PIPELINE["userVoiceQuality"] = prev_uvq
