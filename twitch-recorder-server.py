@@ -23,7 +23,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.73"
+HELPER_VERSION = "6.74"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4959,6 +4959,7 @@ def self_test():
         (md / f"{other}__OtherBox-SelfTest.json").write_text(json.dumps(doc), encoding="utf-8")
         assert find_other_copy(str(tgt), "whistleface", st0, 4 * 3600)[0] is None
         assert _covered_note({"computer": "PC", "parts": [1, 2], "durationSecs": 600}).startswith("Already in Drive from PC")
+    _self_test_quality_one_copy()  # v6.74
     _self_test_cp1252_sends()  # v6.51
     _self_test_go_live_schedule()  # v6.52
     _self_test_orphan_recovery()  # v6.53
@@ -4982,6 +4983,87 @@ def self_test():
     _self_test_v673()  # v6.73
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
     return 0
+
+
+
+def _self_test_quality_one_copy():
+    """v6.74: a Fast set never covers All voices; Fast holds while a Demucs peer works; upgrade in place."""
+    import tempfile as _tmp_q
+    if not one_copy_enabled() or not quality_one_copy_enabled():
+        return
+    with _tmp_q.TemporaryDirectory(prefix="tar-qonecopy-") as td:
+        tgt = Path(td)
+        md = _sent_manifest_dir(tgt)
+        md.mkdir(parents=True)
+        st0 = parse_recording_stamp("whistleface-Tue-2026-11-10T09-00-00")[1]
+        other = "whistleface-Tue-2026-11-10T09-00-20"
+        names = [f"whistleface-2026-11-10-Tue-part {i} of 2.ogg" for i in (1, 2)]
+        parts = []
+        for i, nm in enumerate(names):
+            (tgt / nm).write_bytes(b"f" * (200 + i))
+            parts.append({"name": nm, "size": 200 + i})
+        doc = {"kind": "twitch-recorder-sent-parts", "v": 1, "helperVersion": "6.74", "computer": "FastBox-SelfTest",
+               "base": other, "username": "whistleface", "startEpoch": st0 + 20, "durationSecs": 7200,
+               "state": "sent", "parts": parts, "updatedAt": time.time(), "voiceQuality": "fast"}
+        mp = md / f"{other}__FastBox-SelfTest.json"
+        mp.write_text(json.dumps(doc), encoding="utf-8")
+        # Fast set: covers another Fast set and unknown-quality callers, never All voices / Talk only
+        assert find_other_copy(str(tgt), "whistleface", st0, 7200, my_quality="fast")[0] == "sent"
+        assert find_other_copy(str(tgt), "whistleface", st0, 7200)[0] == "sent"
+        assert find_other_copy(str(tgt), "whistleface", st0, 7200, my_quality="better")[0] is None
+        assert find_other_copy(str(tgt), "whistleface", st0, 7200, my_quality="talkonly")[0] is None
+        # pre-v6.74 manifest (no voiceQuality) still covers, as before
+        d0 = dict(doc)
+        d0.pop("voiceQuality")
+        mp.write_text(json.dumps(d0), encoding="utf-8")
+        assert find_other_copy(str(tgt), "whistleface", st0, 7200, my_quality="better")[0] == "sent"
+        # a fresh Fast "sending" claim never makes All voices wait
+        d1 = dict(doc, state="sending")
+        mp.write_text(json.dumps(d1), encoding="utf-8")
+        assert find_other_copy(str(tgt), "whistleface", st0, 7200, my_quality="better")[0] is None
+        assert find_other_copy(str(tgt), "whistleface", st0, 7200, my_quality="fast")[0] == "sending"
+        # All voices covers Fast
+        d2 = dict(doc, voiceQuality="better")
+        mp.write_text(json.dumps(d2), encoding="utf-8")
+        assert find_other_copy(str(tgt), "whistleface", st0, 7200, my_quality="fast")[0] == "sent"
+        # upgrade-in-place: only a complete Fast set with exactly our names
+        mp.write_text(json.dumps(doc), encoding="utf-8")
+        up = fast_parts_to_upgrade(str(tgt), "whistleface-Tue-2026-11-10T09-00-00", "better", names,
+                                   "whistleface", st0, 7200)
+        assert up == {n.lower() for n in names}, up
+        assert not fast_parts_to_upgrade(str(tgt), "x", "fast", names, "whistleface", st0, 7200)
+        assert not fast_parts_to_upgrade(str(tgt), "x", "better", names[:1], "whistleface", st0, 7200)
+        assert not fast_parts_to_upgrade(str(tgt), "x", "better", names, "sweetdeesauce", st0, 7200)
+        src = tgt / "src.ogg"
+        src.write_bytes(b"B" * 200)  # same size as the Fast part — must still replace
+        dest, act = place_in_drive(src, tgt, names[0], force_replace=True)
+        assert act == "replaced" and dest.read_bytes() == b"B" * 200
+        assert place_in_drive(src, tgt, names[0])[1] == "skipped"
+        # Demucs peer detection from status files
+        sd = tgt / STATUS_SUBDIR
+        now = time.time()
+        peer = {"computer": "DemucsBox-SelfTest", "updatedAtEpoch": int(now), "helperVersion": "6.74",
+                "recording": [], "recentRecordings": [{"name": "whistleface-Tue-2026-11-10T09-00-07.ogg"}],
+                "voiceParts": {"quality": "better", "perUser": {}, "offFor": [], "qualityOneCopy": True},
+                "drive": {"found": True, "autoSend": True, "oneCopyPerStream": True, "recentDeliveries": []}}
+        pp = sd / "DemucsBox-SelfTest.json"
+        pp.write_text(json.dumps(peer), encoding="utf-8")
+        assert better_peer_for(str(tgt), "whistleface", st0, 7200, now=now) == "DemucsBox-SelfTest"
+        assert better_peer_for(str(tgt), "sweetdeesauce", st0, 7200, now=now) is None
+        assert better_peer_for(str(tgt), "whistleface", st0 + 86400, 7200, now=now) is None
+        assert better_peer_for(str(tgt), "whistleface", st0, 7200, now=now + ORIGINAL_PEER_FRESH_SECS + 5) is None
+        for bad in ({"helperVersion": "6.73"},
+                    {"voiceParts": dict(peer["voiceParts"], quality="fast")},
+                    {"voiceParts": dict(peer["voiceParts"], perUser={"whistleface": "fast"})},
+                    {"voiceParts": dict(peer["voiceParts"], offFor=["whistleface"])},
+                    {"drive": dict(peer["drive"], autoSend=False)},
+                    {"drive": dict(peer["drive"], recentDeliveries=[
+                        {"base": "whistleface-Tue-2026-11-10T09-00-07", "status": "error"}])}):
+            pp.write_text(json.dumps(dict(peer, **bad)), encoding="utf-8")
+            assert better_peer_for(str(tgt), "whistleface", st0, 7200, now=now) is None, bad
+        assert _voice_rank("fast") < _voice_rank("better") == _voice_rank("talkonly")
+        vp = voice_parts_snapshot()
+        assert "quality" in vp and "offFor" in vp and vp["qualityOneCopy"] is True
 
 
 def _self_test_cp1252_sends():
@@ -10529,6 +10611,8 @@ def _sync_jobs_with_delivery(base, snap):
         msg = f"{n} parts ready — Drive send failed: {snap.get('error')}"
     elif st == "waiting":
         msg = f"Waiting for Drive ({n} part{pl} ready)"
+        if snap.get("fastDeferSince") and snap.get("note"):  # v6.74
+            msg = snap.get("note")
     elif st == "covered":  # v6.50
         msg = snap.get("note") or "Already in Drive from another computer — skipped the duplicate"
     else:
@@ -10639,7 +10723,7 @@ def remove_drive_parts_for_delete(base):
     return freed
 
 
-def register_delivery(base, music_name, parts_dir, names, part_secs, source):
+def register_delivery(base, music_name, parts_dir, names, part_secs, source, voice_quality=None):
     sizes = []
     for nm in names:
         try:
@@ -10654,6 +10738,7 @@ def register_delivery(base, music_name, parts_dir, names, part_secs, source):
             "status": "waiting", "target": None, "sentAt": None, "error": None,
             "source": source, "createdAt": now, "updatedAt": now, "lastAttempt": 0,
             "localPartsCleared": False,  # v6.37
+            "voiceQuality": voice_quality,  # v6.74: fast | better | talkonly (None = unknown)
         }
         # keep the state file small
         if len(PIPELINE["deliveries"]) > 300:
@@ -10690,18 +10775,42 @@ def deliver_one(base):
     one_copy = one_copy_enabled()
     cov_user, cov_start = parse_recording_stamp(base)
     cov_dur = float(d.get("partSecs") or 0) * len(d.get("parts") or [])
+    my_q = d.get("voiceQuality")  # v6.74
     if one_copy and d.get("source") == "stream":
-        kind, doc = find_other_copy(target, cov_user, cov_start, cov_dur)
+        kind, doc = find_other_copy(target, cov_user, cov_start, cov_dur, my_quality=my_q)
         if kind == "sent":
+            if d.get("fastDeferSince"):
+                QUALITY_ONE_COPY_STATS["coveredAfterDefer"] += 1
             return mark_delivery_covered(base, doc, target)
         if kind == "sending":
             return _delivery_update(
                 base, status="waiting", error=None, target=target, lastAttempt=time.time(),
                 note=(f"{doc.get('computer') or 'Another computer'} is sending this stream to Drive right now — "
                       "checking again in a minute (this computer sends its own parts if that doesn't finish)"))
+        # v6.74: a Fast (no Demucs) set waits while a computer with Demucs makes the All voices one
+        if my_q == "fast" and FAST_DEFER_SECS > 0 and quality_one_copy_enabled():
+            now_q = time.time()
+            peer = better_peer_for(target, cov_user, cov_start, cov_dur, now=now_q)
+            since = float(d.get("fastDeferSince") or 0)
+            if peer and (not since or now_q - since < FAST_DEFER_SECS):
+                if not since:
+                    since = now_q
+                    QUALITY_ONE_COPY_STATS["deferred"] += 1
+                    log(f"one-copy quality: {base} is Fast (no Demucs here) — holding it while {peer} "
+                        f"makes All voices parts (up to {FAST_DEFER_SECS / 60:.0f} min)")
+                left = max(0.0, FAST_DEFER_SECS - (now_q - since))
+                return _delivery_update(
+                    base, status="waiting", error=None, target=target, lastAttempt=now_q, fastDeferSince=since,
+                    fastDeferPeer=peer,
+                    note=(f"Fast copy (no Demucs on this computer) — waiting for {peer} to send its All voices "
+                          f"parts; sends this one if that hasn't happened in {left / 60:.0f} min"))
+            if since:
+                QUALITY_ONE_COPY_STATS["sentAfterDefer"] += 1
+                log(f"one-copy quality: {base} sending the Fast copy after all "
+                    f"({'hold ran out' if peer else 'no computer with Demucs is still on it'})")
     _delivery_update(base, status="sending", error=None, target=target, lastAttempt=time.time(), note=None)
     if one_copy:
-        write_sent_manifest(target, base, "sending", duration=cov_dur, user=cov_user, start=cov_start)
+        write_sent_manifest(target, base, "sending", duration=cov_dur, user=cov_user, start=cov_start, quality=my_q)
     DELIVERY_STATE["busy"] = True
     DELIVERY_STATE["base"] = base
     placed = []
@@ -10721,13 +10830,21 @@ def deliver_one(base):
                 _delivery_update(base, driveNames=dnames)
                 log(f"drive delivery base={base}: another broadcast that day has {local_names[0]!r} — "
                     f"sending as {dnames[0]!r}…")
+            upgrade = set()
+            if one_copy and d.get("source") == "stream":  # v6.74: replace another computer's Fast set
+                upgrade = fast_parts_to_upgrade(target, base, my_q, dnames, cov_user, cov_start, cov_dur)
+                if upgrade:
+                    QUALITY_ONE_COPY_STATS["upgraded"] += 1
+                    log(f"one-copy quality: {base} replacing another computer's Fast parts in Drive "
+                        f"with these {my_q} parts ({len(upgrade)} files)")
             for nm, dnm in zip(local_names, dnames):
                 src = Path(d["partsDir"]) / nm
                 if not src.is_file():
                     raise RuntimeError(f"local part missing ({nm}) — use Split for Drive again")
                 # v6.38: same name+size already in Drive → skip; different size → <name>-<Computer>
                 # (a manual Re-split from this computer may replace its own earlier parts)
-                dest, _act = place_in_drive(src, Path(target), dnm, allow_replace=(d.get("source") == "manual"))
+                dest, _act = place_in_drive(src, Path(target), dnm, allow_replace=(d.get("source") == "manual"),
+                                            force_replace=(dnm.lower() in upgrade))
                 try:
                     placed.append({"name": Path(dest).name, "size": int(src.stat().st_size)})
                 except OSError:
@@ -10736,14 +10853,16 @@ def deliver_one(base):
             log(f"drive delivery error base={base}: {e}")
             msg = drive_permission_message() if isinstance(e, PermissionError) else (str(e) or type(e).__name__)
             if one_copy:  # v6.50: drop our "sending" claim so other computers don't wait on it
-                write_sent_manifest(target, base, "error", parts=placed, duration=cov_dur, user=cov_user, start=cov_start)
+                write_sent_manifest(target, base, "error", parts=placed, duration=cov_dur, user=cov_user, start=cov_start,
+                                    quality=my_q)
             return _delivery_update(base, status="error", error=msg)
         # Every part is in Drive. Mark sent first so a crash mid-clear does not leave status=waiting
         # with missing parts; v6.51: nothing after this point may turn a finished send into "error".
         snap = _delivery_update(base, status="sent", sentAt=time.time(), target=target, error=None)
         try:
             if one_copy:  # v6.50: tell the other computers this stream is in Drive
-                write_sent_manifest(target, base, "sent", parts=placed, duration=cov_dur, user=cov_user, start=cov_start)
+                write_sent_manifest(target, base, "sent", parts=placed, duration=cov_dur, user=cov_user, start=cov_start,
+                                    quality=my_q)
             log(f"drive delivery sent base={base} parts={len(d.get('parts') or [])} → {target}")
             # v6.37: free local Drive parts after successful send (full -music.ogg kept)
             freed = clear_local_drive_parts(base)
@@ -11047,7 +11166,8 @@ def _split_and_deliver(job_id, music_path, source, progress, pct=95):
     progress("Splitting for Drive…", pct)
     parts_dir, names, part_secs = split_music_for_drive(job_id, music_path, progress)
     base = music_base_stem(Path(music_path).name)
-    register_delivery(base, Path(music_path).name, parts_dir, names, part_secs, source)
+    register_delivery(base, Path(music_path).name, parts_dir, names, part_secs, source,
+                      voice_quality=_job_get(job_id, "quality"))  # v6.74
     _set_music_job(job_id, phase="deliver", base=base, partsCount=len(names), partSecs=round(part_secs, 1),
                    outputPath=str(Path(parts_dir) / names[0]))
     progress(f"{len(names)} parts ready — sending to Drive…", 99)
@@ -11061,6 +11181,8 @@ def _split_and_deliver(job_id, music_path, source, progress, pct=95):
         msg = f"{len(names)} parts ready — Drive send failed: {snap.get('error')}"
     elif st == "covered":  # v6.50
         msg = snap.get("note") or "Already in Drive from another computer — skipped the duplicate"
+    elif snap.get("fastDeferSince") and snap.get("note"):  # v6.74
+        msg = snap.get("note")
     else:
         msg = f"Waiting for Drive ({len(names)} part{'s' if len(names) != 1 else ''} ready)"
     return base, names, part_secs, st, msg
@@ -11104,7 +11226,9 @@ def _pipeline_attempt(job_id):
                 note += f" · leading silence {lead:.0f}s (info only)"
             _set_music_job(job_id, info=note, duration=total)
             # v6.50: another computer already sent this stream's parts → skip hours of voice removal
-            cov = one_copy_precheck(_job_get(job_id, "username"), paths[0].name, total)
+            cov = one_copy_precheck(_job_get(job_id, "username"), paths[0].name, total,
+                                    quality=(_job_get(job_id, "quality")
+                                             or resolve_voice_quality(None, username=_job_get(job_id, "username"))[0]))
             if cov:
                 doc, cov_target = cov
                 cbase = music_base_stem(paths[0].name)
@@ -11937,14 +12061,19 @@ def _host_variant(name):
     return f"{stem}-{computer_name()}{ext}"
 
 
-def place_in_drive(src, dest_dir, name, allow_replace=False):
+def place_in_drive(src, dest_dir, name, allow_replace=False, force_replace=False):
     """Copy src into dest_dir/name without clobbering another computer's file.
 
     Returns (dest_path, action) with action in copied | skipped | renamed | replaced.
+    v6.74: force_replace overwrites dest_dir/name (another computer's Fast part being upgraded).
     """
     src = Path(src)
     dest_dir = Path(dest_dir)
     size = src.stat().st_size
+    if force_replace:
+        dest = dest_dir / name
+        atomic_copy(src, dest)
+        return dest, "replaced"
     for i, nm in enumerate((name, _host_variant(name))):
         dest = dest_dir / nm
         try:
@@ -12010,8 +12139,9 @@ def _sent_manifest_dir(target):
     return Path(target) / STATUS_SUBDIR / SENT_MANIFEST_SUBDIR
 
 
-def write_sent_manifest(target, base, state, parts=None, duration=None, user=None, start=None):
-    """Write <target>/Recorder status/Sent parts/<base>__<computer>.json. Soft: never raises."""
+def write_sent_manifest(target, base, state, parts=None, duration=None, user=None, start=None, quality=None):
+    """Write <target>/Recorder status/Sent parts/<base>__<computer>.json. Soft: never raises.
+    v6.74: voiceQuality (fast | better | talkonly) so a Fast set never blocks an All voices one."""
     try:
         if user is None or start is None:
             u2, s2 = parse_recording_stamp(base)
@@ -12022,6 +12152,8 @@ def write_sent_manifest(target, base, state, parts=None, duration=None, user=Non
                "startedAt": _iso_local(start) if start else None,
                "durationSecs": round(float(duration or 0), 1), "state": state,
                "parts": list(parts or []), "updatedAt": time.time()}
+        if quality:
+            doc["voiceQuality"] = str(quality)
         d = _sent_manifest_dir(target)
         d.mkdir(parents=True, exist_ok=True)
         _status_atomic_write(d / f"{base}__{computer_name()}.json",
@@ -12071,9 +12203,11 @@ def _manifest_parts_present(target, doc):
     return True
 
 
-def find_other_copy(target, user, start, duration, now=None):
+def find_other_copy(target, user, start, duration, now=None, my_quality=None):
     """('sent', doc) when another computer's complete set in Drive covers this stream,
-    ('sending', doc) when another computer is sending one right now, else (None, None)."""
+    ('sending', doc) when another computer is sending one right now, else (None, None).
+    v6.74: with my_quality, a lower-quality set (Fast from a computer without Demucs) never covers
+    an All voices / Talk only one."""
     try:
         duration = float(duration or 0)
     except (TypeError, ValueError):
@@ -12099,6 +12233,8 @@ def find_other_copy(target, user, start, duration, now=None):
         overlap = min(start + duration, o_start + o_dur) - max(start, o_start)
         if overlap < 0.5 * duration:
             continue  # a different broadcast
+        if my_quality and not _doc_covers_quality(doc, my_quality):
+            continue  # v6.74: theirs is Fast, ours removes every voice — ours is worth sending
         st = doc.get("state")
         if st == "sent" and _manifest_parts_present(target, doc):
             return "sent", doc
@@ -12153,7 +12289,7 @@ def register_covered_delivery(base, doc, target):
     return snap
 
 
-def one_copy_precheck(username, first_name, duration):
+def one_copy_precheck(username, first_name, duration, quality=None):
     """Before voice removal: (doc, target) when another computer already sent this stream."""
     if not one_copy_enabled():
         return None
@@ -12166,12 +12302,174 @@ def one_copy_precheck(username, first_name, duration):
             return None
         u, start = parse_recording_stamp(first_name)
         user = (username or u or "").lower()
-        kind, doc = find_other_copy(target, user, start, duration)
+        kind, doc = find_other_copy(target, user, start, duration, my_quality=quality)
         if kind == "sent":
             return doc, target
     except Exception as e:
         log(f"one-copy precheck skipped: {e}")
     return None
+
+
+# ─── v6.74: ONE COPY PER STREAM KNOWS ABOUT VOICE-REMOVAL QUALITY ─────────────────────────────────
+# Nov 3–9: every part set in Drive/Twitch came from ANDERSONSRIG, which has no Demucs, so the helper
+# fell back to Fast (ffmpeg) voice removal there. Fast finishes ~10 min after the stream; the Demucs
+# computers (Quiques-Mach-1, Silver Bullet) take longer, then read ANDERSONSRIG's "Sent parts" manifest
+# and skipped their All voices parts as "covered". So Drive only ever got the Fast copy even though
+# full All voices removal is the default. Now (1) each Sent-parts manifest says which voice removal
+# made it (voiceQuality), and a Fast set never covers / never makes an All voices or Talk only
+# computer wait; (2) a Fast computer holds its finished parts ("waiting", up to 3 h) while a live
+# v6.74+ computer with Demucs that recorded the same stream and auto-sends parts for that streamer is
+# still working, then skips as covered once that set lands — or sends anyway if that computer goes
+# quiet (status file > 20 min old), its send fails, or the hold runs out; (3) if the Fast set was
+# already sent, the All voices set replaces those same-named parts in Drive instead of adding a
+# second "-<Computer>" set. Manifests from helpers before v6.74 (no voiceQuality) still count as
+# covering, as before. Env TWITCH_RECORDER_QUALITY_ONE_COPY=0 turns all of this off;
+# TWITCH_RECORDER_FAST_DEFER_SECS (default 10800, 0 = never hold) sets the Fast hold.
+QUALITY_ONE_COPY_ENV_OFF = (os.environ.get("TWITCH_RECORDER_QUALITY_ONE_COPY") or "").strip() == "0"
+FAST_DEFER_SECS = _env_secs("TWITCH_RECORDER_FAST_DEFER_SECS", 3 * 3600, 0)
+QUALITY_ONE_COPY_MIN_VERSION = (6, 74)
+_VOICE_RANK = {"fast": 1, "better": 2, "talkonly": 2}
+QUALITY_ONE_COPY_STATS = {"deferred": 0, "coveredAfterDefer": 0, "sentAfterDefer": 0, "upgraded": 0}
+
+
+def quality_one_copy_enabled():
+    return (not QUALITY_ONE_COPY_ENV_OFF) and one_copy_enabled()
+
+
+def _voice_rank(q):
+    return _VOICE_RANK.get(str(q or "").strip().lower(), 0)
+
+
+def _doc_covers_quality(doc, my_quality):
+    """Does another computer's Sent-parts manifest count as covering a set of my_quality?"""
+    if not quality_one_copy_enabled():
+        return True
+    theirs = doc.get("voiceQuality")
+    if not theirs or not _voice_rank(my_quality):
+        return True  # pre-v6.74 manifest / unknown quality: keep the v6.50 behaviour
+    return _voice_rank(theirs) >= _voice_rank(my_quality)
+
+
+def _peer_has_stream(doc, user, start, duration):
+    """The peer status doc shows a recording of this streamer that overlaps our stream."""
+    u = str(user or "").lower()
+    lo = float(start) - max(ONE_COPY_TOL_SECS, 0.02 * duration) - 3600.0
+    hi = float(start) + max(float(duration or 0), 60.0)
+    names = [r.get("file") for r in (doc.get("recording") or []) if isinstance(r, dict)]
+    names += [r.get("name") for r in (doc.get("recentRecordings") or []) if isinstance(r, dict)]
+    for nm in names:
+        pu, ps = parse_recording_stamp(nm or "")
+        if pu and ps and pu.lower() == u and lo <= ps <= hi:
+            return True
+    return False
+
+
+def _peer_delivery_failed(doc, user, start, duration):
+    for x in ((doc.get("drive") or {}).get("recentDeliveries") or []):
+        if not isinstance(x, dict) or x.get("status") != "error":
+            continue
+        pu, ps = parse_recording_stamp(x.get("base") or "")
+        if pu and ps and pu.lower() == str(user).lower() and abs(ps - float(start)) < max(1800.0, 0.5 * duration):
+            return True
+    return False
+
+
+def better_peer_for(target, user, start, duration, now=None):
+    """Name of a live v6.74+ computer that will send All voices / Talk only parts for this stream,
+    else None. Read from the other computers' status files in <target>/Recorder status."""
+    if not target or not user or not start:
+        return None
+    now = time.time() if now is None else now
+    me = computer_name().lower()
+    u = str(user).lower()
+    try:
+        folder = Path(target) / STATUS_SUBDIR
+        for p in sorted(folder.glob("*.json")):
+            if p.name.startswith("."):
+                continue
+            try:
+                doc = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(doc, dict):
+                continue
+            comp = str(doc.get("computer") or "")
+            if not comp or comp.lower() == me:
+                continue
+            try:
+                if now - float(doc.get("updatedAtEpoch") or 0) >= ORIGINAL_PEER_FRESH_SECS:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if _parse_version_tuple(str(doc.get("helperVersion") or "0")) < QUALITY_ONE_COPY_MIN_VERSION:
+                continue
+            vq = doc.get("voiceParts") or {}
+            if not isinstance(vq, dict) or not vq.get("qualityOneCopy"):
+                continue
+            q = (vq.get("perUser") or {}).get(u) or vq.get("quality")
+            if _voice_rank(q) < 2:
+                continue
+            if u in [str(x).lower() for x in (vq.get("offFor") or [])]:
+                continue
+            drv = doc.get("drive") or {}
+            if not drv.get("autoSend") or not drv.get("oneCopyPerStream") or not drv.get("found"):
+                continue
+            if not _peer_has_stream(doc, u, start, float(duration or 0)):
+                continue
+            if _peer_delivery_failed(doc, u, start, float(duration or 0)):
+                continue
+            return comp
+    except OSError:
+        pass
+    return None
+
+
+def fast_parts_to_upgrade(target, base, my_quality, names, user, start, duration):
+    """Lower-case Drive names of another computer's same-broadcast Fast set that our better set may
+    replace in place — only when that set is complete in Drive and has exactly our names."""
+    if not quality_one_copy_enabled() or _voice_rank(my_quality) < 2 or not names:
+        return set()
+    want = {str(n).lower() for n in names}
+    me = computer_name().lower()
+    try:
+        duration = float(duration or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    for doc in _read_sent_manifests(target):
+        if str(doc.get("computer") or "").lower() == me or doc.get("state") != "sent":
+            continue
+        if not doc.get("voiceQuality") or _voice_rank(doc.get("voiceQuality")) >= _voice_rank(my_quality):
+            continue
+        if str(doc.get("username") or "").lower() != str(user or "").lower():
+            continue
+        try:
+            o_start, o_dur = float(doc.get("startEpoch")), float(doc.get("durationSecs") or 0)
+        except (TypeError, ValueError):
+            continue
+        overlap = min(start + duration, o_start + o_dur) - max(start, o_start)
+        if overlap < 0.5 * max(duration, 60.0):
+            continue
+        theirs = {os.path.basename(str(x.get("name") or "")).lower()
+                  for x in (doc.get("parts") or []) if isinstance(x, dict)}
+        if theirs == want and _manifest_parts_present(target, doc):
+            return theirs
+    return set()
+
+
+def voice_parts_snapshot():
+    """v6.74: what this computer's after-stream parts will be (read by the other computers)."""
+    eff = resolve_voice_quality(None)[0]
+    with PIPELINE_LOCK:
+        uvq = dict(PIPELINE.get("userVoiceQuality") or {})
+        off = sorted(k for k, v in (PIPELINE.get("users") or {}).items() if not v)
+    per = {}
+    for u in uvq:
+        q = resolve_voice_quality(None, username=u)[0]
+        if q and q != eff:
+            per[str(u).lower()] = q
+    return {"quality": eff, "perUser": per, "offFor": off,
+            "qualityOneCopy": quality_one_copy_enabled(),
+            "fastDeferSecs": FAST_DEFER_SECS, "stats": dict(QUALITY_ONE_COPY_STATS)}
 
 
 # ─── v6.71: ONE COPY PER STREAM FOR ORIGINALS ────────────────────────────────
@@ -13450,6 +13748,7 @@ def build_status_doc(now=None):
         "recording": recording,
         "lastErrors": {u: _short(e) for u, e in last_errors.items()},
         "voiceRemoval": {"running": int(q.get("running") or 0), "waiting": int(q.get("waiting") or 0)},
+        "voiceParts": voice_parts_snapshot(),  # v6.74: other computers read this (Fast vs All voices)
         "drive": {
             "found": bool(roots),
             "target": target,
@@ -13628,6 +13927,15 @@ def render_status_text(doc):
         L.append("One copy per stream: " + (
             "on — this computer skips voice removal / parts when another computer already sent that stream"
             if d.get("oneCopyPerStream") else "OFF — this computer sends its own parts for every stream"))
+    vp = doc.get("voiceParts") or {}  # v6.74
+    if vp.get("quality") == "fast":
+        L.append("Voice removal for parts: Fast (ffmpeg — Demucs not installed here)"
+                 + (" — holds its parts while a computer with Demucs sends All voices parts for the same stream"
+                    if vp.get("qualityOneCopy") and float(vp.get("fastDeferSecs") or 0) > 0 else ""))
+    elif vp.get("quality"):
+        L.append("Voice removal for parts: " + {"better": "All voices (Demucs)", "talkonly": "Talk only"}.get(
+            vp.get("quality"), str(vp.get("quality"))) + (" — a Fast copy from another computer never blocks it"
+                                                        if vp.get("qualityOneCopy") else ""))
     for x in d.get("recentDeliveries") or []:
         line = f"  parts {x['base']}: {x['status']}"
         if x.get("sentAt"):
