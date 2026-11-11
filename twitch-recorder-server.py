@@ -23,7 +23,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.74"
+HELPER_VERSION = "6.75"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4979,6 +4979,7 @@ def self_test():
     _self_test_v669()  # v6.69
     _self_test_v670()  # v6.70
     _self_test_v671()  # v6.71
+    _self_test_v675()  # v6.75
     _self_test_v672()  # v6.72
     _self_test_v673()  # v6.73
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
@@ -12048,12 +12049,142 @@ ORIGINALS_SUBDIR = "Originals"
 ORIGINAL_WAIT_SECS = float(os.environ.get("TWITCH_RECORDER_ORIGINAL_WAIT_SECS") or 1800)
 
 
-def computer_name():
-    raw = (os.environ.get("TWITCH_RECORDER_COMPUTER_NAME") or os.environ.get("COMPUTERNAME")
-           or socket.gethostname() or "computer")
-    raw = raw.split(".")[0]
+def _clean_computer_name(raw):
+    raw = str(raw or "").strip().split(".")[0]
     clean = "".join(ch if (ch.isalnum() or ch in "-_") else "-" for ch in raw).strip("-_")
-    return (clean or "computer")[:40]
+    return clean[:40]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v6.75: stable computer name. On a Mac, socket.gethostname() follows the network —
+# the same helper flipped between "Erics-14-Silver-Bullet" (its Bonjour name) and
+# "mac" (a name handed out by the router), so it wrote two status files, saw its own
+# Sent manifests as "another computer", and took turns with itself for originals.
+# Now the name is picked once (macOS: scutil LocalHostName, the Sharing name that
+# doesn't change with Wi-Fi; Windows: COMPUTERNAME; else hostname), saved in
+# REC_DIR/.computer-identity.json, and every other name this computer has gone by is
+# kept as an alias: its manifests count as ours and its stale status files are
+# removed from Recorder status. TWITCH_RECORDER_COMPUTER_NAME still overrides.
+# ─────────────────────────────────────────────────────────────────────────────
+COMPUTER_IDENTITY_FILE = ".computer-identity.json"
+_IDENTITY = {"name": None, "aliases": [], "path": None}
+_IDENTITY_LOCK = threading.Lock()
+
+
+def _mac_local_hostname():
+    if sys.platform != "darwin":
+        return ""
+    for key in ("LocalHostName", "ComputerName"):
+        try:
+            r = subprocess.run(["scutil", "--get", key], capture_output=True, timeout=5,
+                               stdin=subprocess.DEVNULL)
+            v = _clean_computer_name((r.stdout or b"").decode("utf-8", errors="replace"))
+            if r.returncode == 0 and v:
+                return v
+        except Exception:
+            pass
+    return ""
+
+
+def _network_computer_name():
+    """The name this computer reports right now (may change with the network on a Mac)."""
+    try:
+        return _clean_computer_name(os.environ.get("COMPUTERNAME") or socket.gethostname())
+    except Exception:
+        return ""
+
+
+def _identity_save_locked():
+    if globals().get("SELF_TEST_MODE"):
+        return
+    try:
+        path = Path(_IDENTITY["path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps({"name": _IDENTITY["name"], "aliases": _IDENTITY["aliases"],
+                                   "savedBy": HELPER_VERSION}, indent=1) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _identity_locked():
+    path = str(Path(REC_DIR) / COMPUTER_IDENTITY_FILE)
+    if _IDENTITY["name"] and _IDENTITY["path"] == path:
+        return _IDENTITY
+    _IDENTITY.update(name=None, aliases=[], path=path)
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(doc, dict):
+            _IDENTITY["name"] = _clean_computer_name(doc.get("name")) or None
+            _IDENTITY["aliases"] = [a for a in (_clean_computer_name(x) for x in (doc.get("aliases") or []))
+                                    if a][:20]
+    except (OSError, ValueError):
+        pass
+    if not _IDENTITY["name"]:
+        net = _network_computer_name()
+        stable = (_clean_computer_name(os.environ.get("COMPUTERNAME")) or _mac_local_hostname() or net
+                  or "computer")
+        _IDENTITY["name"] = stable
+        if net and net.lower() != stable.lower():
+            _IDENTITY["aliases"] = [net]
+        _identity_save_locked()
+    return _IDENTITY
+
+
+def computer_name():
+    env = _clean_computer_name(os.environ.get("TWITCH_RECORDER_COMPUTER_NAME"))
+    if env:
+        return env
+    with _IDENTITY_LOCK:
+        return _identity_locked()["name"]
+
+
+def computer_aliases():
+    """Other names this computer has gone by (lower-case not applied)."""
+    with _IDENTITY_LOCK:
+        ident = _identity_locked()
+        net = _network_computer_name()
+        me = (_clean_computer_name(os.environ.get("TWITCH_RECORDER_COMPUTER_NAME")) or ident["name"]).lower()
+        if net and net.lower() != me and net.lower() not in {a.lower() for a in ident["aliases"]}:
+            ident["aliases"] = (ident["aliases"] + [net])[-20:]
+            _identity_save_locked()
+        out = [a for a in ident["aliases"] if a.lower() != me]
+        if me != ident["name"].lower():
+            out.append(ident["name"])  # env override: the saved name is ours too
+        return out
+
+
+def my_computer_names():
+    """Lower-case set: current name + aliases (for 'is this manifest / status file mine?')."""
+    return {computer_name().lower()} | {a.lower() for a in computer_aliases()}
+
+
+def remove_alias_status_files(folder):
+    """v6.75: delete this computer's own status files written under an old name."""
+    removed = []
+    try:
+        folder = Path(folder)
+        for alias in computer_aliases():
+            for ext in (".json", ".txt"):
+                p = folder / f"{alias}{ext}"
+                if not p.is_file():
+                    continue
+                if ext == ".json":
+                    try:
+                        doc = json.loads(p.read_text(encoding="utf-8"))
+                        if str((doc or {}).get("computer") or "").lower() != alias.lower():
+                            break  # not a status file this computer wrote — leave both alone
+                    except (OSError, ValueError):
+                        break
+                try:
+                    p.unlink()
+                    removed.append(p.name)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return removed
 
 
 def _host_variant(name):
@@ -12216,10 +12347,11 @@ def find_other_copy(target, user, start, duration, now=None, my_quality=None):
         return None, None
     now = time.time() if now is None else now
     me = computer_name().lower()
+    mine = my_computer_names()  # v6.75: old names of this computer count as me
     tol = max(ONE_COPY_TOL_SECS, 0.02 * duration)
     sending = (None, None)
     for doc in _read_sent_manifests(target):
-        if str(doc.get("computer") or "").lower() == me:
+        if str(doc.get("computer") or "").lower() in mine:
             continue
         if str(doc.get("username") or "").lower() != str(user).lower():
             continue
@@ -12381,6 +12513,7 @@ def better_peer_for(target, user, start, duration, now=None):
         return None
     now = time.time() if now is None else now
     me = computer_name().lower()
+    mine = my_computer_names()  # v6.75: old names of this computer count as me
     u = str(user).lower()
     try:
         folder = Path(target) / STATUS_SUBDIR
@@ -12394,7 +12527,7 @@ def better_peer_for(target, user, start, duration, now=None):
             if not isinstance(doc, dict):
                 continue
             comp = str(doc.get("computer") or "")
-            if not comp or comp.lower() == me:
+            if not comp or comp.lower() in mine:
                 continue
             try:
                 if now - float(doc.get("updatedAtEpoch") or 0) >= ORIGINAL_PEER_FRESH_SECS:
@@ -12431,12 +12564,13 @@ def fast_parts_to_upgrade(target, base, my_quality, names, user, start, duration
         return set()
     want = {str(n).lower() for n in names}
     me = computer_name().lower()
+    mine = my_computer_names()  # v6.75: old names of this computer count as me
     try:
         duration = float(duration or 0)
     except (TypeError, ValueError):
         duration = 0.0
     for doc in _read_sent_manifests(target):
-        if str(doc.get("computer") or "").lower() == me or doc.get("state") != "sent":
+        if str(doc.get("computer") or "").lower() in mine or doc.get("state") != "sent":
             continue
         if not doc.get("voiceQuality") or _voice_rank(doc.get("voiceQuality")) >= _voice_rank(my_quality):
             continue
@@ -12561,11 +12695,12 @@ def find_other_original(target, user, start, duration, now=None):
         return None, None
     now = time.time() if now is None else now
     me = computer_name().lower()
+    mine = my_computer_names()  # v6.75: old names of this computer count as me
     tol = max(ONE_COPY_TOL_SECS, 0.02 * duration)
     end = start + duration
     sending = (None, None)
     for doc in _read_original_manifests(target):
-        if str(doc.get("computer") or "").lower() == me:
+        if str(doc.get("computer") or "").lower() in mine:
             continue
         if str(doc.get("username") or "").lower() != str(user).lower():
             continue
@@ -12606,6 +12741,7 @@ def original_send_slot(target, user, now=None):
     """(slot, first_computer): my place among live v6.71+ helpers that watch this streamer."""
     now = time.time() if now is None else now
     me = computer_name()
+    mine = my_computer_names()  # v6.75
     names = {me.lower(): me}
     try:
         folder = Path(target) / STATUS_SUBDIR
@@ -12619,7 +12755,7 @@ def original_send_slot(target, user, now=None):
             if not isinstance(doc, dict):
                 continue
             comp = str(doc.get("computer") or "")
-            if not comp or comp.lower() == me.lower():
+            if not comp or comp.lower() in mine:
                 continue
             try:
                 fresh = now - float(doc.get("updatedAtEpoch") or 0) < ORIGINAL_PEER_FRESH_SECS
@@ -12699,6 +12835,67 @@ def original_one_copy_gate(name, d, target, src, now=None):
         ORIG_ONE_COPY_STATS["sentAfterHold"] += 1
     write_original_manifest(target, name, "sending", None, None, info)
     return info
+
+
+def _self_test_v675():
+    """v6.75: stable computer name — saved once, network name kept as alias, alias files removed."""
+    import tempfile as _tmp75
+    global REC_DIR
+    prev_rec, prev_mode = REC_DIR, globals().get("SELF_TEST_MODE")
+    prev_env = os.environ.pop("TWITCH_RECORDER_COMPUTER_NAME", None)
+    prev_net, prev_mac = globals()["_network_computer_name"], globals()["_mac_local_hostname"]
+    with _IDENTITY_LOCK:
+        prev_ident = dict(_IDENTITY, aliases=list(_IDENTITY["aliases"]))
+    try:
+        with _tmp75.TemporaryDirectory(prefix="tar-675-") as td:
+            REC_DIR = Path(td) / "rec"
+            globals()["SELF_TEST_MODE"] = False  # allow the identity save into the temp dir
+            net = {"v": "mac"}
+            globals()["_network_computer_name"] = lambda: net["v"]
+            if not os.environ.get("COMPUTERNAME"):
+                globals()["_mac_local_hostname"] = lambda: "Erics-14-Silver-Bullet"
+                with _IDENTITY_LOCK:
+                    _IDENTITY.update(name=None, aliases=[], path=None)
+                assert computer_name() == "Erics-14-Silver-Bullet", computer_name()
+                assert my_computer_names() == {"erics-14-silver-bullet", "mac"}, my_computer_names()
+                saved = json.loads((REC_DIR / COMPUTER_IDENTITY_FILE).read_text())
+                assert saved["name"] == "Erics-14-Silver-Bullet" and saved["aliases"] == ["mac"], saved
+                # network name changes back and forth → name never changes
+                net["v"] = "Erics-14-Silver-Bullet"
+                assert computer_name() == "Erics-14-Silver-Bullet"
+                net["v"] = "dhcp-12"
+                assert "dhcp-12" in my_computer_names() and computer_name() == "Erics-14-Silver-Bullet"
+                # reload from disk (fresh process)
+                globals()["_mac_local_hostname"] = lambda: "Somethingelse"
+                with _IDENTITY_LOCK:
+                    _IDENTITY.update(name=None, aliases=[], path=None)
+                assert computer_name() == "Erics-14-Silver-Bullet"
+                # alias status files: own removed, a different computer's file with that name kept
+                folder = Path(td) / "status"
+                folder.mkdir()
+                (folder / "mac.json").write_text(json.dumps({"computer": "mac"}))
+                (folder / "mac.txt").write_text("x")
+                (folder / "dhcp-12.json").write_text(json.dumps({"computer": "Other-PC"}))
+                (folder / "dhcp-12.txt").write_text("x")
+                gone = remove_alias_status_files(folder)
+                assert sorted(gone) == ["mac.json", "mac.txt"], gone
+                assert (folder / "dhcp-12.json").is_file() and (folder / "dhcp-12.txt").is_file()
+                # env override wins, saved name still counts as mine
+                os.environ["TWITCH_RECORDER_COMPUTER_NAME"] = "Custom Name"
+                assert computer_name() == "Custom-Name"
+                assert "erics-14-silver-bullet" in my_computer_names()
+                os.environ.pop("TWITCH_RECORDER_COMPUTER_NAME", None)
+    finally:
+        REC_DIR = prev_rec
+        globals()["SELF_TEST_MODE"] = prev_mode
+        globals()["_network_computer_name"], globals()["_mac_local_hostname"] = prev_net, prev_mac
+        if prev_env is not None:
+            os.environ["TWITCH_RECORDER_COMPUTER_NAME"] = prev_env
+        else:
+            os.environ.pop("TWITCH_RECORDER_COMPUTER_NAME", None)
+        with _IDENTITY_LOCK:
+            _IDENTITY.clear()
+            _IDENTITY.update(prev_ident)
 
 
 def _self_test_v671():
@@ -13722,6 +13919,7 @@ def build_status_doc(now=None):
     au = auto_update_snapshot()  # v6.43
     doc = {
         "computer": computer_name(),
+        "computerAliases": computer_aliases(),  # v6.75: older names of this same computer
         "updatedAt": _iso_local(now),
         "updatedAtEpoch": int(now),
         "nextUpdateBy": _iso_local(now + STATUS_FILE_INTERVAL_SECS),
@@ -13840,6 +14038,9 @@ def render_status_text(doc):
         ver += f" (v{doc.get('diskVersion')} installed, restart pending)"
     ver += f", running since {doc.get('helperStartedAt')}"
     L.append(ver)
+    if doc.get("computerAliases"):  # v6.75
+        L.append("Same computer, older names (their status files are removed, their Drive sends count as this "
+                 "computer's): " + ", ".join(doc["computerAliases"]))
     tools = [("streamlink", doc["streamlink"]), ("ffmpeg", doc["ffmpeg"]), ("demucs", doc["demucs"])]
     L.append("Tools: " + ", ".join(f"{n} {'ok' if ok else 'MISSING'}" for n, ok in tools))
     if doc.get("streamlinkLine"):  # v6.55
@@ -14052,6 +14253,7 @@ def write_status_file(reason="tick"):
         local_folder.mkdir(parents=True, exist_ok=True)
         _status_atomic_write(local_txt, render_status_text(doc).encode("utf-8"))
         _status_atomic_write(local_js, (json.dumps(doc, indent=1, ensure_ascii=False) + "\n").encode("utf-8"))
+        remove_alias_status_files(local_folder)  # v6.75
         with STATUS_FILE_LOCK:
             STATUS_FILE.update(localLastWrittenAt=now, localTxtPath=str(local_txt), localError=None)
     except Exception as e:
@@ -14081,6 +14283,9 @@ def write_status_file(reason="tick"):
                 doc["driveAccess"] = {"ok": True, "error": None, "kind": "ok"}
                 _status_atomic_write(txt, render_status_text(doc).encode("utf-8"))
                 _status_atomic_write(js, (json.dumps(doc, indent=1, ensure_ascii=False) + "\n").encode("utf-8"))
+                gone = remove_alias_status_files(folder)  # v6.75: same computer, old name
+                if gone:
+                    log(f"status file: removed this computer's old-name status files from Drive: {', '.join(gone)}")
                 with STATUS_FILE_LOCK:
                     STATUS_FILE.update(lastWrittenAt=now, folder=str(folder), txtPath=str(txt),
                                        jsonPath=str(js), error=None, writes=int(STATUS_FILE["writes"]) + 1)
