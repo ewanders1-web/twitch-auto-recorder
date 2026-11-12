@@ -220,7 +220,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.75</span>
+    <span class="badge">v6.76</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -577,7 +577,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.75'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.76'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -1559,6 +1559,7 @@ function pingHelperAndStatus(){
   maybePageAutoUpdate(); // v6.43: one-time nudge for helpers that can't update themselves
   try{ checkPageStale(); }catch(e){ console.warn('[page-stale]', e); } // v6.63
   try{ renderManualUpdateBanner(); }catch(e){} // v6.70
+  try{ maybeManualUpdateProbe(); }catch(e){} // v6.76: old helpers with auto-update off
   // Fresh connect / reconnect: merge disk files and immediately kick live Auto-Rec
   if(helper.ok && !wasOk){
     driveRefresh().catch(function(){}); // v6.35
@@ -5909,8 +5910,14 @@ function autoUpdateText(){
         +' — ⚠ v'+(a.remoteVersion||'?')+' available. Click Install update (will not install by itself).'
         +(a.lastCheckAt?' Last checked '+auClock(a.lastCheckAt)+'.':'');
     }
+    const mr=manualUpdateRemote(); // v6.76: also known for helpers older than v6.70
+    if(mr){
+      return 'Auto-update: off'+(a.envDisabled?' (TWITCH_RECORDER_AUTO_UPDATE=0)':'')
+        +' — ⚠ this helper is v'+(helper.version||'?')+', v'+mr+' is available. Click Install update (will not install by itself).';
+    }
     return 'Auto-update: off'+(a.envDisabled?' (TWITCH_RECORDER_AUTO_UPDATE=0)':'')+' — updates only via Check for updates → Install update.'
-      +(a.lastCheckAt?' Last checked '+auClock(a.lastCheckAt)+(a.lastResult?' ('+a.lastResult+')':'')+'.':'');
+      +(a.lastCheckAt?' Last checked '+auClock(a.lastCheckAt)+(a.lastResult?' ('+a.lastResult+')':'')+'.':'')
+      +(!a.lastCheckAt && manualUpdateProbe.lastResult?' Page check: '+manualUpdateProbe.lastResult+'.':'');
   }
   let t='Auto-update: on';
   if(a.state==='waiting-idle') t+=' — v'+(a.remoteVersion||'?')+' available, installs when idle'+(a.waitingFor?' (waiting: '+a.waitingFor+')':'');
@@ -6021,7 +6028,8 @@ function autoUpdateBit(){
   if(!a.enabled){
     if(a.updateAvailable || a.state==='outdated-manual')
       return ' · ⚠ v'+(a.remoteVersion||'?')+' available (auto-update off)';
-    return '';
+    const mr=manualUpdateRemote(); // v6.76
+    return mr?(' · ⚠ v'+mr+' available (auto-update off)'):'';
   }
   if(a.state==='waiting-idle') return ' · ⬆ v'+(a.remoteVersion||'?')+' installs when idle';
   if(a.state==='installing') return ' · ⬆ installing v'+(a.remoteVersion||'?');
@@ -6099,7 +6107,58 @@ function manualUpdateRemote(){
     return String(a.remoteVersion);
   if(updateCheck.updateAvailable && updateCheck.remoteVersion && _versionIsNewer(updateCheck.remoteVersion, local))
     return String(updateCheck.remoteVersion);
+  // v6.76: helpers older than v6.70 never check GitHub while auto-update is off, so they never say
+  // a newer version exists. The page copy served from GitHub Pages IS the latest release — when it
+  // is newer than the helper, that is enough to offer Install update.
+  if(helper.version && pageIsPublishedCopy() && _versionIsNewer(UI_VERSION, local)) return String(UI_VERSION);
   return '';
+}
+// ─── v6.76: OLD HELPERS WITH AUTO-UPDATE OFF GET THE INSTALL UPDATE BANNER TOO ───
+// macbookpro (v6.63) and Silver Bullet (v6.65) have auto-update off and predate v6.70's "check even
+// when off", so their status said "not checked yet" for days and nothing on the page said they were
+// 10+ versions behind (still hitting bugs fixed long ago, e.g. the 6.68 'Resource deadlock avoided'
+// Drive fix). The page now (a) treats its own GitHub Pages version as "available" and (b) asks the
+// helper to check GitHub (/api/update/check — read-only, same as clicking Check for updates) about
+// 90 s after connecting and then every ~3 h while auto-update is off. Never installs by itself.
+var manualUpdateProbe={ checkedAt:0, checking:false, lastResult:'' };
+function pageIsPublishedCopy(){
+  // true for the GitHub Pages copy (or any non-local web host); false for file:// and the helper's
+  // own http://127.0.0.1:8765/ copy (that one is the helper's version, not the latest release)
+  const proto=String(location.protocol||''), h=String(location.hostname||'').toLowerCase();
+  if(proto!=='https:' && proto!=='http:') return false;
+  if(!h || h==='127.0.0.1' || h==='localhost' || h==='[::1]' || h==='::1') return false;
+  return true;
+}
+async function maybeManualUpdateProbe(){
+  if(manualUpdateProbe.checking || updateCheck.checking || updateCheck.installing) return;
+  if(!helper.ok || !helper.version || !autoUpdateEffectivelyOff()) return;
+  const a=helper.autoUpdate||{};
+  if(a.lastCheckAt && a.state!=='error') return;      // v6.70+ helper already checks on its own cadence
+  if(!helperOkSince || Date.now()-helperOkSince < 90000) return;
+  if(Date.now()-manualUpdateProbe.checkedAt < 3*3600*1000) return;
+  manualUpdateProbe.checking=true;
+  manualUpdateProbe.checkedAt=Date.now();
+  try{
+    const d=await helperFetch('/api/update/check', undefined, 15000);
+    if(!d || !d.ok){ manualUpdateProbe.lastResult='check failed'+(d&&d.error?(': '+d.error):''); return; }
+    if(d.autoUpdate && typeof d.autoUpdate==='object') helper.autoUpdate=d.autoUpdate;
+    if(d.updateAvailable && d.remoteVersion){
+      updateCheck.localVersion=d.localVersion||helper.version;
+      updateCheck.remoteVersion=String(d.remoteVersion);
+      updateCheck.updateAvailable=true;
+      manualUpdateProbe.lastResult='v'+d.remoteVersion+' available';
+      console.log('[manual-update] helper v'+updateCheck.localVersion+' — v'+d.remoteVersion+' on GitHub (auto-update off; not installing)');
+    }else{
+      manualUpdateProbe.lastResult='up to date'+(d.remoteVersion?(' (GitHub v'+d.remoteVersion+')'):'');
+    }
+    renderAutoUpdateLine();
+    renderManualUpdateBanner();
+  }catch(e){
+    manualUpdateProbe.lastResult='check failed';
+    console.warn('[manual-update] probe failed', e);
+  }finally{
+    manualUpdateProbe.checking=false;
+  }
 }
 function renderManualUpdateBanner(){
   const ban=document.getElementById('manualUpdateBanner');
