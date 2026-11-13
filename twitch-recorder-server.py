@@ -23,7 +23,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.76"
+HELPER_VERSION = "6.77"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4980,6 +4980,7 @@ def self_test():
     _self_test_v670()  # v6.70
     _self_test_v671()  # v6.71
     _self_test_v675()  # v6.75
+    _self_test_v677()  # v6.77
     _self_test_v672()  # v6.72
     _self_test_v673()  # v6.73
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
@@ -5164,6 +5165,7 @@ def _pipeline_health_summary():
         "originals": orig_on,  # v6.38
         "origWaiting": sum(1 for d in origs if d.get("status") in ("waiting", "queued")),
         "origErrors": sum(1 for d in origs if d.get("status") == "error"),
+        "origGone": sum(1 for d in origs if d.get("status") == "gone"),  # v6.77 (not counted as failed)
         "computer": computer_name(),
         "waiting": sum(1 for d in dels if d.get("status") == "waiting"),
         "errors": sum(1 for d in dels if d.get("status") == "error"),
@@ -13006,6 +13008,100 @@ def _self_test_v671():
                     PIPELINE[k] = v
 
 
+def _self_test_v677():
+    """v6.77: an original whose local file is gone stops retrying (gone), re-checks, comes back."""
+    import tempfile as _tmp77
+    global REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE, ORIGINAL_GONE_ENV_OFF
+    prev_g = (REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE, ORIGINAL_GONE_ENV_OFF)
+    with PIPELINE_LOCK:
+        prev_p = {k: (json.loads(json.dumps(PIPELINE.get(k))) if k in PIPELINE else None)
+                  for k in ("originals",)}
+    prev_kicks = set(DELIVERY_STATE["force"])
+    try:
+        with _tmp77.TemporaryDirectory(prefix="tar-677-") as td:
+            td = Path(td)
+            REC_DIR = td / "rec"
+            DRIVE_PARTS_DIR = REC_DIR / "Drive parts"
+            PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
+            REC_DIR.mkdir(parents=True)
+            ORIGINAL_GONE_ENV_OFF = False
+            name = "selftest677-Fri-2026-11-13T10-00-00.ogg"
+            (REC_DIR / name).write_bytes(b"g" * 3000)
+            (REC_DIR / "other-file.ogg").write_bytes(b"x")
+            with PIPELINE_LOCK:
+                PIPELINE["originals"] = {}
+            assert register_original(name, "selftest677", "stream")["status"] == "queued"
+            (REC_DIR / name).unlink()  # deleted in Finder
+            t0 = time.time()
+            with PIPELINE_LOCK:
+                d0 = dict(PIPELINE["originals"][name])
+            # first checks: still "error" (grace period / check count not reached)
+            r = _original_missing_update(name, d0, t0)
+            assert r["status"] == "error" and r["missingChecks"] == 1, r
+            r = _original_missing_update(name, r, t0 + 300)
+            r = _original_missing_update(name, r, t0 + 600)
+            assert r["status"] == "error" and r["missingChecks"] == 3, r  # 3 checks but < 30 min
+            assert drive_stuck_counts()["originals"] == 1
+            # unmounted / empty folder never marks gone
+            (REC_DIR / "other-file.ogg").unlink()
+            for f in REC_DIR.iterdir():
+                if f.is_file():
+                    f.unlink()
+            r = _original_missing_update(name, r, t0 + ORIGINAL_GONE_GRACE_SECS + 1)
+            assert r["status"] == "error", r
+            (REC_DIR / "other-file.ogg").write_bytes(b"x")
+            r = _original_missing_update(name, r, t0 + ORIGINAL_GONE_GRACE_SECS + 2)
+            assert r["status"] == "gone" and r["error"] is None and r.get("goneAt"), r
+            # terminal: not due on the 5-min error retry, not counted as failed / stuck
+            assert name not in originals_due(set(), t0 + ORIGINAL_GONE_GRACE_SECS + 900)
+            assert name not in originals_due({"*"}, t0 + ORIGINAL_GONE_GRACE_SECS + 900)
+            assert drive_stuck_counts()["originals"] == 0
+            hs = _pipeline_health_summary()
+            assert hs["origErrors"] == 0 and hs["origGone"] == 1, hs
+            # low-frequency re-check, or a named Check again
+            assert name in originals_due(set(), t0 + ORIGINAL_GONE_GRACE_SECS + ORIGINAL_GONE_RECHECK_SECS + 10)
+            assert name in originals_due({name}, t0 + ORIGINAL_GONE_GRACE_SECS + 900)
+            r = deliver_original(name)  # still missing → stays gone
+            assert r["status"] == "gone", r
+            payload, code = api_pipeline_original({"name": name, "action": "recheck"})
+            assert code == 200 and payload["ok"] and payload["found"] is False, payload
+            # opt-out: gone entries go back to the 5-min retry and nothing new turns gone
+            ORIGINAL_GONE_ENV_OFF = True
+            assert name in originals_due(set(), time.time() + DELIVERY_ERROR_RETRY_SECS + 5)
+            with PIPELINE_LOCK:
+                dd = dict(PIPELINE["originals"][name], status="error", missingChecks=50, missingSince=1.0)
+            assert _original_missing_update(name, dd, time.time())["status"] == "error"
+            _orig_update(name, status="gone")
+            ORIGINAL_GONE_ENV_OFF = False
+            # the file comes back → Check again queues it and resets the counters
+            (REC_DIR / name).write_bytes(b"g" * 3000)
+            payload, code = api_pipeline_original({"name": name, "action": "recheck"})
+            assert code == 200 and payload["found"] is True and payload["original"]["status"] == "queued", payload
+            with PIPELINE_LOCK:
+                d = PIPELINE["originals"][name]
+                assert not d.get("missingChecks") and not d.get("goneAt"), d
+            # a re-registered (restored) file is queued again even when it was gone
+            _orig_update(name, status="gone")
+            assert register_original(name, "selftest677", "stream")["status"] == "queued"
+            # Dismiss forgets an unsent entry; unknown names are 404
+            _orig_update(name, status="gone")
+            payload, code = api_pipeline_original({"name": name, "action": "dismiss"})
+            assert code == 200 and payload["dismissed"], payload
+            with PIPELINE_LOCK:
+                assert name not in PIPELINE["originals"]
+            assert api_pipeline_original({"name": name, "action": "recheck"})[1] == 404
+    finally:
+        REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE, ORIGINAL_GONE_ENV_OFF = prev_g
+        DELIVERY_STATE["force"].clear()
+        DELIVERY_STATE["force"].update(prev_kicks)
+        with PIPELINE_LOCK:
+            for k, v in prev_p.items():
+                if v is None:
+                    PIPELINE.pop(k, None)
+                else:
+                    PIPELINE[k] = v
+
+
 def original_enabled_for(username):
     u = (username or "").lower()
     with PIPELINE_LOCK:
@@ -13022,6 +13118,79 @@ def set_original_user_pref(username, on):
             return
         users[u] = bool(on)
     _pipeline_save()
+
+
+# ---- v6.77: originals whose local file is gone stop retrying forever -------------------------------
+# Before v6.77 an original whose file was deleted / moved outside the page (Finder, Explorer) stayed
+# "error: local original is missing" and was retried every 5 min forever (macbookpro showed 4 of them
+# every cycle, counted as failed in health / status file). Now, once the file is confirmed missing on
+# ORIGINAL_GONE_CHECKS checks spread over at least ORIGINAL_GONE_GRACE_SECS — and ~/TwitchRecordings
+# itself is there and not empty (an unmounted / disconnected folder never marks anything gone) — the
+# original becomes "gone": terminal, not retried, not counted as failed. "Check again" on the page
+# re-checks at once; the helper also re-checks quietly every ORIGINAL_GONE_RECHECK_SECS, and a file
+# that comes back is sent normally. "Dismiss" forgets the entry. Env TWITCH_RECORDER_MARK_GONE_ORIGINALS=0
+# keeps the old behaviour (error + retry every 5 min).
+ORIGINAL_GONE_ENV_OFF = (os.environ.get("TWITCH_RECORDER_MARK_GONE_ORIGINALS") or "").strip() == "0"
+ORIGINAL_GONE_CHECKS = max(1, int(float(os.environ.get("TWITCH_RECORDER_GONE_CHECKS") or 3)))
+ORIGINAL_GONE_GRACE_SECS = float(os.environ.get("TWITCH_RECORDER_GONE_GRACE_SECS") or 1800)
+ORIGINAL_GONE_RECHECK_SECS = float(os.environ.get("TWITCH_RECORDER_GONE_RECHECK_SECS") or 6 * 3600)
+ORIGINAL_GONE_NOTE = "Local file gone — not sent (deleted or moved from ~/TwitchRecordings)"
+
+
+def mark_gone_originals_enabled():
+    return not ORIGINAL_GONE_ENV_OFF
+
+
+def _rec_dir_looks_mounted(missing_name=None):
+    """True when REC_DIR exists and holds at least one other entry (not an empty / unmounted folder)."""
+    try:
+        if not REC_DIR.is_dir():
+            return False
+        for e in os.scandir(str(REC_DIR)):  # helper state files (.drive-pipeline.json …) don't count
+            if e.name != missing_name and not e.name.startswith("."):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _original_missing_update(name, d, now):
+    """Local file not there: count the check; mark "gone" once confirmed (v6.77)."""
+    checks = int(d.get("missingChecks") or 0) + 1
+    since = float(d.get("missingSince") or 0) or now
+    if d.get("status") == "gone":  # quiet re-check: still gone
+        return _orig_update(name, lastAttempt=now, missingChecks=checks, missingSince=since)
+    if (mark_gone_originals_enabled() and checks >= ORIGINAL_GONE_CHECKS
+            and now - since >= ORIGINAL_GONE_GRACE_SECS and _rec_dir_looks_mounted(name)):
+        log(f"drive original gone: {name} — local file missing on {checks} checks since "
+            f"{_iso_local(since)}; not retrying (re-checks every {ORIGINAL_GONE_RECHECK_SECS / 3600:.0f} h)")
+        return _orig_update(name, status="gone", error=None, note=ORIGINAL_GONE_NOTE, lastAttempt=now,
+                            missingChecks=checks, missingSince=since, goneAt=now, holdUntil=None)
+    return _orig_update(name, status="error", error="local original is missing (deleted?)",
+                        lastAttempt=now, missingChecks=checks, missingSince=since)
+
+
+def recheck_original(name, dismiss=False):
+    """v6.77: page "Check again" / "Dismiss" for an original whose local file is gone."""
+    name = basename_of(name)
+    with PIPELINE_LOCK:
+        d = (PIPELINE.get("originals") or {}).get(name) if name else None
+        d = dict(d) if d else None
+    if not d:
+        return {"ok": False, "error": "that original is not in the Drive send list"}, 404
+    if dismiss:
+        if d.get("status") == "sent":
+            return {"ok": False, "error": "already in Drive — nothing to dismiss"}, 409
+        forget_original_if_unsent(name)
+        return {"ok": True, "dismissed": True, "name": name}, 200
+    if (REC_DIR / name).is_file():
+        snap = _orig_update(name, status="queued", error=None, note="File is back — sending",
+                            missingChecks=0, missingSince=None, goneAt=None)
+        request_delivery(name)
+        return {"ok": True, "found": True, "driveFound": bool(detect_drive_roots()), "original": snap}, 200
+    snap = _orig_update(name, lastAttempt=time.time())
+    return {"ok": True, "found": False, "original": snap,
+            "message": f"{name} is still not in ~/TwitchRecordings — nothing to send"}, 200
 
 
 def _orig_update(name, **kw):
@@ -13094,8 +13263,11 @@ def deliver_original(name):
         return d
     src = REC_DIR / name
     if not src.is_file():
-        return _orig_update(name, status="error", error="local original is missing (deleted?)",
-                            lastAttempt=time.time())
+        return _original_missing_update(name, d, time.time())  # v6.77: "gone" once confirmed
+    if d.get("missingChecks") or d.get("status") == "gone":  # v6.77: the file is back
+        log(f"drive original: {name} is back in {REC_DIR} — sending")
+        d = _orig_update(name, missingChecks=0, missingSince=None, goneAt=None,
+                         status="queued", note=None) or d
     if _file_is_recording(src):
         return _orig_update(name, status="waiting", note="Still recording — will send when it finishes",
                             lastAttempt=time.time())
@@ -13157,6 +13329,10 @@ def originals_due(forced, now):
                 todo.append(name)
             elif st == "held" and now >= float(d.get("holdUntil") or 0):  # v6.71
                 todo.append(name)
+            elif st == "gone":  # v6.77: terminal — only a quiet low-frequency re-check
+                every = ORIGINAL_GONE_RECHECK_SECS if mark_gone_originals_enabled() else DELIVERY_ERROR_RETRY_SECS
+                if now - float(d.get("lastAttempt") or 0) > every:
+                    todo.append(name)
     return todo
 
 
@@ -13167,7 +13343,7 @@ def originals_snapshot(limit=60):
         return [{k: d.get(k) for k in (
             "name", "base", "username", "size", "status", "target", "dest", "action", "sentAt",
             "error", "note", "source", "computer", "createdAt", "updatedAt",
-            "holdUntil", "coveredBy", "durationSecs")} for d in items[:limit]]
+            "holdUntil", "coveredBy", "durationSecs", "goneAt", "missingSince")} for d in items[:limit]]
 
 
 def forget_original_if_unsent(name):
@@ -13202,6 +13378,9 @@ def wait_for_originals(job_id, names, progress):
 
 def api_pipeline_original(body):
     body = body if isinstance(body, dict) else {}
+    act = str(body.get("action") or "").strip().lower()
+    if act in ("recheck", "dismiss"):  # v6.77: originals whose local file is gone
+        return recheck_original(body.get("name"), dismiss=(act == "dismiss"))
     target = resolve_download_path(body.get("name"))
     if not target:
         return {"ok": False, "error": "not found in ~/TwitchRecordings"}, 404
@@ -13963,6 +14142,8 @@ def build_status_doc(now=None):
             "originalsOneCopy": originals_one_copy_enabled(),  # v6.71
             "originalsSkippedAsDuplicate": sum(1 for d in all_origs if d.get("status") == "covered"),
             "originalsHeld": sum(1 for d in all_origs if d.get("status") == "held"),
+            "originalsGone": sum(1 for d in all_origs if d.get("status") == "gone"),  # v6.77
+            "markGoneOriginals": mark_gone_originals_enabled(),  # v6.77
             "recentDeliveries": [{
                 "base": d.get("base"), "status": d.get("status"), "parts": len(d.get("parts") or []),
                 "sentAt": _iso_local(d.get("sentAt")), "note": _short(d.get("note"), 200),
@@ -14123,7 +14304,8 @@ def render_status_text(doc):
     if doc.get("driveMaterializeLine"):  # v6.68
         L.append(doc["driveMaterializeLine"])
     L.append(f"Drive sends: {d.get('partsWaiting', 0)} part sets waiting, {d.get('partsErrors', 0)} failed;"
-             f" {d.get('originalsWaiting', 0)} originals waiting, {d.get('originalsErrors', 0)} failed")
+             f" {d.get('originalsWaiting', 0)} originals waiting, {d.get('originalsErrors', 0)} failed"
+             + (f", {d.get('originalsGone')} local file gone (not retried)" if d.get("originalsGone") else ""))
     if "oneCopyPerStream" in d:  # v6.50
         L.append("One copy per stream: " + (
             "on — this computer skips voice removal / parts when another computer already sent that stream"

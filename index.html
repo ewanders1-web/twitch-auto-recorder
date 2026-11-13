@@ -68,6 +68,7 @@
   .drive-pipe-box{margin-top:.6rem;padding:.55rem .65rem;border:1px solid rgba(147,197,253,.25);border-radius:8px;background:rgba(59,130,246,.06);font-size:.78rem;}
   .drive-pipe-box .dp-row{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin:.2rem 0;}
   .dp-badge{display:inline-block;font-size:.68rem;padding:.05rem .4rem;border-radius:999px;margin-left:.3rem;white-space:nowrap;}
+  .dp-badge.gone{background:rgba(156,163,175,.18);color:#d1d5db;}
   .dp-badge.sent,.dp-badge.covered{background:rgba(16,185,129,.18);color:#6ee7b7;}
   .dp-badge.waiting,.dp-badge.sending{background:rgba(251,191,36,.15);color:#fcd34d;}
   .dp-badge.error{background:rgba(239,68,68,.18);color:#fca5a5;}
@@ -220,7 +221,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.76</span>
+    <span class="badge">v6.77</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -577,7 +578,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.76'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.77'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -5639,6 +5640,7 @@ function renderPipelineBox(){
       const nEsc=driveEsc(ov.name).replace(/&#39;/g,"\\'");
       html+='<div class="dp-row"><span>'+driveEsc(ov.name)+'</span>'+originalBadgeHtml(ov)
         +(ov.status==='waiting'||ov.status==='error'||ov.status==='held'||ov.status==='covered'?'<button class="btn btn-gray btn-sm" onclick="pipelineSendOriginal(\''+nEsc+'\')">Send original now</button>':'')
+        +(ov.status==='gone'?'<button class="btn btn-gray btn-sm" onclick="pipelineRecheckOriginal(\''+nEsc+'\',false)" title="Look for the file in ~/TwitchRecordings again and send it if it is back">Check again</button><button class="btn btn-gray btn-sm" onclick="pipelineRecheckOriginal(\''+nEsc+'\',true)" title="Remove this entry from the Drive send list">Dismiss</button>':'') // v6.77
         +'</div>'+(ov.status==='error'&&ov.error?'<div class="hint" style="color:#fca5a5;margin:.1rem 0 .3rem">'+driveEsc(ov.error)+'</div>':'');
     });
   }
@@ -6317,6 +6319,11 @@ function originalBadgeHtml(ov){
   }else if(st==='sending'){ txt='⇪ Sending original…'; tip=ov.target||''; }
   else if(st==='queued'){ txt='⇪ Original queued for Drive'; tip='Sent before voice removal starts'; }
   else if(st==='error'){ txt='⚠ Original send failed'; tip=ov.error||'error'; }
+  else if(st==='gone'){ // v6.77: the local file was deleted / moved — not retried any more
+    txt='Local file gone — not sent';
+    tip=(ov.note||'The local original is no longer in ~/TwitchRecordings')+(ov.goneAt?(' · since '+driveDate(ov.goneAt)):'')
+      +' · not retried (the helper re-checks every few hours) — Check again looks now, Dismiss removes it from the list';
+  }
   else if(st==='covered'){ // v6.71: another computer already put this stream's original in Drive
     const cb=ov.coveredBy||{};
     txt='☁ Original in Drive from '+(cb.computer||'another computer');
@@ -6346,7 +6353,9 @@ function applyOriginalsFromHealth(d){
     }else if(ov.status==='covered' && (!prev || prev.status!=='covered')){ // v6.71
       const cb=ov.coveredBy||{};
       flashOk('☁ Original already in Drive from '+driveEsc(cb.computer||'another computer')+' — skipped the duplicate copy of '+driveEsc(ov.name)+' (kept here locally)');
-    }else if(ov.status==='error' && (!prev || prev.status!=='error')){
+    }else if(ov.status==='gone' && prev && prev.status!=='gone'){ // v6.77: quiet, not a failure
+      flashOk('Original '+driveEsc(ov.name)+': local file gone (deleted or moved) — not sent, no more retries. Check again / Dismiss in the Drive box.');
+    }else if(ov.status==='error' && (!prev || prev.status!=='error') && !(prev && prev.status==='gone')){
       flashErr('Original → Drive failed ('+driveEsc(ov.name)+'): '+driveEsc(ov.error||'unknown'));
       fireNotify('tar-do-'+ov.name, 'Original → Drive failed', ov.error||'');
     }
@@ -6370,6 +6379,20 @@ async function pipelineSendOriginal(name){
     await pingHelperAndStatus();
     renderHist();
   }catch(e){ flashErr('Send original failed: '+(e.message||e)); }
+}
+// v6.77: "Check again" / "Dismiss" for an original whose local file is gone
+async function pipelineRecheckOriginal(name, dismiss){
+  if(!helper.ok){ flashErr('Local helper not running.'); return; }
+  try{
+    const d=await helperFetch('/api/pipeline/original', {name:name, action:dismiss?'dismiss':'recheck'}, 8000);
+    if(!d || !d.ok){ flashErr((dismiss?'Dismiss':'Check again')+': '+driveEsc((d&&d.error)||'failed')+(helperVerLt(helper.version||'0','6.77')?' (needs helper v6.77 — use Install update)':'')); return; }
+    if(dismiss){ delete pipelineOriginals[name]; flashOk('Removed '+driveEsc(name)+' from the Drive send list.'); }
+    else if(d.found){ (d.driveFound?flashOk:flashErr)(d.driveFound?('File is back — sending original '+driveEsc(name)+' to Google Drive…'):'File is back, but Google Drive for Desktop is not found — it goes automatically once Drive appears.'); }
+    else flashErr(driveEsc(d.message||('Still not in ~/TwitchRecordings: '+name)));
+    await pingHelperAndStatus();
+    renderPipelineBox();
+    renderHist();
+  }catch(e){ flashErr('Check again failed: '+(e.message||e)); }
 }
 
 // ─── UI HELPERS ──────────────────────────────────────
