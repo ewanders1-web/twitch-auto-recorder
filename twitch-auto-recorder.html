@@ -221,7 +221,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.77</span>
+    <span class="badge">v6.78</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -578,7 +578,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.77'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.78'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -5485,6 +5485,7 @@ async function fetchDriveHistory(){
 let pipelineDeliveries={};   // base -> delivery snapshot (from /api/health driveDeliveries)
 let pipelineStatus=null;     // /api/pipeline/status payload
 let pipelineSeenOnce=false;
+let pipelineVoiceFails={}; // v6.78: name -> failed after-stream voice removal (from /api/health drivePipeline.voiceFailures)
 let pipelinePrefsSig='';
 function helperHasPipeline(){ return !!helper.pipeline; }
 function drivePipeActiveFor(username){
@@ -5569,6 +5570,7 @@ function applyPipelineFromHealth(d){
   helper.pipeline=(d && d.drivePipeline && typeof d.drivePipeline==='object')?d.drivePipeline:null;
   if(!helper.pipeline) return;
   applyOriginalsFromHealth(d); // v6.38
+  applyVoiceFailsFromHealth(); // v6.78
   const list=Array.isArray(d.driveDeliveries)?d.driveDeliveries:[];
   const next={};
   let changed=false;
@@ -5644,6 +5646,7 @@ function renderPipelineBox(){
         +'</div>'+(ov.status==='error'&&ov.error?'<div class="hint" style="color:#fca5a5;margin:.1rem 0 .3rem">'+driveEsc(ov.error)+'</div>':'');
     });
   }
+  html+=voiceFailRowsHtml(); // v6.78
   html+=statusFileRowHtml(); // v6.41
   const dl=(ps.deliveries||[]).slice(0,8);
   if(dl.length){
@@ -6379,6 +6382,62 @@ async function pipelineSendOriginal(name){
     await pingHelperAndStatus();
     renderHist();
   }catch(e){ flashErr('Send original failed: '+(e.message||e)); }
+}
+// ─── v6.78: AFTER-STREAM VOICE REMOVAL THAT FAILED STAYS VISIBLE ─────
+// The helper keeps failed / never-started voice-removal jobs (no music parts for that stream) for
+// 7 days; All voices failures are tried once with Fast so parts still reach Drive.
+function applyVoiceFailsFromHealth(){
+  const list=(helper.pipeline && Array.isArray(helper.pipeline.voiceFailures))?helper.pipeline.voiceFailures:null;
+  if(!list) return;
+  const next={};
+  let changed=false;
+  list.forEach(function(v){
+    if(!v || !v.name) return;
+    next[v.name]=v;
+    const prev=pipelineVoiceFails[v.name];
+    if(!prev || prev.at!==v.at || prev.resolved!==v.resolved || prev.working!==v.working || prev.fallback!==v.fallback) changed=true;
+    if(!pipelineSeenOnce) return;
+    if(!v.resolved && !v.working && (!prev || prev.at!==v.at)){
+      const fb=v.fallback==='fast-queued'?' — trying Fast (ffmpeg) voice removal instead':'';
+      flashErr('Voice removal failed ('+driveEsc(v.base||v.name)+'): '+driveEsc(v.error||'unknown')+fb);
+      fireNotify('tar-vf-'+v.name, 'Voice removal failed — no music parts yet', (v.base||v.name)+': '+(v.error||'')+fb);
+    }else if(v.resolved==='fast' && prev && prev.resolved!=='fast'){
+      flashOk('☁ '+driveEsc(v.base||v.name)+': All voices failed, Fast (ffmpeg) parts were sent to Drive instead');
+    }
+  });
+  if(Object.keys(next).length!==Object.keys(pipelineVoiceFails).length) changed=true;
+  pipelineVoiceFails=next;
+  if(changed) renderPipelineBox();
+}
+function voiceFailRowsHtml(){
+  const ps=pipelineStatus||{};
+  const src=Array.isArray(ps.voiceFailures)&&!Object.keys(pipelineVoiceFails).length?ps.voiceFailures:Object.values(pipelineVoiceFails);
+  const list=src.filter(function(v){ return v && v.name; }).slice(0,6);
+  if(!list.length) return '';
+  return '<div style="margin-top:.3rem">'+list.map(function(v){
+    const nEsc=driveEsc(v.name).replace(/&#39;/g,"\\'");
+    let txt, cls='error', tip=(v.error||'')+(v.atIso?(' · '+v.atIso):'');
+    if(v.resolved==='fast'){ txt='☁ All voices failed — Fast parts sent'; cls='covered'; }
+    else if(v.working){ txt='⏳ Voice removal running again…'; cls='sending'; }
+    else if(v.fallback==='fast-queued'){ txt='⚠ All voices failed — Fast fallback queued'; }
+    else { txt='⚠ Voice removal failed — no music parts'; }
+    const btns=v.working?'':((v.resolved?'':'<button class="btn btn-gray btn-sm" onclick="pipelineVoiceAction(\''+nEsc+'\',false)" title="Remove voice → split → send to Drive again (All voices / your setting)">Try again</button>')
+      +'<button class="btn btn-gray btn-sm" onclick="pipelineVoiceAction(\''+nEsc+'\',true)" title="Hide this from the list">Dismiss</button>');
+    return '<div class="dp-row"><span>'+driveEsc(v.base||v.name)+'</span> <span class="dp-badge '+cls+'" title="'+driveEsc(tip)+'">'+driveEsc(txt)+'</span>'+btns+'</div>'
+      +(!v.resolved&&!v.working&&v.error?'<div class="hint" style="color:#fca5a5;margin:.1rem 0 .3rem">'+driveEsc(v.error)+'</div>':'');
+  }).join('')+'</div>';
+}
+async function pipelineVoiceAction(name, dismiss){
+  if(!helper.ok){ flashErr('Local helper not running.'); return; }
+  try{
+    const d=await helperFetch('/api/pipeline/voice', {name:name, action:dismiss?'dismiss':'retry'}, 8000);
+    if(!d || !d.ok){ flashErr((dismiss?'Dismiss':'Try again')+': '+driveEsc((d&&d.error)||'failed')+(helperVerLt(helper.version||'0','6.78')?' (needs helper v6.78 — use Install update)':'')); return; }
+    if(dismiss){ delete pipelineVoiceFails[name]; flashOk('Removed '+driveEsc(name)+' from the failed list.'); }
+    else flashOk('Removing voice from '+driveEsc(name)+' again → parts to Drive (progress in Convert → Google Drive).');
+    await pingHelperAndStatus();
+    await fetchPipelineStatus();
+    renderPipelineBox();
+  }catch(e){ flashErr((dismiss?'Dismiss':'Try again')+' failed: '+(e.message||e)); }
 }
 // v6.77: "Check again" / "Dismiss" for an original whose local file is gone
 async function pipelineRecheckOriginal(name, dismiss){

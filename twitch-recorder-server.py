@@ -23,7 +23,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.77"
+HELPER_VERSION = "6.78"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4981,6 +4981,7 @@ def self_test():
     _self_test_v671()  # v6.71
     _self_test_v675()  # v6.75
     _self_test_v677()  # v6.77
+    _self_test_v678()  # v6.78
     _self_test_v672()  # v6.72
     _self_test_v673()  # v6.73
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
@@ -5174,6 +5175,9 @@ def _pipeline_health_summary():
         "sending": bool(DELIVERY_STATE.get("busy")),
         "driveFound": bool(detect_drive_roots()),
         "voiceRetry": _pipeline_retry_snapshot(),  # v6.61
+        "voiceFailed": voice_failed_count(),  # v6.78: streams whose voice removal failed (no parts)
+        "voiceFailures": voice_failures_snapshot(10),  # v6.78
+        "fastFallback": fast_fallback_enabled(),  # v6.78
     }
 
 
@@ -9223,6 +9227,9 @@ def _pipeline_load():
         pj = data.get("pendingJobs") if isinstance(data.get("pendingJobs"), dict) else {}
         PIPELINE["pendingJobs"] = {str(k): v for k, v in pj.items()
                                    if isinstance(v, dict) and isinstance(v.get("segments"), list)}
+        # v6.78: after-stream voice removal that failed / never started (shown until it works)
+        vfd = data.get("voiceFailures") if isinstance(data.get("voiceFailures"), dict) else {}
+        PIPELINE["voiceFailures"] = {str(k): v for k, v in vfd.items() if isinstance(v, dict) and v.get("name")}
     if _migrated_vq and not SELF_TEST_MODE:  # v6.72: persist the Talk only → All voices reset now
         _pipeline_save()
 
@@ -11039,6 +11046,7 @@ def pipeline_status_payload():
         "statusFile": status_file_snapshot(),  # v6.41
         "voiceQuality": voice_quality_snapshot(),  # v6.45
         "oneCopy": one_copy_enabled(),  # v6.50
+        "voiceFailures": voice_failures_snapshot(50),  # v6.78
     }
 
 
@@ -11240,6 +11248,7 @@ def _pipeline_attempt(job_id):
                 _set_music_job(job_id, status="done", phase="done", progress=cmsg, progressPct=100,
                                deliveryStatus="covered", base=cbase, error=None, finishedAt=time.time())
                 log(f"pipeline skipped job={job_id}: {cmsg}")
+                resolve_voice_failure(segs[0] if segs else None, "covered")  # v6.78
                 return
             # Disk-low pause (Auto): wait while under diskWarn instead of starting demucs.
             paused = False
@@ -11291,6 +11300,8 @@ def _pipeline_attempt(job_id):
         _set_music_job(job_id, status="done", phase="done", progress=msg, progressPct=100,
                        deliveryStatus=st, error=None, finishedAt=time.time(), retryAt=None)
         log(f"pipeline done job={job_id} music={Path(music_path).name} parts={len(names)} delivery={st}")
+        resolve_voice_failure(segs[0] if segs else None,  # v6.78
+                              "fast" if _job_get(job_id, "fastFallback") else "done")
     finally:
         if slot_held:
             try:
@@ -11393,6 +11404,7 @@ def pipeline_worker(job_id):
         _set_music_job(job_id, musicMade=made)
     _set_music_job(job_id, autoRetries=retries)
     keep_pending = False
+    fallback_req = None  # v6.78
     try:
         while True:
             try:
@@ -11412,8 +11424,21 @@ def pipeline_worker(job_id):
                         PIPELINE_RETRY_STATS.update(lastError=msg[:300], lastAt=time.time(), lastName=first)
                     if retries and not permanent:
                         msg = f"{msg} (failed {retries + 1} times — press Retry to try again)"
+                    q_used = _job_get(job_id, "quality")
+                    was_fb = bool(_job_get(job_id, "fastFallback"))
+                    fb_ok = (not was_fb) and fast_fallback_allowed(q_used, msg)
+                    raw_msg = msg
+                    if fb_ok:
+                        msg = f"{msg} — trying Fast (ffmpeg) voice removal instead so parts still reach Drive"
                     _set_music_job(job_id, status="error", progress="Error", error=msg,
                                    finishedAt=time.time(), retryAt=None)
+                    try:  # v6.78: keep the failure visible after the job leaves memory
+                        note_voice_failure(first, _job_get(job_id, "username"), segs, raw_msg, q_used,
+                                           fallback=("fast-failed" if was_fb else ("fast-queued" if fb_ok else None)))
+                    except Exception as e2:
+                        log(f"voice failure note failed: {e2}")
+                    if fb_ok:
+                        fallback_req = (_job_get(job_id, "username"), list(segs))
                     return
                 delay = _pipeline_retry_delay(retries)
                 retries += 1
@@ -11448,6 +11473,304 @@ def pipeline_worker(job_id):
                 _pending_job_drop(first)
             except Exception:
                 pass
+        if fallback_req:  # v6.78: queued only after the old pending entry is gone (fresh retries)
+            _start_fast_fallback(*fallback_req)
+
+
+# ─── v6.78: VOICE-REMOVAL FAILURES STAY VISIBLE + ONE FAST FALLBACK ───────────────────────────────
+# Nov 13–15: Quiques-Mach-1 (Demucs) sent the originals of 6 streams to Drive/Originals but not one
+# music part set, and its status file still said "0 part sets waiting, 0 failed": a failed (or
+# never-started) after-stream voice-removal job only lived in memory for ~15 min (MUSIC_JOBS), so
+# nothing in Drive or on a reopened page said the parts were missing. And because that computer
+# still advertised All voices, the Fast-only computers (v6.74) held their own parts up to 3 h for
+# parts that never came. Now:
+#   • a job that ends in error (after its automatic retries) or never starts is kept in
+#     .drive-pipeline.json voiceFailures (7 days) → status file line "Voice removal FAILED …",
+#     /api/health drivePipeline.voiceFailed / voiceFailures, the page's Drive box (Try again /
+#     Dismiss) and a one-time notification;
+#   • the status file also lists it as a failed part set (recentDeliveries status error), so a
+#     Fast computer holding its parts for this one (v6.74) sends them right away;
+#   • when All voices / Talk only (Demucs) is what failed, the stream is done once more with Fast
+#     (ffmpeg) voice removal so music-only parts still reach Drive; a Demucs computer's All voices
+#     set still replaces those same-named Fast parts (v6.74). Env TWITCH_RECORDER_FAST_FALLBACK=0
+#     turns the fallback off (failures are still shown).
+#   • a later successful / covered run of the same stream clears the entry by itself.
+FAST_FALLBACK_ENV_OFF = (os.environ.get("TWITCH_RECORDER_FAST_FALLBACK") or "").strip() == "0"
+VOICE_FAIL_KEEP_SECS = 7 * 86400
+VOICE_FAIL_MAX = 60
+VOICE_FAIL_STATS = {"failed": 0, "fallbackQueued": 0, "fallbackSent": 0, "fallbackFailed": 0}
+_NO_FALLBACK_HINTS = ("no finished segments on disk", "ffmpeg not found", "ffmpeg not installed",
+                      "mono audio", "no segments", "voice removal unavailable")
+
+
+def fast_fallback_enabled():
+    return not FAST_FALLBACK_ENV_OFF
+
+
+def fast_fallback_allowed(quality, msg):
+    """Should a failed All voices / Talk only job be done once more with Fast (ffmpeg)?"""
+    if not fast_fallback_enabled() or str(quality or "") not in ("better", "talkonly"):
+        return False
+    low = str(msg or "").lower()
+    if any(h in low for h in _NO_FALLBACK_HINTS) or "cancel" in low:
+        return False
+    return bool(which_ffmpeg())
+
+
+def _voice_fail_prune_locked(now):
+    vf = PIPELINE.setdefault("voiceFailures", {})
+    for k in [k for k, v in vf.items()
+              if not isinstance(v, dict) or now - float(v.get("at") or 0) > VOICE_FAIL_KEEP_SECS]:
+        vf.pop(k, None)
+    if len(vf) > VOICE_FAIL_MAX:
+        for v in sorted(vf.values(), key=lambda x: float(x.get("at") or 0))[: len(vf) - VOICE_FAIL_MAX]:
+            vf.pop(v.get("name"), None)
+    return vf
+
+
+def note_voice_failure(first, username, segs, error, quality, fallback=None, now=None):
+    """Remember that this stream's after-stream voice removal failed / never started. Never raises."""
+    if not first:
+        return None
+    now = time.time() if now is None else now
+    try:
+        with PIPELINE_LOCK:
+            vf = _voice_fail_prune_locked(now)
+            prev = vf.get(first) if isinstance(vf.get(first), dict) else {}
+            ent = {"name": first, "base": music_base_stem(first), "username": (username or prev.get("username") or ""),
+                   "segments": [basename_of(x) for x in (segs or prev.get("segments") or []) if x][:40],
+                   "error": str(error or "unknown")[:400], "quality": quality or prev.get("quality"),
+                   "firstAt": prev.get("firstAt") or now, "at": now,
+                   "count": int(prev.get("count") or 0) + 1,
+                   "fallback": fallback if fallback is not None else prev.get("fallback"),
+                   "resolved": None}
+            vf[first] = ent
+            VOICE_FAIL_STATS["failed"] += 1
+            if fallback == "fast-queued":
+                VOICE_FAIL_STATS["fallbackQueued"] += 1
+            elif fallback == "fast-failed":
+                VOICE_FAIL_STATS["fallbackFailed"] += 1
+            snap = dict(ent)
+        _pipeline_save()
+        log(f"voice removal FAILED for {first}: {snap['error'][:200]}"
+            + (f" (fallback: {fallback})" if fallback else ""))
+        STATUS_FILE_WAKE.set()
+        return snap
+    except Exception as e:
+        log(f"voice failure note failed: {e}")
+        return None
+
+
+def resolve_voice_failure(first, how):
+    """A later run of this stream worked ('done'), was covered by another computer ('covered') or
+    the Fast fallback sent parts ('fast'). Fast keeps a resolved entry (shown, not counted)."""
+    if not first:
+        return
+    try:
+        with PIPELINE_LOCK:
+            vf = PIPELINE.get("voiceFailures") or {}
+            ent = vf.get(first)
+            if not isinstance(ent, dict) or ent.get("resolved"):
+                return
+            if how == "fast":
+                ent.update(resolved="fast", resolvedAt=time.time(), fallback="fast-sent")
+                VOICE_FAIL_STATS["fallbackSent"] += 1
+            else:
+                vf.pop(first, None)
+        _pipeline_save()
+        STATUS_FILE_WAKE.set()
+    except Exception as e:
+        log(f"voice failure resolve failed: {e}")
+
+
+def _start_fast_fallback(username, segs):
+    try:
+        jid, err = start_stream_pipeline(username, segs, reason="Fast fallback (All voices failed)",
+                                         quality="fast", fallback=True)
+    except Exception as e:
+        jid, err = None, str(e)
+    if jid:
+        log(f"voice removal: Fast fallback queued job={jid} for {segs[:1]}")
+    else:
+        log(f"voice removal: Fast fallback not started for {segs[:1]}: {err}")
+        first = segs[0] if segs else None
+        with PIPELINE_LOCK:
+            ent = (PIPELINE.get("voiceFailures") or {}).get(first)
+            if isinstance(ent, dict):
+                ent["fallback"] = "fast-not-started"
+                ent["error"] = (str(ent.get("error") or "") + f" · Fast fallback did not start: {err}")[:400]
+        _pipeline_save()
+    return jid
+
+
+def voice_failures_snapshot(limit=20, include_resolved=True, now=None):
+    now = time.time() if now is None else now
+    with PIPELINE_LOCK:
+        items = [dict(v) for v in (PIPELINE.get("voiceFailures") or {}).values() if isinstance(v, dict)]
+    items = [v for v in items if now - float(v.get("at") or 0) <= VOICE_FAIL_KEEP_SECS
+             and (include_resolved or not v.get("resolved"))]
+    items.sort(key=lambda v: float(v.get("at") or 0), reverse=True)
+    with MUSIC_JOBS_LOCK:
+        busy = {j.get("name") for j in MUSIC_JOBS.values()
+                if (j.get("status") or "") in ("queued", "running") and j.get("source") == "pipeline"}
+    out = []
+    for v in items[:limit]:
+        out.append({"name": v.get("name"), "base": v.get("base"), "username": v.get("username"),
+                    "error": v.get("error"), "quality": v.get("quality"), "at": v.get("at"),
+                    "atIso": _iso_local(v.get("at")), "count": v.get("count"), "fallback": v.get("fallback"),
+                    "resolved": v.get("resolved"), "working": v.get("name") in busy})
+    return out
+
+
+def voice_failed_count(now=None):
+    return sum(1 for v in voice_failures_snapshot(VOICE_FAIL_MAX, include_resolved=False, now=now)
+               if not v.get("working"))
+
+
+def voice_failure_line(v):
+    """One status-file line for a failed stream."""
+    q = {"better": "All voices", "talkonly": "Talk only", "fast": "Fast"}.get(v.get("quality") or "", "")
+    fb = {"fast-queued": "Fast fallback queued", "fast-failed": "Fast fallback failed too",
+          "fast-sent": "Fast parts sent instead", "fast-not-started": "Fast fallback did not start"}.get(
+        v.get("fallback") or "", "")
+    if v.get("resolved") == "fast":
+        head = f"  parts {v.get('base')}: {q or 'voice removal'} failed — Fast (ffmpeg) parts sent instead"
+        return head + f" ({_short(v.get('error'), 160)})"
+    line = f"  parts {v.get('base')}: voice removal FAILED" + (f" ({q})" if q else "")
+    if v.get("atIso"):
+        line += f" at {v['atIso']}"
+    if v.get("working"):
+        line += " — trying again now"
+    elif fb:
+        line += f" — {fb}"
+    return line + f" — {_short(v.get('error'), 240)}"
+
+
+def api_pipeline_voice(body):
+    """POST /api/pipeline/voice {name, action: retry|dismiss} (v6.78)."""
+    body = body if isinstance(body, dict) else {}
+    name = basename_of(str(body.get("name") or ""))
+    act = str(body.get("action") or "retry").strip().lower()
+    with PIPELINE_LOCK:
+        ent = (PIPELINE.get("voiceFailures") or {}).get(name)
+        ent = dict(ent) if isinstance(ent, dict) else None
+    if not ent:
+        return {"ok": False, "error": "no failed voice removal with that name"}, 404
+    if act == "dismiss":
+        with PIPELINE_LOCK:
+            (PIPELINE.get("voiceFailures") or {}).pop(name, None)
+        _pipeline_save()
+        STATUS_FILE_WAKE.set()
+        return {"ok": True, "dismissed": True, "name": name}, 200
+    if act != "retry":
+        return {"ok": False, "error": "action must be retry or dismiss"}, 400
+    segs = [s for s in (ent.get("segments") or [name]) if (REC_DIR / s).is_file()]
+    if not segs:
+        return {"ok": False, "error": "the recording is no longer in ~/TwitchRecordings"}, 404
+    PIPELINE_SEEN.discard(segs[0])
+    jid, err = start_stream_pipeline(ent.get("username") or "", segs, reason="Try again (after failure)")
+    if not jid:
+        return {"ok": False, "error": err or "could not start"}, 409
+    return {"ok": True, "jobId": jid, "name": name,
+            "already": err == "already running"}, 200
+
+
+def _self_test_v678():
+    """v6.78: failed voice removal is remembered, shown, peers see it, Fast fallback once, resolve."""
+    import tempfile as _tmp78
+    global REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE, FAST_FALLBACK_ENV_OFF
+    prev_g = (REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE, FAST_FALLBACK_ENV_OFF)
+    with PIPELINE_LOCK:
+        prev_p = {k: (json.loads(json.dumps(PIPELINE.get(k))) if k in PIPELINE else None)
+                  for k in ("voiceFailures", "pendingJobs")}
+    prev_stats = dict(VOICE_FAIL_STATS)
+    try:
+        with _tmp78.TemporaryDirectory(prefix="tar-678-") as td:
+            td = Path(td)
+            REC_DIR = td / "rec"
+            DRIVE_PARTS_DIR = REC_DIR / "Drive parts"
+            PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
+            REC_DIR.mkdir(parents=True)
+            FAST_FALLBACK_ENV_OFF = False
+            name = "selftest678-Sun-2026-11-15T18-41-35.ogg"
+            (REC_DIR / name).write_bytes(b"v" * 5000)
+            with PIPELINE_LOCK:
+                PIPELINE["voiceFailures"] = {}
+            # fallback decision
+            has_ff = bool(which_ffmpeg())
+            assert fast_fallback_allowed("better", "demucs exited with code -9") is has_ff
+            assert fast_fallback_allowed("talkonly", "x") is has_ff
+            assert not fast_fallback_allowed("fast", "ffmpeg crashed")
+            assert not fast_fallback_allowed("better", "no finished segments on disk")
+            assert not fast_fallback_allowed("better", "ffmpeg not installed")
+            FAST_FALLBACK_ENV_OFF = True
+            assert not fast_fallback_allowed("better", "demucs exited with code -9")
+            FAST_FALLBACK_ENV_OFF = False
+            # a failure is kept, counted and shown (status doc, text, health)
+            snap = note_voice_failure(name, "selftest678", [name], "demucs exited with code -9", "better",
+                                      fallback="fast-queued")
+            assert snap and snap["base"] == "selftest678-Sun-2026-11-15T18-41-35" and snap["count"] == 1
+            assert voice_failed_count() == 1
+            hs = _pipeline_health_summary()
+            assert hs["voiceFailed"] == 1 and hs["voiceFailures"][0]["name"] == name, hs
+            doc = build_status_doc()
+            d = doc["drive"]
+            assert d["voiceFailed"] == 1 and d["voiceFailures"][0]["fallback"] == "fast-queued"
+            syn = [x for x in d["recentDeliveries"] if x.get("voiceFailed")]
+            assert syn and syn[0]["status"] == "error" and syn[0]["base"] == snap["base"], d["recentDeliveries"]
+            txt = render_status_text(doc)
+            assert "Voice removal FAILED for 1 stream" in txt and "Fast fallback queued" in txt, txt
+            assert txt.count(f"parts {snap['base']}:") == 1, txt  # synthetic row not printed twice
+            # a peer holding Fast parts for this stream sees the failure (v6.74 _peer_delivery_failed)
+            u, st = parse_recording_stamp(name)
+            assert _peer_delivery_failed(doc, "selftest678", st, 4 * 3600)
+            json.dumps(doc)
+            # persisted
+            saved = json.loads(PIPELINE_FILE.read_text(encoding="utf-8"))
+            assert name in saved.get("voiceFailures", {})
+            # the Fast fallback sent parts → resolved, not counted, still shown
+            resolve_voice_failure(name, "fast")
+            assert voice_failed_count() == 0
+            txt = render_status_text(build_status_doc())
+            assert "Fast (ffmpeg) parts sent instead" in txt and "Voice removal FAILED" not in txt, txt
+            assert not [x for x in build_status_doc()["drive"]["recentDeliveries"] if x.get("voiceFailed")]
+            # a second failure (e.g. Fast failed too) re-opens it; a normal success clears it
+            note_voice_failure(name, "selftest678", [name], "ffmpeg crashed", "fast", fallback="fast-failed")
+            assert voice_failed_count() == 1
+            assert "Fast fallback failed too" in render_status_text(build_status_doc())
+            resolve_voice_failure(name, "done")
+            assert voice_failed_count() == 0 and not voice_failures_snapshot()
+            # covered by another computer clears too; prune drops old entries
+            note_voice_failure(name, "selftest678", [name], "x", "better")
+            resolve_voice_failure(name, "covered")
+            assert not voice_failures_snapshot()
+            note_voice_failure(name, "selftest678", [name], "x", "better", now=time.time() - VOICE_FAIL_KEEP_SECS - 10)
+            assert not voice_failures_snapshot()
+            note_voice_failure("other678-Sun-2026-11-15T10-00-00.ogg", "other678", [], "y", None)
+            with PIPELINE_LOCK:
+                assert name not in PIPELINE["voiceFailures"]
+            # API: unknown 404, dismiss, retry with the recording gone → 404
+            assert api_pipeline_voice({"name": "nope.ogg"})[1] == 404
+            assert api_pipeline_voice({"name": "other678-Sun-2026-11-15T10-00-00.ogg", "action": "bogus"})[1] == 400
+            assert api_pipeline_voice({"name": "other678-Sun-2026-11-15T10-00-00.ogg"})[1] == 404  # file gone
+            p, c = api_pipeline_voice({"name": "other678-Sun-2026-11-15T10-00-00.ogg", "action": "dismiss"})
+            assert c == 200 and p["dismissed"] and not voice_failures_snapshot()
+            # pending job keeps the fallback flag across a restart
+            _pending_job_put(name, "selftest678", [name], False, "t", fallback=True)
+            assert _pending_job_field(name, "fastFallback") is True
+            _pending_job_put(name, "selftest678", [name], False, "t")
+            assert _pending_job_field(name, "fastFallback") is True
+            _pending_job_drop(name)
+    finally:
+        REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE, FAST_FALLBACK_ENV_OFF = prev_g
+        VOICE_FAIL_STATS.clear()
+        VOICE_FAIL_STATS.update(prev_stats)
+        with PIPELINE_LOCK:
+            for k, v in prev_p.items():
+                if v is None:
+                    PIPELINE.pop(k, None)
+                else:
+                    PIPELINE[k] = v
 
 
 def _pipeline_retry_snapshot():
@@ -11505,13 +11828,15 @@ PIPELINE_RESUME_MAX_AGE_SECS = int(os.environ.get("TWITCH_RECORDER_PIPELINE_RESU
 PIPELINE_RESUME_DELAY_SECS = float(os.environ.get("TWITCH_RECORDER_PIPELINE_RESUME_DELAY") or 20)
 
 
-def _pending_job_put(first, username, segs, redo, reason):
+def _pending_job_put(first, username, segs, redo, reason, fallback=False):
     with PIPELINE_LOCK:
         pj = PIPELINE.setdefault("pendingJobs", {})
         prev = pj.get(first) if isinstance(pj.get(first), dict) else {}
         pj[first] = {"segments": list(segs), "username": username, "redo": bool(redo),
                      "reason": reason, "queuedAt": prev.get("queuedAt") or time.time(),
                      "attempts": int(prev.get("attempts") or 0) + 1}
+        if fallback or prev.get("fastFallback"):  # v6.78: a restart keeps the Fast fallback
+            pj[first]["fastFallback"] = True
         for k in ("errorRetries", "lastError", "musicMade"):  # v6.61: keep the auto-retry state
             if prev.get(k) is not None:
                 pj[first][k] = prev.get(k)
@@ -11544,8 +11869,10 @@ def resume_pending_pipeline_jobs(now=None):
             dropped.append(first)
             continue
         user = ent.get("username") or ""
+        fb = bool(ent.get("fastFallback"))  # v6.78
         jid, err = start_stream_pipeline(user, on_disk, redo=bool(ent.get("redo")),
-                                         reason="resumed after helper restart")
+                                         reason="resumed after helper restart",
+                                         quality="fast" if fb else None, fallback=fb)
         if jid:
             resumed.append(first)
         else:
@@ -11560,7 +11887,7 @@ def resume_pending_pipeline_jobs(now=None):
     return resumed
 
 
-def start_stream_pipeline(username, segments, redo=False, reason="stream-end"):
+def start_stream_pipeline(username, segments, redo=False, reason="stream-end", quality=None, fallback=False):
     segs = [basename_of(s) for s in (segments or []) if s]
     segs = [s for s in segs if s and not is_music_export_name(s) and not is_seamless_export_name(s)]
     if not segs:
@@ -11574,15 +11901,19 @@ def start_stream_pipeline(username, segments, redo=False, reason="stream-end"):
                 return jid, "already running"
     if not which_ffmpeg():
         return None, "ffmpeg not installed"
-    eff_q, q_note = resolve_voice_quality(None, username=username)  # v6.72: All voices default
+    if quality == "fast" and fallback:  # v6.78: Fast fallback after All voices / Talk only failed
+        eff_q, q_note = "fast", "All voices failed on this computer — Fast (ffmpeg) fallback"
+    else:
+        eff_q, q_note = resolve_voice_quality(None, username=username)  # v6.72: All voices default
     if not eff_q:
         return None, q_note or "voice removal unavailable"
     PIPELINE_SEEN.add(first)
     # name = first segment so History / Auto Music see it as that recording's Music-only job
     jid = _new_job(first, first, "pipeline", pipeline_worker, segments=segs, username=username,
-                   redo=bool(redo), reason=reason, quality=eff_q, qualityNote=q_note)
+                   redo=bool(redo), reason=reason, quality=eff_q, qualityNote=q_note,
+                   fastFallback=bool(fallback))
     try:
-        _pending_job_put(first, username, segs, redo, reason)
+        _pending_job_put(first, username, segs, redo, reason, fallback=bool(fallback))
     except Exception as e:
         log(f"pipeline pending-save failed: {e}")
     log(f"pipeline queued job={jid} user={username} segments={segs} quality={eff_q} ({reason})")
@@ -11612,6 +11943,8 @@ def _on_session_finalized(username, segments, reason="stream-end"):
         jid, err = start_stream_pipeline(username, segs, reason=reason)
         if err and not jid:
             log(f"pipeline not started for {username}: {err}")
+            if err != "already running":  # v6.78: keep it visible (status file / page)
+                note_voice_failure(segs[0], username, segs, f"voice removal did not start: {err}", None)
 
     threading.Thread(target=run, daemon=True, name=f"pipeline-trigger-{username}").start()
 
@@ -14096,6 +14429,8 @@ def build_status_doc(now=None):
     q = music_demucs_queue_info()
     ka = keep_awake_snapshot()
     au = auto_update_snapshot()  # v6.43
+    vfails = voice_failures_snapshot(12, now=now)  # v6.78
+    vfails_open = [v for v in vfails if not v.get("resolved") and not v.get("working")]
     doc = {
         "computer": computer_name(),
         "computerAliases": computer_aliases(),  # v6.75: older names of this same computer
@@ -14144,10 +14479,17 @@ def build_status_doc(now=None):
             "originalsHeld": sum(1 for d in all_origs if d.get("status") == "held"),
             "originalsGone": sum(1 for d in all_origs if d.get("status") == "gone"),  # v6.77
             "markGoneOriginals": mark_gone_originals_enabled(),  # v6.77
+            "voiceFailed": len(vfails_open),  # v6.78
+            "voiceFailures": vfails[:6],  # v6.78
+            "fastFallback": fast_fallback_enabled(),  # v6.78
             "recentDeliveries": [{
                 "base": d.get("base"), "status": d.get("status"), "parts": len(d.get("parts") or []),
                 "sentAt": _iso_local(d.get("sentAt")), "note": _short(d.get("note"), 200),
-                "error": _short(d.get("error"), 300) or None} for d in dels],
+                "error": _short(d.get("error"), 300) or None} for d in dels] + [
+                # v6.78: failed voice removal = a failed part set (Fast peers stop holding for us)
+                {"base": v.get("base"), "status": "error", "parts": 0, "sentAt": None, "note": "",
+                 "error": _short("Voice removal failed: " + str(v.get("error") or ""), 300), "voiceFailed": True}
+                for v in vfails_open if v.get("base") not in {d.get("base") for d in dels}],
             "recentOriginals": [{
                 "name": o.get("name"), "status": o.get("status"),
                 "sentAt": _iso_local(o.get("sentAt")), "note": _short(o.get("note"), 200),
@@ -14306,6 +14648,14 @@ def render_status_text(doc):
     L.append(f"Drive sends: {d.get('partsWaiting', 0)} part sets waiting, {d.get('partsErrors', 0)} failed;"
              f" {d.get('originalsWaiting', 0)} originals waiting, {d.get('originalsErrors', 0)} failed"
              + (f", {d.get('originalsGone')} local file gone (not retried)" if d.get("originalsGone") else ""))
+    if d.get("voiceFailed"):  # v6.78
+        n_vf = int(d.get("voiceFailed") or 0)
+        L.append(f"Voice removal FAILED for {n_vf} stream{'s' if n_vf != 1 else ''} — no music-only parts from "
+                 "this computer for them (Try again in the recorder page's Drive box)")
+    for v in d.get("voiceFailures") or []:
+        if v.get("working") and not v.get("resolved"):
+            continue
+        L.append(voice_failure_line(v))
     if "oneCopyPerStream" in d:  # v6.50
         L.append("One copy per stream: " + (
             "on — this computer skips voice removal / parts when another computer already sent that stream"
@@ -14320,6 +14670,8 @@ def render_status_text(doc):
             vp.get("quality"), str(vp.get("quality"))) + (" — a Fast copy from another computer never blocks it"
                                                         if vp.get("qualityOneCopy") else ""))
     for x in d.get("recentDeliveries") or []:
+        if x.get("voiceFailed"):  # v6.78: already listed above
+            continue
         line = f"  parts {x['base']}: {x['status']}"
         if x.get("sentAt"):
             line += f" at {x['sentAt']}"
@@ -14851,7 +15203,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload, status = api_delete_recordings(body if isinstance(body, dict) else {})
             self.send_json(payload, status=status)
             return
-        if path in ("/api/pipeline/prefs", "/api/pipeline/split", "/api/pipeline/deliver", "/api/pipeline/original"):
+        if path in ("/api/pipeline/prefs", "/api/pipeline/split", "/api/pipeline/deliver", "/api/pipeline/original",
+                    "/api/pipeline/voice"):
             if not origin_allowed(self.headers.get("Origin")):
                 self.send_json({"ok": False, "error": "origin not allowed"}, status=403)
                 return
@@ -14862,6 +15215,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 payload, status = api_pipeline_split(body)
             elif path == "/api/pipeline/original":
                 payload, status = api_pipeline_original(body)
+            elif path == "/api/pipeline/voice":  # v6.78
+                payload, status = api_pipeline_voice(body)
             else:
                 payload, status = api_pipeline_deliver(body)
             self.send_json(payload, status=status)
