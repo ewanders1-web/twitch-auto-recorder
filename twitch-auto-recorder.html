@@ -221,7 +221,7 @@
 <div class="container"><div class="card">
   <div class="header">
     <div><h1>🎙️ Twitch Auto-Recorder</h1><p>GitHub Pages UI + local helper • Multi-streamer • Level meters • Tab-capture fallback</p></div>
-    <span class="badge">v6.78</span>
+    <span class="badge">v6.79</span>
   </div>
   <div class="tabs">
     <button class="tab active" onclick="switchTab(this,'main')">⏺ Recorder</button>
@@ -578,7 +578,7 @@ const LS_KEY = 'twitch-auto-recorder-v4'; // keep v4 key so existing creds / Aut
 const IDB_NAME = 'twitch-auto-recorder-v6';
 const IDB_STORE = 'chunks';
 const HELPER_URL = 'http://127.0.0.1:8765';
-const UI_VERSION = '6.78'; // keep in sync with badge + HELPER_VERSION
+const UI_VERSION = '6.79'; // keep in sync with badge + HELPER_VERSION
 let histSelected=new Set(); // v6.34: multi-select finished helper/disk History names
 let cfg = { clientId:'', clientSecret:'', interval:30, notifyOptIn:false, helperQuality:'audio_only', seamlessRecordings:true, autoMusicOnly:true, drivePipeline:true, driveOriginals:true, keepAwake:true, keepAwakeArmed:false, keepAwakeSchedule:true, statusToDrive:true, autoUpdate:true, streamlinkUpdate:true, soloWatch:true, oneCopy:true, homeStreamer:'', returnHomeAfterSet:true, homeWaitMins:60, homeSwitchDelayMins:2, homeArmIfOff:false, homeBackups:'', homeOnlyGuests:false, driveLastPath:'', driveOutMode:'subfolder', driveKeepSource:false, voiceQuality:'auto' };
 let voiceQualityFromStorage=false; // v6.45
@@ -5647,6 +5647,7 @@ function renderPipelineBox(){
     });
   }
   html+=voiceFailRowsHtml(); // v6.78
+  html+=missingPartsRowsHtml(); // v6.79
   html+=statusFileRowHtml(); // v6.41
   const dl=(ps.deliveries||[]).slice(0,8);
   if(dl.length){
@@ -6425,6 +6426,26 @@ function voiceFailRowsHtml(){
       +'<button class="btn btn-gray btn-sm" onclick="pipelineVoiceAction(\''+nEsc+'\',true)" title="Hide this from the list">Dismiss</button>');
     return '<div class="dp-row"><span>'+driveEsc(v.base||v.name)+'</span> <span class="dp-badge '+cls+'" title="'+driveEsc(tip)+'">'+driveEsc(txt)+'</span>'+btns+'</div>'
       +(!v.resolved&&!v.working&&v.error?'<div class="hint" style="color:#fca5a5;margin:.1rem 0 .3rem">'+driveEsc(v.error)+'</div>':'');
+  }).join('')+'</div>';
+}
+// ─── v6.79: MISSING MUSIC PARTS CHECK ─────
+// The helper looks for streams it recorded that still have no music parts in Drive from ANY computer
+// 4 h after they ended, and makes them itself (computers take turns). Shown here so a gap is visible.
+function missingPartsRowsHtml(){
+  const ps=pipelineStatus||{};
+  const mp=(helper.pipeline&&helper.pipeline.missingParts)||ps.missingParts;
+  if(!mp || !mp.enabled) return '';
+  const now=Date.now();
+  const pend=(Array.isArray(mp.pending)?mp.pending:[]).slice(0,6);
+  const started=(Array.isArray(mp.started)?mp.started:[]).filter(function(x){ return x && x.at && (now/1000-x.at)<86400; }).slice(0,4);
+  if(!pend.length && !started.length) return '';
+  return '<div style="margin-top:.3rem">'+pend.map(function(x){
+    const tip='No music parts in Google Drive from any computer for this stream (ended '+(x.endedAt||'?')+'). '+(x.waiting?('Waiting: '+x.waiting):'');
+    return '<div class="dp-row"><span>'+driveEsc(x.base||'')+'</span> <span class="dp-badge waiting" title="'+driveEsc(tip)+'">'+driveEsc('⚠ No music parts in Drive — this computer makes them')+'</span></div>';
+  }).join('')+started.map(function(x){
+    const ok=x.result==='started';
+    const tip='Missing-parts check started voice removal at '+(x.atIso||'?')+(ok?'':(' — '+(x.result||'')));
+    return '<div class="dp-row"><span>'+driveEsc(x.base||'')+'</span> <span class="dp-badge '+(ok?'sending':'error')+'" title="'+driveEsc(tip)+'">'+driveEsc(ok?'⏳ Making missing music parts…':'⚠ Missing parts — could not start')+'</span></div>';
   }).join('')+'</div>';
 }
 async function pipelineVoiceAction(name, dismiss){

@@ -23,7 +23,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.78"
+HELPER_VERSION = "6.79"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4982,6 +4982,7 @@ def self_test():
     _self_test_v675()  # v6.75
     _self_test_v677()  # v6.77
     _self_test_v678()  # v6.78
+    _self_test_v679()  # v6.79
     _self_test_v672()  # v6.72
     _self_test_v673()  # v6.73
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
@@ -5178,6 +5179,7 @@ def _pipeline_health_summary():
         "voiceFailed": voice_failed_count(),  # v6.78: streams whose voice removal failed (no parts)
         "voiceFailures": voice_failures_snapshot(10),  # v6.78
         "fastFallback": fast_fallback_enabled(),  # v6.78
+        "missingParts": missing_parts_snapshot(),  # v6.79
     }
 
 
@@ -9230,6 +9232,9 @@ def _pipeline_load():
         # v6.78: after-stream voice removal that failed / never started (shown until it works)
         vfd = data.get("voiceFailures") if isinstance(data.get("voiceFailures"), dict) else {}
         PIPELINE["voiceFailures"] = {str(k): v for k, v in vfd.items() if isinstance(v, dict) and v.get("name")}
+        # v6.79: streams the missing-parts check already started here (never started twice)
+        psw = data.get("partsSweep") if isinstance(data.get("partsSweep"), dict) else {}
+        PIPELINE["partsSweep"] = {str(k): v for k, v in psw.items() if isinstance(v, dict)}
     if _migrated_vq and not SELF_TEST_MODE:  # v6.72: persist the Talk only → All voices reset now
         _pipeline_save()
 
@@ -11047,6 +11052,7 @@ def pipeline_status_payload():
         "voiceQuality": voice_quality_snapshot(),  # v6.45
         "oneCopy": one_copy_enabled(),  # v6.50
         "voiceFailures": voice_failures_snapshot(50),  # v6.78
+        "missingParts": missing_parts_snapshot(),  # v6.79
     }
 
 
@@ -11765,6 +11771,549 @@ def _self_test_v678():
         REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE, FAST_FALLBACK_ENV_OFF = prev_g
         VOICE_FAIL_STATS.clear()
         VOICE_FAIL_STATS.update(prev_stats)
+        with PIPELINE_LOCK:
+            for k, v in prev_p.items():
+                if v is None:
+                    PIPELINE.pop(k, None)
+                else:
+                    PIPELINE[k] = v
+
+
+# ─── v6.79: MISSING MUSIC PARTS CHECK — A SAFETY NET ACROSS COMPUTERS ─────────────────────────────
+# Nov 11–17: no helper put a single voice-removed part set into Drive. Every Sent-parts manifest
+# came from ANDERSONSRIG, whose status file stopped on Nov 10 (computer off). Quiques-Mach-1 (Demucs)
+# recorded whistleface Fri/Sat/Sun, dj_sweettooth, sweetdeesauce and lilypita and sent their
+# originals, but never their parts; macbookpro and Silver Bullet recorded most of the same streams
+# and did not send parts either. Each computer only ever looked at its own after-stream job, so a
+# stream nobody delivered just stayed without music. Now every helper (v6.79+) looks, every ~10 min,
+# at the stream recordings in ~/TwitchRecordings that ended 4 h to 3 days ago and that this computer
+# did not already process (no -music file, no Drive send / covered / failed entry, no job queued):
+# if no computer's music parts for that broadcast are in the Drive target (Sent-parts manifests, or
+# part files named after that streamer + day, including hand-made ones), it removes the voice →
+# splits → sends the parts itself, the normal after-stream way (All voices with Demucs, else Fast;
+# the v6.50/v6.74 one-copy checks still run right before sending). Computers that see the same
+# missing stream take turns: each lists it in its status file (missingParts.pending), a Demucs
+# computer goes first, then by name, the next one waits 1 h more; nobody starts while another
+# computer that recorded the stream is still removing voice (up to 12 h). One stream at a time,
+# only when no other voice removal is queued here, never for a streamer whose "remove voice → Drive"
+# is off on this computer, at most once per stream. Env TWITCH_RECORDER_MISSING_PARTS=0 turns it
+# off; TWITCH_RECORDER_MISSING_PARTS_AFTER_SECS (default 14400) / _MAX_AGE_SECS (259200) /
+# _SLOT_SECS (3600) tune it.
+MISSING_PARTS_ENV_OFF = (os.environ.get("TWITCH_RECORDER_MISSING_PARTS") or "").strip().lower() in (
+    "0", "off", "false", "no")
+MISSING_PARTS_AFTER_SECS = _env_secs("TWITCH_RECORDER_MISSING_PARTS_AFTER_SECS", 4 * 3600, 0)
+MISSING_PARTS_MAX_AGE_SECS = _env_secs("TWITCH_RECORDER_MISSING_PARTS_MAX_AGE_SECS", 3 * 86400, 3600)
+MISSING_PARTS_SLOT_SECS = _env_secs("TWITCH_RECORDER_MISSING_PARTS_SLOT_SECS", 3600, 0)
+MISSING_PARTS_TICK_SECS = _env_secs("TWITCH_RECORDER_MISSING_PARTS_TICK_SECS", 600, 5)
+MISSING_PARTS_GAP_SECS = 45 * 60  # segments of one broadcast closer than this = one stream
+MISSING_PARTS_MIN_UPTIME_SECS = 15 * 60  # let resume / crash recovery / the page act first
+MISSING_PARTS_PEER_BUSY_MAX_SECS = 12 * 3600
+MISSING_PARTS_MIN_VERSION = (6, 79)
+MISSING_PARTS_KEEP_SECS = 7 * 86400
+_MISSING_PARTS_EXTS = (".ogg", ".ts", ".mp4", ".m4a", ".mkv", ".webm", ".aac", ".flv", ".opus")
+MISSING_PARTS_STATE = {"lastCheckAt": 0.0, "pending": [], "lastError": None, "started": 0}
+
+
+def missing_parts_enabled():
+    return not MISSING_PARTS_ENV_OFF
+
+
+def _local_stream_groups(now=None):
+    """This computer's finished stream recordings, grouped into broadcasts (segments < 45 min apart)."""
+    now = time.time() if now is None else now
+    by_user = {}
+    try:
+        items = list(REC_DIR.iterdir())
+    except OSError:
+        return []
+    for p in items:
+        nm = p.name
+        if nm.startswith(".") or p.suffix.lower() not in _MISSING_PARTS_EXTS:
+            continue
+        if is_music_export_name(nm) or is_seamless_export_name(nm):
+            continue
+        u, st = parse_recording_stamp(nm)
+        if not u or not st:
+            continue
+        try:
+            s = p.stat()
+            if not p.is_file() or s.st_size <= SCRUB_MAX_BYTES:
+                continue
+        except OSError:
+            continue
+        by_user.setdefault(u.lower(), []).append((float(st), float(s.st_mtime), nm))
+    groups = []
+    for u, files in by_user.items():
+        files.sort()
+        cur = None
+        for st, mt, nm in files:
+            if cur and st - cur["end"] <= MISSING_PARTS_GAP_SECS:
+                cur["segments"].append(nm)
+                cur["end"] = max(cur["end"], mt)
+                continue
+            cur = {"username": u, "segments": [nm], "start": st, "end": max(mt, st)}
+            groups.append(cur)
+    for g in groups:
+        g["durationSecs"] = max(60.0, g["end"] - g["start"])
+        g["base"] = music_base_stem(g["segments"][0])
+    groups.sort(key=lambda g: g["start"])
+    return groups
+
+
+def _group_handled_here(g):
+    """True when this computer already processed / is processing / gave up on this broadcast."""
+    segs = set(g.get("segments") or [])
+    if segs & PIPELINE_SEEN:
+        return True
+    bases = {music_base_stem(s) for s in segs}
+    with PIPELINE_LOCK:
+        if segs & set((PIPELINE.get("pendingJobs") or {}).keys()):
+            return True
+        if segs & set((PIPELINE.get("partsSweep") or {}).keys()):
+            return True
+        if bases & set((PIPELINE.get("deliveries") or {}).keys()):
+            return True
+        for v in (PIPELINE.get("voiceFailures") or {}).values():
+            if isinstance(v, dict) and (v.get("name") in segs or segs & set(v.get("segments") or [])):
+                return True
+    with MUSIC_JOBS_LOCK:
+        for j in MUSIC_JOBS.values():
+            if j.get("name") in segs or segs & set(j.get("segments") or []):
+                return True
+    for s in segs:
+        if find_existing_sibling(s, "music"):
+            return True
+    return False
+
+
+def _part_name_prefixes(user, start):
+    """Lower-case Drive name prefixes a music part set of this broadcast may have (local + UTC day)."""
+    out = set()
+    u = str(user or "").lower()
+    lt = time.localtime(start)
+    out.add(f"{u}-{time.strftime('%Y-%m-%d', lt)}-{_WEEKDAYS_EN[lt.tm_wday]}".lower())  # v6.67 (+ "Hybrid")
+    for tm in (lt, time.gmtime(start)):  # whistleface_20261114-161033-music-part1of3 (UTC or local)
+        out.add(f"{u}_{time.strftime('%Y%m%d', tm)}-")
+    return out
+
+
+def drive_music_parts_for(target, user, start, duration, names=None):
+    """('sent'|'sending'|'named', who) when music parts for this broadcast are (being) put in Drive by
+    any computer or by hand; (None, None) when Drive has none."""
+    kind, doc = find_other_copy(target, user, start, duration)
+    if kind:
+        return kind, doc.get("computer")
+    pres = _part_name_prefixes(user, start)
+    if names is None:
+        try:
+            names = [p.name for p in Path(target).iterdir()]
+        except OSError:
+            names = []
+    owners = None
+    for nm in names:
+        low = str(nm).lower()
+        if "part" not in low or not any(low.startswith(px) for px in pres):
+            continue
+        if owners is None:
+            owners = {}
+            for d in _read_sent_manifests(target):
+                for p in d.get("parts") or []:
+                    if isinstance(p, dict) and p.get("name"):
+                        owners.setdefault(str(p["name"]).lower(), []).append(d)
+        docs = owners.get(low) or []
+        if docs and not any(_manifest_same_broadcast(d, user, start, duration) for d in docs):
+            continue  # that name belongs to another broadcast the same day
+        return "named", nm
+    return None, None
+
+
+def _manifest_same_broadcast(doc, user, start, duration):
+    try:
+        o_start, o_dur = float(doc.get("startEpoch")), float(doc.get("durationSecs") or 0)
+    except (TypeError, ValueError):
+        return False
+    if str(doc.get("username") or "").lower() != str(user).lower():
+        return False
+    a_end, b_end = start + max(duration, 60.0), o_start + max(o_dur, 60.0)
+    return min(a_end, b_end) - max(start, o_start) >= 0.5 * min(a_end - start, b_end - o_start)
+
+
+def _my_parts_rank_key(user):
+    q = resolve_voice_quality(None, username=user)[0]
+    return (-_voice_rank(q), computer_name().lower())
+
+
+def _peer_missing_parts_view(target, user, start, duration, now=None):
+    """(peers ahead of us in line for this broadcast, name of a peer still removing voice for it)."""
+    now = time.time() if now is None else now
+    mine = my_computer_names()
+    me_key = _my_parts_rank_key(user)
+    ahead, busy = 0, None
+    try:
+        folder = Path(target) / STATUS_SUBDIR
+        paths = sorted(folder.glob("*.json"))
+    except OSError:
+        return 0, None
+    for p in paths:
+        if p.name.startswith("."):
+            continue
+        try:
+            doc = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        comp = str(doc.get("computer") or "")
+        if not comp or comp.lower() in mine:
+            continue
+        try:
+            if now - float(doc.get("updatedAtEpoch") or 0) >= ORIGINAL_PEER_FRESH_SECS:
+                continue
+        except (TypeError, ValueError):
+            continue
+        vr = doc.get("voiceRemoval") or {}
+        if int(vr.get("running") or 0) > 0 and _peer_has_stream(doc, user, start, duration):
+            busy = busy or comp
+        if _parse_version_tuple(str(doc.get("helperVersion") or "0")) < MISSING_PARTS_MIN_VERSION:
+            continue
+        mp = doc.get("missingParts") or {}
+        if not isinstance(mp, dict) or not mp.get("enabled"):
+            continue
+        for x in mp.get("started") or []:  # it already started voice removal for this broadcast
+            if (isinstance(x, dict) and x.get("result") == "started"
+                    and now - float(x.get("at") or 0) < MISSING_PARTS_PEER_BUSY_MAX_SECS
+                    and _manifest_same_broadcast(x, user, start, duration)):
+                busy = busy or comp
+        same = False
+        for x in mp.get("pending") or []:
+            if not isinstance(x, dict) or str(x.get("username") or "").lower() != str(user).lower():
+                continue
+            if _manifest_same_broadcast({"username": x.get("username"), "startEpoch": x.get("startEpoch"),
+                                         "durationSecs": x.get("durationSecs")}, user, start, duration):
+                same = True
+                break
+        if not same:
+            continue
+        q = (doc.get("voiceParts") or {}).get("perUser", {}).get(str(user).lower()) or \
+            (doc.get("voiceParts") or {}).get("quality")
+        if (-_voice_rank(q), comp.lower()) < me_key:
+            ahead += 1
+    return ahead, busy
+
+
+def _pipeline_jobs_busy():
+    with MUSIC_JOBS_LOCK:
+        return any((j.get("status") or "") in ("queued", "running") and j.get("source") == "pipeline"
+                   for j in MUSIC_JOBS.values())
+
+
+def _parts_sweep_prune_locked(now):
+    ps = PIPELINE.setdefault("partsSweep", {})
+    for k in [k for k, v in ps.items()
+              if not isinstance(v, dict) or now - float(v.get("at") or 0) > MISSING_PARTS_KEEP_SECS]:
+        ps.pop(k, None)
+    return ps
+
+
+def missing_parts_tick(now=None, uptime=None, start_fn=None, target=None):
+    """One check. Returns {pending, started}. Starts at most one stream's voice removal."""
+    now = time.time() if now is None else now
+    uptime = (now - HELPER_STARTED_AT) if uptime is None else uptime
+    out = {"pending": [], "started": None, "skipped": None}
+    if MISSING_PARTS_STATE.get("pending"):  # an early return below leaves nothing stale behind
+        MISSING_PARTS_STATE["pending"] = []
+    if not missing_parts_enabled():
+        out["skipped"] = "off"
+        return out
+    if uptime < MISSING_PARTS_MIN_UPTIME_SECS:
+        out["skipped"] = "starting up"
+        return out
+    with PIPELINE_LOCK:
+        if not PIPELINE.get("enabled", True):
+            out["skipped"] = "auto-send off"
+            return out
+    if target is None:
+        roots = detect_drive_roots()
+        if not roots:
+            out["skipped"] = "no Drive"
+            return out
+        target, _k, err = resolve_delivery_target(roots, create=False)
+        if err or not target:
+            out["skipped"] = "no Drive target"
+            return out
+    try:
+        drive_names = [p.name for p in Path(target).iterdir()]
+    except OSError as e:
+        out["skipped"] = f"cannot list Drive target: {e}"
+        return out
+    with LOCK:
+        active = set(ACTIVE.keys())
+    with ORPHAN_LOCK:
+        orphan = set(ORPHAN_SESSIONS.keys())
+    busy_here = _pipeline_jobs_busy()
+    start_fn = start_fn or start_stream_pipeline
+    for g in _local_stream_groups(now):
+        u = g["username"]
+        age = now - g["end"]
+        if age < MISSING_PARTS_AFTER_SECS or age > MISSING_PARTS_MAX_AGE_SECS:
+            continue
+        if u in active or u in orphan or not pipeline_enabled_for(u):
+            continue
+        if _group_handled_here(g):
+            continue
+        kind, _who = drive_music_parts_for(target, u, g["start"], g["durationSecs"], names=drive_names)
+        if kind:
+            continue
+        ahead, busy_peer = _peer_missing_parts_view(target, u, g["start"], g["durationSecs"], now)
+        due = g["end"] + MISSING_PARTS_AFTER_SECS + ahead * MISSING_PARTS_SLOT_SECS
+        wait = None
+        if busy_peer and now < g["end"] + MISSING_PARTS_PEER_BUSY_MAX_SECS:
+            wait = f"{busy_peer} is still removing voice"
+        elif now < due:
+            wait = f"{ahead} computer(s) ahead — this one starts at {_fmt_clock(due)}"
+        elif busy_here or out["started"]:
+            wait = "after the voice removal running here"
+        ent = {"base": g["base"], "username": u, "startEpoch": g["start"],
+               "durationSecs": round(g["durationSecs"], 1), "endedAt": _iso_local(g["end"]),
+               "segments": list(g["segments"]), "dueAt": _iso_local(due), "waiting": wait}
+        if wait:
+            out["pending"].append(ent)
+            continue
+        first = g["segments"][0]
+        hrs = age / 3600.0
+        with PIPELINE_LOCK:
+            _parts_sweep_prune_locked(now)[first] = {
+                "name": first, "base": g["base"], "username": u, "segments": list(g["segments"]),
+                "startEpoch": g["start"], "durationSecs": round(g["durationSecs"], 1),
+                "at": now, "atIso": _iso_local(now), "endedAt": _iso_local(g["end"]), "jobId": None,
+                "result": "started"}
+        try:
+            jid, err = start_fn(u, list(g["segments"]),
+                                reason=f"missing-parts check — no music parts in Drive {hrs:.0f} h after the stream")
+        except Exception as e:
+            jid, err = None, str(e)
+        with PIPELINE_LOCK:
+            rec = (PIPELINE.get("partsSweep") or {}).get(first) or {}
+            rec.update(jobId=jid, result="started" if jid else f"not started: {err}")
+        _pipeline_save()
+        if jid:
+            MISSING_PARTS_STATE["started"] = int(MISSING_PARTS_STATE.get("started") or 0) + 1
+            log(f"missing-parts check: {g['base']} has no music parts in Drive {hrs:.1f} h after the stream "
+                f"— removing voice here (job={jid})")
+            out["started"] = dict(ent, jobId=jid)
+            busy_here = True
+        else:
+            log(f"missing-parts check: could not start {g['base']}: {err}")
+            if err != "already running":
+                note_voice_failure(first, u, g["segments"], f"missing-parts check could not start voice removal: {err}", None)
+    MISSING_PARTS_STATE.update(lastCheckAt=now, pending=out["pending"][:12], lastError=None)
+    STATUS_FILE_WAKE.set()
+    return out
+
+
+def missing_parts_loop():
+    time.sleep(max(5.0, MISSING_PARTS_MIN_UPTIME_SECS))
+    while True:
+        try:
+            missing_parts_tick()
+        except Exception as e:
+            MISSING_PARTS_STATE["lastError"] = str(e)[:240]
+            log(f"missing-parts check failed: {e}")
+        time.sleep(MISSING_PARTS_TICK_SECS)
+
+
+def missing_parts_snapshot(now=None):
+    now = time.time() if now is None else now
+    with PIPELINE_LOCK:
+        started = [dict(v) for v in (PIPELINE.get("partsSweep") or {}).values()
+                   if isinstance(v, dict) and now - float(v.get("at") or 0) <= MISSING_PARTS_KEEP_SECS]
+    started.sort(key=lambda v: float(v.get("at") or 0), reverse=True)
+    pend = [{k: x.get(k) for k in ("base", "username", "startEpoch", "durationSecs", "endedAt", "dueAt", "waiting")}
+            for x in (MISSING_PARTS_STATE.get("pending") or [])]
+    return {"enabled": missing_parts_enabled(), "afterSecs": MISSING_PARTS_AFTER_SECS,
+            "lastCheckAt": _iso_local(MISSING_PARTS_STATE.get("lastCheckAt")) if MISSING_PARTS_STATE.get("lastCheckAt") else None,
+            "pending": pend[:12],
+            "started": [{k: v.get(k) for k in ("base", "username", "startEpoch", "durationSecs", "at", "atIso",
+                                               "endedAt", "jobId", "result")}
+                        for v in started[:8]],
+            "lastError": MISSING_PARTS_STATE.get("lastError")}
+
+
+def missing_parts_lines(mp):
+    """Status-file lines (empty when there is nothing to say)."""
+    if not isinstance(mp, dict) or not mp.get("enabled"):
+        return []
+    L = []
+    pend, started = mp.get("pending") or [], mp.get("started") or []
+    if pend:
+        L.append(f"Music parts MISSING in Drive for {len(pend)} stream{'s' if len(pend) != 1 else ''} this computer "
+                 f"recorded (no computer sent them {float(mp.get('afterSecs') or 0) / 3600:.0f} h+ after the stream) "
+                 "— this computer makes them itself when it is its turn:")
+        for x in pend[:6]:
+            L.append(f"  parts {x.get('base')}: missing — waiting ({x.get('waiting')})")
+    for x in [x for x in started if time.time() - float(x.get("at") or 0) < 86400][:4]:
+        L.append(f"  parts {x.get('base')}: missing-parts check started voice removal at {x.get('atIso')}"
+                 + ("" if x.get("result") == "started" else f" — {x.get('result')}"))
+    return L
+
+
+def _self_test_v679():
+    """v6.79: missing-parts check — finds this computer's streams with no music parts anywhere in
+    Drive, takes turns with peers, starts one voice removal, never twice, respects every guard."""
+    import tempfile as _tmp79
+    global REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE, MISSING_PARTS_ENV_OFF
+    prev_g = (REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE, MISSING_PARTS_ENV_OFF)
+    keys = ("deliveries", "partsSweep", "voiceFailures", "pendingJobs", "enabled", "users")
+    with PIPELINE_LOCK:
+        prev_p = {k: (json.loads(json.dumps(PIPELINE.get(k))) if k in PIPELINE else None) for k in keys}
+    prev_state = json.loads(json.dumps(MISSING_PARTS_STATE))
+    prev_seen = set(PIPELINE_SEEN)
+    try:
+        with _tmp79.TemporaryDirectory(prefix="tar-679-") as td:
+            td = Path(td)
+            REC_DIR = td / "rec"
+            DRIVE_PARTS_DIR = REC_DIR / "Drive parts"
+            PIPELINE_FILE = REC_DIR / ".drive-pipeline.json"
+            target = td / "My Drive" / "Twitch"
+            (target / STATUS_SUBDIR).mkdir(parents=True)
+            REC_DIR.mkdir(parents=True)
+            MISSING_PARTS_ENV_OFF = False
+            with PIPELINE_LOCK:
+                PIPELINE.update(deliveries={}, partsSweep={}, voiceFailures={}, pendingJobs={}, enabled=True, users={})
+            now = time.time()
+
+            def rec_name(user, st):
+                lt = time.localtime(st)
+                return f"{user}-{_WEEKDAYS_EN[lt.tm_wday]}-{time.strftime('%Y-%m-%dT%H-%M-%S', lt)}.ogg"
+
+            def put(user, st, end):
+                nm = rec_name(user, st)
+                (REC_DIR / nm).write_bytes(b"r" * 20000)
+                os.utime(REC_DIR / nm, (end, end))
+                return nm
+
+            s1 = now - 9 * 3600
+            a1 = put("selftest679", s1, s1 + 2 * 3600)  # first segment
+            a2 = put("selftest679", s1 + 2 * 3600 + 600, now - 4.5 * 3600)  # restart 10 min later → same stream
+            young = put("young679", now - 3 * 3600, now - 1800)  # ended 30 min ago → not yet
+            old = put("old679", now - 5 * 86400, now - 5 * 86400 + 3600)  # too old
+            (REC_DIR / "selftest679-x-music.ogg").write_bytes(b"m" * 20000)  # not a recording
+            groups = _local_stream_groups(now)
+            g = [x for x in groups if x["username"] == "selftest679"]
+            assert len(g) == 1 and g[0]["segments"] == [a1, a2], groups
+            assert g[0]["base"] == Path(a1).stem
+            calls = []
+
+            def fake_start(u, segs, reason=""):
+                calls.append((u, list(segs), reason))
+                return f"job{len(calls)}", None
+
+            # guards: env off, starting up
+            MISSING_PARTS_ENV_OFF = True
+            assert missing_parts_tick(now, uptime=10 ** 6, start_fn=fake_start, target=str(target))["skipped"] == "off"
+            MISSING_PARTS_ENV_OFF = False
+            assert missing_parts_tick(now, uptime=60, start_fn=fake_start, target=str(target))["skipped"] == "starting up"
+            assert not calls
+            # "remove voice → Drive" off for this streamer → leave it alone
+            set_pipeline_user_pref("selftest679", False)
+            r = missing_parts_tick(now, uptime=10 ** 6, start_fn=fake_start, target=str(target))
+            assert not calls and not r["pending"], r
+            set_pipeline_user_pref("selftest679", True)
+            # Drive already has parts named after that streamer + day (any computer / by hand) → covered
+            pre = pretty_part_prefix(Path(a1).stem)
+            hand = target / f"{pre} - Hybrid Part 1 of 2.ogg"
+            hand.write_bytes(b"p" * 100)
+            r = missing_parts_tick(now, uptime=10 ** 6, start_fn=fake_start, target=str(target))
+            assert not calls and not r["pending"], r
+            hand.unlink()
+            # ...but a same-day set that a manifest says is ANOTHER broadcast does not count
+            other = target / f"{pre}-part 1 of 1.ogg"
+            other.write_bytes(b"p" * 100)
+            write_sent_manifest(str(target), "selftest679-Xxx-other", "sent",
+                                parts=[{"name": other.name, "size": 100}], duration=1800,
+                                user="selftest679", start=s1 - 6 * 3600, quality="better")
+            mpath = target / STATUS_SUBDIR / SENT_MANIFEST_SUBDIR / f"selftest679-Xxx-other__{computer_name()}.json"
+            mdoc = json.loads(mpath.read_text(encoding="utf-8"))
+            mdoc["computer"] = "otherbox679"
+            mpath.write_text(json.dumps(mdoc), encoding="utf-8")
+            assert drive_music_parts_for(str(target), "selftest679", g[0]["start"], g[0]["durationSecs"]) == (None, None)
+            # a peer (v6.79, All voices) that lists the same stream as pending and is ahead in line → wait
+            peer = {"computer": "000peer679", "updatedAtEpoch": int(now), "helperVersion": "6.79",
+                    "voiceParts": {"quality": "better", "perUser": {}}, "voiceRemoval": {"running": 0},
+                    "missingParts": {"enabled": True, "pending": [{"username": "selftest679", "startEpoch": g[0]["start"],
+                                                                     "durationSecs": g[0]["durationSecs"]}],
+                                     "started": []}}
+            ppath = target / STATUS_SUBDIR / "000peer679.json"
+            ppath.write_text(json.dumps(peer), encoding="utf-8")
+            r = missing_parts_tick(now, uptime=10 ** 6, start_fn=fake_start, target=str(target))
+            assert not calls and len(r["pending"]) == 1 and "ahead" in (r["pending"][0]["waiting"] or ""), r
+            snap = missing_parts_snapshot(now)
+            assert snap["pending"][0]["base"] == g[0]["base"]
+            doc = build_status_doc()
+            assert doc["missingParts"]["pending"], doc.get("missingParts")
+            txt = render_status_text(doc)
+            assert "Music parts MISSING in Drive for 1 stream" in txt and f"parts {g[0]['base']}: missing" in txt, txt
+            json.dumps(doc)
+            # its turn comes one slot later
+            r = missing_parts_tick(g[0]["end"] + MISSING_PARTS_AFTER_SECS + MISSING_PARTS_SLOT_SECS + 5,
+                                   uptime=10 ** 6, start_fn=fake_start, target=str(target))
+            assert len(calls) == 1 and calls[0][1] == [a1, a2], calls  # one slot (1 h) after the peer ahead
+            calls.clear()
+            with PIPELINE_LOCK:
+                PIPELINE["partsSweep"] = {}
+            # a peer that already started it (or is still removing voice for it) → wait
+            peer["missingParts"] = {"enabled": True, "pending": [],
+                                    "started": [{"username": "selftest679", "startEpoch": g[0]["start"],
+                                                 "durationSecs": g[0]["durationSecs"], "at": now - 60, "result": "started"}]}
+            ppath.write_text(json.dumps(peer), encoding="utf-8")
+            r = missing_parts_tick(now, uptime=10 ** 6, start_fn=fake_start, target=str(target))
+            assert not calls and "still removing voice" in (r["pending"][0]["waiting"] or ""), r
+            peer["missingParts"] = {"enabled": True, "pending": [], "started": []}
+            peer["voiceRemoval"] = {"running": 1}
+            peer["recentRecordings"] = [{"name": rec_name("selftest679", s1 + 30)}]
+            ppath.write_text(json.dumps(peer), encoding="utf-8")
+            r = missing_parts_tick(now, uptime=10 ** 6, start_fn=fake_start, target=str(target))
+            assert not calls and r["pending"], r
+            ppath.unlink()
+            # nobody has it → start it here, exactly once, both segments, nothing else
+            r = missing_parts_tick(now, uptime=10 ** 6, start_fn=fake_start, target=str(target))
+            assert len(calls) == 1 and calls[0][0] == "selftest679" and calls[0][1] == [a1, a2], calls
+            assert "missing-parts check" in calls[0][2] and r["started"]["jobId"] == "job1"
+            assert not any(c[0] in ("young679", "old679") for c in calls)
+            r = missing_parts_tick(now + 700, uptime=10 ** 6, start_fn=fake_start, target=str(target))
+            assert len(calls) == 1, calls  # never twice
+            saved = json.loads(PIPELINE_FILE.read_text(encoding="utf-8"))
+            assert a1 in saved.get("partsSweep", {})
+            snap = missing_parts_snapshot(now)
+            assert snap["started"][0]["base"] == g[0]["base"] and snap["started"][0]["result"] == "started"
+            assert "missing-parts check started voice removal" in "\n".join(missing_parts_lines(snap))
+            # handled here already (a -music file / a delivery entry) → never picked up
+            with PIPELINE_LOCK:
+                PIPELINE["partsSweep"] = {}
+            (REC_DIR / f"{Path(a1).stem}-music.ogg").write_bytes(b"m" * 20000)
+            r = missing_parts_tick(now, uptime=10 ** 6, start_fn=fake_start, target=str(target))
+            assert len(calls) == 1 and not r["pending"], r
+            (REC_DIR / f"{Path(a1).stem}-music.ogg").unlink()
+            with PIPELINE_LOCK:
+                PIPELINE["deliveries"] = {Path(a1).stem: {"base": Path(a1).stem, "status": "covered"}}
+            r = missing_parts_tick(now, uptime=10 ** 6, start_fn=fake_start, target=str(target))
+            assert len(calls) == 1 and not r["pending"], r
+            # a start that fails is kept visible (v6.78 failure list)
+            with PIPELINE_LOCK:
+                PIPELINE["deliveries"] = {}
+
+            def bad_start(u, segs, reason=""):
+                return None, "ffmpeg not installed"
+            missing_parts_tick(now, uptime=10 ** 6, start_fn=bad_start, target=str(target))
+            assert any(v["name"] == a1 for v in voice_failures_snapshot()), voice_failures_snapshot()
+            assert "missingParts" in _pipeline_health_summary()
+            assert not missing_parts_lines({"enabled": False, "pending": [{"base": "x"}]})
+    finally:
+        REC_DIR, DRIVE_PARTS_DIR, PIPELINE_FILE, MISSING_PARTS_ENV_OFF = prev_g
+        MISSING_PARTS_STATE.clear()
+        MISSING_PARTS_STATE.update(prev_state)
+        PIPELINE_SEEN.clear()
+        PIPELINE_SEEN.update(prev_seen)
         with PIPELINE_LOCK:
             for k, v in prev_p.items():
                 if v is None:
@@ -14461,6 +15010,7 @@ def build_status_doc(now=None):
         "lastErrors": {u: _short(e) for u, e in last_errors.items()},
         "voiceRemoval": {"running": int(q.get("running") or 0), "waiting": int(q.get("waiting") or 0)},
         "voiceParts": voice_parts_snapshot(),  # v6.74: other computers read this (Fast vs All voices)
+        "missingParts": missing_parts_snapshot(now),  # v6.79: other computers read pending/started (take turns)
         "drive": {
             "found": bool(roots),
             "target": target,
@@ -14656,6 +15206,7 @@ def render_status_text(doc):
         if v.get("working") and not v.get("resolved"):
             continue
         L.append(voice_failure_line(v))
+    L.extend(missing_parts_lines(doc.get("missingParts")))  # v6.79
     if "oneCopyPerStream" in d:  # v6.50
         L.append("One copy per stream: " + (
             "on — this computer skips voice removal / parts when another computer already sent that stream"
@@ -17181,6 +17732,10 @@ def main():
             threading.Thread(target=orphan_recovery_loop, daemon=True, name="orphan-recovery").start()
     except Exception as e:
         log(f"recover load failed: {e}")
+
+    # v6.79: streams nobody sent music parts for → make them here (safety net across computers)
+    if missing_parts_enabled():
+        threading.Thread(target=missing_parts_loop, daemon=True, name="missing-parts").start()
 
     # v6.44: re-queue voice-removal/split jobs a crash/reboot/restart interrupted
     def _resume_later():
