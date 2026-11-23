@@ -23,7 +23,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("TWITCH_RECORDER_PORT") or 8765)  # v6.35: env override for tests
-HELPER_VERSION = "6.79"
+HELPER_VERSION = "6.80"
 REC_DIR = Path(
     os.environ.get("TWITCH_RECORDER_REC_DIR") or (Path.home() / "TwitchRecordings")
 ).expanduser()  # v6.35: env override for tests
@@ -4983,6 +4983,7 @@ def self_test():
     _self_test_v677()  # v6.77
     _self_test_v678()  # v6.78
     _self_test_v679()  # v6.79
+    _self_test_v680()  # v6.80
     _self_test_v672()  # v6.72
     _self_test_v673()  # v6.73
     print(json.dumps({"selfTest": "ok", "version": HELPER_VERSION}))
@@ -7238,11 +7239,83 @@ def _which_ffprobe():
     return shutil.which("ffprobe") or shutil.which("ffprobe.exe")
 
 
+# v6.80: ffprobe is optional. Some computers have a lone ffmpeg binary (Quiques-Mach-1:
+# ~/bin/ffmpeg with no ffprobe next to it), so every after-stream voice removal failed with
+# "ffprobe not found (install ffmpeg)" (6 streams Nov 17–20, no music parts sent). When ffprobe is
+# missing, the same facts are read from `ffmpeg -i` (container, audio codec, channels, duration;
+# a file with no Duration header is decoded once to find its length).
+_RE_FFI_DUR = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+_RE_FFI_INPUT = re.compile(r"Input #0,\s*([^\s]+?),?\s+from")
+_RE_FFI_AUDIO = re.compile(r"Stream #0:\d+[^:]*:\s*Audio:\s*([A-Za-z0-9_]+)([^\n]*)")
+_RE_FFI_TIME = re.compile(r"time=\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+
+def _ffmpeg_info_text(path, timeout=180):
+    ff = which_ffmpeg()
+    if not ff:
+        raise RuntimeError("ffmpeg not found (install ffmpeg)")
+    r = subprocess.run([ff, "-nostdin", "-hide_banner", "-i", str(path)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    return ff, (r.stderr or "")
+
+
+def _parse_ffmpeg_info(txt):
+    """Parse `ffmpeg -i` stderr → {duration, container, audioCodec, channels} (audioCodec None = no audio)."""
+    dur = 0.0
+    m = _RE_FFI_DUR.search(txt or "")
+    if m:
+        dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    m = _RE_FFI_INPUT.search(txt or "")
+    container = m.group(1).rstrip(",") if m else "?"
+    m = _RE_FFI_AUDIO.search(txt or "")
+    codec, ch = (None, 0)
+    if m:
+        codec = m.group(1)
+        rest = m.group(2).lower()
+        if " mono" in rest or ",mono" in rest:
+            ch = 1
+        elif "stereo" in rest:
+            ch = 2
+        else:
+            mc = re.search(r"(\d+)\s*channels", rest) or re.search(r"\b(\d)\.(\d)\b", rest)
+            if mc:
+                ch = int(mc.group(1)) + (int(mc.group(2)) if mc.lastindex and mc.lastindex > 1 else 0)
+    return {"duration": dur, "container": container, "audioCodec": codec, "channels": ch}
+
+
+def _ffmpeg_decode_secs(ff, path, timeout=1800):
+    """Length by decoding (files whose header has no Duration). 0.0 if unknown."""
+    try:
+        r = subprocess.run([ff, "-nostdin", "-hide_banner", "-i", str(path), "-vn", "-f", "null", "-"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0.0
+    hits = _RE_FFI_TIME.findall(r.stderr or "")
+    if not hits:
+        return 0.0
+    h, mi, se = hits[-1]
+    return int(h) * 3600 + int(mi) * 60 + float(se)
+
+
+def probe_media_ffmpeg(path):
+    """probe_media without ffprobe (v6.80)."""
+    ff, txt = _ffmpeg_info_text(path)
+    info = _parse_ffmpeg_info(txt)
+    if not info["audioCodec"]:
+        tail = txt.strip()[-300:]
+        raise RuntimeError("ffmpeg found no audio stream in this file" + (f" ({tail})" if tail else ""))
+    if not info["duration"]:
+        info["duration"] = _ffmpeg_decode_secs(ff, path)
+    return {"duration": info["duration"], "container": info["container"] or "?",
+            "audioCodec": info["audioCodec"] or "?"}
+
+
 def probe_media(path):
-    """ffprobe by content (never trusts the extension). Returns dict or raises."""
+    """ffprobe by content (never trusts the extension). Returns dict or raises.
+    v6.80: falls back to `ffmpeg -i` when ffprobe is not installed."""
     fp = _which_ffprobe()
     if not fp:
-        raise RuntimeError("ffprobe not found (install ffmpeg)")
+        return probe_media_ffmpeg(path)
     r = subprocess.run(
         [fp, "-v", "error", "-show_entries",
          "format=duration,format_name:stream=codec_type,codec_name",
@@ -8490,8 +8563,11 @@ def is_voice_removed_name(name):
 
 def _audio_channels(path):
     fp = _which_ffprobe()
-    if not fp:
-        return 0
+    if not fp:  # v6.80: ffmpeg-only computers
+        try:
+            return int(_parse_ffmpeg_info(_ffmpeg_info_text(path, timeout=120)[1])["channels"] or 0)
+        except Exception:
+            return 0
     try:
         r = subprocess.run(
             [fp, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=channels",
@@ -11679,6 +11755,90 @@ def api_pipeline_voice(body):
         return {"ok": False, "error": err or "could not start"}, 409
     return {"ok": True, "jobId": jid, "name": name,
             "already": err == "already running"}, 200
+
+
+# v6.80: streams whose voice removal failed only because ffprobe was missing are tried again by
+# themselves once ffmpeg-only probing works (~2 min after the helper starts, one call each, once).
+FFPROBE_RETRY_DELAY_SECS = _env_secs("TWITCH_RECORDER_FFPROBE_RETRY_DELAY_SECS", 120, 0)
+
+
+def ffprobe_failures_to_retry():
+    with PIPELINE_LOCK:
+        vf = dict(PIPELINE.get("voiceFailures") or {})
+    out = []
+    for name, ent in vf.items():
+        if not isinstance(ent, dict) or ent.get("resolved") or ent.get("ffprobeRetried"):
+            continue
+        if "ffprobe not found" in str(ent.get("error") or "").lower():
+            out.append(name)
+    return out
+
+
+def retry_ffprobe_failures():
+    """Re-queue failed streams whose only problem was the missing ffprobe. Returns names started."""
+    if not which_ffmpeg():
+        return []
+    started = []
+    for name in ffprobe_failures_to_retry():
+        with PIPELINE_LOCK:
+            ent = (PIPELINE.get("voiceFailures") or {}).get(name)
+            if isinstance(ent, dict):
+                ent["ffprobeRetried"] = time.time()
+        _pipeline_save()
+        try:
+            res, code = api_pipeline_voice({"name": name, "action": "retry"})
+        except Exception as e:
+            res, code = {"error": str(e)}, 500
+        if code == 200:
+            started.append(name)
+            log(f"v6.80: voice removal re-queued for {name} (was: ffprobe not found)")
+        else:
+            log(f"v6.80: could not re-queue {name}: {res.get('error')}")
+    return started
+
+
+def _ffprobe_retry_later():
+    time.sleep(FFPROBE_RETRY_DELAY_SECS)
+    try:
+        retry_ffprobe_failures()
+    except Exception as e:
+        log(f"ffprobe-failure retry failed: {e}")
+
+
+def _self_test_v680():
+    """v6.80: ffmpeg -i parsing replaces ffprobe; ffprobe-only failures are picked for one retry."""
+    sample = (
+        "Input #0, ogg, from '/Users/x/TwitchRecordings/a.ogg':\n"
+        "  Duration: 03:58:12.48, start: 0.000000, bitrate: 160 kb/s\n"
+        "  Stream #0:0: Audio: opus, 48000 Hz, stereo, fltp\n"
+        "At least one output file must be specified\n")
+    i = _parse_ffmpeg_info(sample)
+    assert abs(i["duration"] - (3 * 3600 + 58 * 60 + 12.48)) < 0.01, i
+    assert i["container"] == "ogg" and i["audioCodec"] == "opus" and i["channels"] == 2, i
+    i = _parse_ffmpeg_info("Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'b.m4a':\n  Duration: N/A, bitrate: N/A\n"
+                           "  Stream #0:0[0x1](und): Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, mono, fltp\n")
+    assert i["duration"] == 0.0 and i["audioCodec"] == "aac" and i["channels"] == 1, i
+    assert i["container"].startswith("mov"), i
+    i = _parse_ffmpeg_info("Input #0, wav, from 'c.wav':\n  Duration: 00:00:01.00\n"
+                           "  Stream #0:0: Audio: pcm_s16le ([1][0][0][0] / 0x0001), 44100 Hz, 5.1, s16\n")
+    assert i["channels"] == 6 and i["audioCodec"] == "pcm_s16le", i
+    assert _parse_ffmpeg_info("Input #0, png_pipe, from 'x.png':\n  Stream #0:0: Video: png\n")["audioCodec"] is None
+    with PIPELINE_LOCK:
+        prev = json.loads(json.dumps(PIPELINE.get("voiceFailures"))) if "voiceFailures" in PIPELINE else None
+        PIPELINE["voiceFailures"] = {
+            "a.ogg": {"name": "a.ogg", "error": "ffprobe not found (install ffmpeg) (failed 3 times)"},
+            "b.ogg": {"name": "b.ogg", "error": "demucs crashed"},
+            "c.ogg": {"name": "c.ogg", "error": "ffprobe not found", "ffprobeRetried": 1.0},
+            "d.ogg": {"name": "d.ogg", "error": "ffprobe not found", "resolved": "fast"},
+        }
+    try:
+        assert ffprobe_failures_to_retry() == ["a.ogg"], ffprobe_failures_to_retry()
+    finally:
+        with PIPELINE_LOCK:
+            if prev is None:
+                PIPELINE.pop("voiceFailures", None)
+            else:
+                PIPELINE["voiceFailures"] = prev
 
 
 def _self_test_v678():
@@ -17736,6 +17896,9 @@ def main():
     # v6.79: streams nobody sent music parts for → make them here (safety net across computers)
     if missing_parts_enabled():
         threading.Thread(target=missing_parts_loop, daemon=True, name="missing-parts").start()
+
+    # v6.80: voice removals that failed only for a missing ffprobe → try them again once
+    threading.Thread(target=_ffprobe_retry_later, daemon=True, name="ffprobe-retry").start()
 
     # v6.44: re-queue voice-removal/split jobs a crash/reboot/restart interrupted
     def _resume_later():
